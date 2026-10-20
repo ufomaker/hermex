@@ -65,3 +65,15 @@ fastlane/test_output/
 
 # Python bytecode from scripts/tests
 __pycache__/
+
+# HarmonyOS / DevEco Studio
+.hvigor/
+**/build/
+**/.cxx/
+**/.preview/
+**/oh_modules/
+**/*.hap
+**/*.har
+**/*.hsp
+harmonyos/local.properties
+harmonyos/artifacts/

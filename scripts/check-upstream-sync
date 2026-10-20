@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+echo "=== Hermex 上游变更检查报告 ==="
+echo "执行时间: $(date '+%Y-%m-%d %H:%M:%S')"
+
+if ! git remote get-url upstream >/dev/null 2>&1; then
+    echo "错误: 未配置 upstream 远程仓库。" >&2
+    exit 1
+fi
+
+UPSTREAM_URL=$(git remote get-url upstream)
+echo "上游仓库地址: $UPSTREAM_URL"
+
+echo "正在查询上游 master 远端真实引用 (git ls-remote)..."
+REMOTE_LINE=$(git ls-remote upstream refs/heads/master 2>&1) || {
+    echo "错误: 访问上游仓库失败，请检查网络连接。" >&2
+    exit 2
+}
+
+REMOTE_MASTER_SHA=$(echo "$REMOTE_LINE" | awk '{print $1}')
+
+if [ -z "$REMOTE_MASTER_SHA" ]; then
+    echo "错误: 未能在上游找到 refs/heads/master 引用。" >&2
+    exit 3
+fi
+
+CURRENT_BRANCH=$(git branch --show-current)
+LOCAL_HEAD=$(git rev-parse HEAD)
+TRACKING_UPSTREAM_MASTER=$(git rev-parse upstream/master 2>/dev/null || echo "未抓取")
+
+echo "当前本地分支: $CURRENT_BRANCH ($LOCAL_HEAD)"
+echo "本地 tracking 引用 upstream/master: $TRACKING_UPSTREAM_MASTER"
+echo "远端实际 upstream/master SHA: $REMOTE_MASTER_SHA"
+
+echo ""
+echo "--- 协议与基线 Pin 检查 ---"
+if [ -f "HERMES_AGENT_TESTED_SHA" ]; then
+    echo "后端 Hermes 协议测试验证版本 (HERMES_AGENT_TESTED_SHA):"
+    sed 's/^/  /' HERMES_AGENT_TESTED_SHA
+fi
+
+if [ -f "UPSTREAM_TESTED_SHA" ]; then
+    echo "上游 iOS 客户端测试提交 Pin (UPSTREAM_TESTED_SHA):"
+    sed 's/^/  /' UPSTREAM_TESTED_SHA
+fi
+
+echo ""
+if [ "$LOCAL_HEAD" = "$REMOTE_MASTER_SHA" ]; then
+    echo "结论: 本地当前 HEAD 与上游 master 完全一致 ($REMOTE_MASTER_SHA)。"
+else
+    echo "提示: 本地当前 HEAD 与上游远端 master 存在差异。"
+    echo "  本地 HEAD: $LOCAL_HEAD"
+    echo "  远端 HEAD: $REMOTE_MASTER_SHA"
+fi
+
+echo "=== 检查完成，本操作为严格只读，未修改工作区与仓库分支状态 ==="
