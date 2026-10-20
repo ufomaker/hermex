@@ -8,6 +8,7 @@ export interface BotConnection {
   username?: string;
   password?: string;
   token?: string;
+  cookies?: string; // 保存由 Set-Cookie 解析的 Cookie 串
   activeProfile?: string;
   serverVersion?: string;
   isCurrent?: boolean;
@@ -21,6 +22,7 @@ export function cloneConnection(c: BotConnection): BotConnection {
     username: c.username,
     password: c.password,
     token: c.token,
+    cookies: c.cookies,
     activeProfile: c.activeProfile,
     serverVersion: c.serverVersion,
     isCurrent: c.isCurrent

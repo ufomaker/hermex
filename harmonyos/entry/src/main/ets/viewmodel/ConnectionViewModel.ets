@@ -17,9 +17,12 @@ export class ConnectionViewModel {
   ): Promise<BotConnection> {
     const status = await this.probeStatus(url);
     let token = '';
+    let cookies = '';
 
     if (status.auth_required && username && password) {
-      token = await HermesRESTClient.login(url, username, password);
+      const loginRes = await HermesRESTClient.login(url, username, password);
+      token = loginRes.token || '';
+      cookies = loginRes.cookies || '';
     }
 
     const conn: BotConnection = {
@@ -29,6 +32,7 @@ export class ConnectionViewModel {
       username: username,
       password: password,
       token: token,
+      cookies: cookies,
       activeProfile: status.profiles.length > 0 ? status.profiles[0] : 'default',
       serverVersion: status.version,
       isCurrent: true

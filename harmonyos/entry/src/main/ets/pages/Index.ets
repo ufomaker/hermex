@@ -1,10 +1,11 @@
 import { ConnectionViewModel } from '../viewmodel/ConnectionViewModel';
 import { SessionListViewModel } from '../viewmodel/SessionListViewModel';
-import { ChatViewModel, ChatUIStateListener } from '../viewmodel/ChatViewModel';
+import { ChatViewModel } from '../viewmodel/ChatViewModel';
 import { BotConnection, HermesStatus } from '../model/Connection';
 import { HermesSession } from '../model/Session';
 import { ChatMessage, ToolCallItem } from '../model/ChatMessage';
 import { ModelOption } from '../model/Approval';
+import promptAction from '@ohos.promptAction';
 
 @Entry
 @Component
@@ -14,8 +15,8 @@ struct Index {
   @State passwordInput: string = '';
   @State statusProbeText: string = '';
   @State inputText: string = '';
-  @State currentSessionTitle: string = '新会话';
-  @State currentSessionId: string = 'default_session';
+  @State currentSessionTitle: string = '未选择会话';
+  @State currentSessionId: string = '';
   @State showServerDialog: boolean = false;
   @State showSessionListDialog: boolean = false;
   @State showModelDialog: boolean = false;
@@ -35,14 +36,23 @@ struct Index {
   @State availableModels: ModelOption[] = [];
   @State hasApproval: boolean = false;
   @State approvalDesc: string = '';
+  @State isSubmittingApproval: boolean = false;
   @State hasClarify: boolean = false;
   @State clarifyQuestion: string = '';
   @State clarifyOptions: string[] = [];
+  @State isSubmittingClarify: boolean = false;
 
   aboutToAppear() {
     this.chatVm.setListener({
       onStateChanged: () => {
         this.syncVmState();
+      },
+      onErrorToast: (msg: string) => {
+        try {
+          promptAction.showToast({ message: msg, duration: 3000 });
+        } catch (e) {
+          // ignore prompt error in headless test
+        }
       }
     });
     this.initDefaultConnection();
@@ -59,6 +69,8 @@ struct Index {
     this.currentModel = this.chatVm.currentModel;
     this.messages = [...this.chatVm.messages];
     this.availableModels = [...this.chatVm.availableModels];
+    this.isSubmittingApproval = this.chatVm.isSubmittingApproval;
+    this.isSubmittingClarify = this.chatVm.isSubmittingClarify;
 
     if (this.chatVm.currentApproval) {
       this.hasApproval = true;
@@ -101,11 +113,20 @@ struct Index {
 
   private async connectAndStart() {
     try {
-      this.statusProbeText = '正在连接...';
+      this.statusProbeText = '正在连接认证并核验 /api/auth/me ...';
       const conn = await this.connVm.loginAndSave('Hermes', this.serverUrl, this.usernameInput, this.passwordInput);
       this.showServerDialog = false;
-      await this.chatVm.attachSession(conn, this.currentSessionId);
-      this.refreshSessions();
+
+      // 拉取会话列表
+      this.sessions = await this.sessionVm.loadSessions(conn);
+      if (this.sessions.length > 0) {
+        // 自动接入最近的一个真实会话
+        await this.switchSession(this.sessions[0]);
+      } else {
+        // 无会话时提示新建
+        this.currentSessionTitle = '请新建会话';
+        this.showSessionListDialog = true;
+      }
     } catch (e) {
       this.statusProbeText = `连接失败: ${e}`;
     }
@@ -129,6 +150,7 @@ struct Index {
     this.syncVmState();
     const cur = this.connVm.getCurrentConnection();
     if (cur) {
+      // 真实恢复会话与拉取历史
       await this.chatVm.attachSession(cur, this.currentSessionId);
     }
   }
@@ -136,13 +158,22 @@ struct Index {
   private async createNewSession() {
     const cur = this.connVm.getCurrentConnection();
     if (!cur) return;
-    const newId = `session_${Date.now()}`;
-    this.currentSessionId = newId;
-    this.currentSessionTitle = '新对话';
-    this.showSessionListDialog = false;
-    this.chatVm.messages = [];
-    this.syncVmState();
-    await this.chatVm.attachSession(cur, newId);
+    try {
+      // 必须通过 Gateway 真实调用 session.create，杜绝伪造本地 ID！
+      if (!this.chatVm.isConnected) {
+        // 若未连接先以临时标识建立握手再创建
+        await this.chatVm.attachSession(cur, '');
+      }
+      const realSessionId = await this.chatVm.createAndAttachNewSession(cur);
+      this.currentSessionId = realSessionId;
+      this.currentSessionTitle = '新对话';
+      this.showSessionListDialog = false;
+      this.refreshSessions();
+    } catch (e) {
+      try {
+        promptAction.showToast({ message: `创建会话失败: ${e}`, duration: 3000 });
+      } catch (err) {}
+    }
   }
 
   build() {
@@ -199,7 +230,7 @@ struct Index {
       .backgroundColor('#FFFFFF')
       .border({ width: { bottom: 1 }, color: '#E5E5EA' })
 
-      // 2. 审批请求悬浮栏
+      // 2. 审批请求悬浮栏 (带加载与重试保护)
       if (this.hasApproval) {
         Row() {
           Column() {
@@ -215,19 +246,21 @@ struct Index {
           .layoutWeight(1)
           .alignItems(HorizontalAlign.Start)
 
-          Button('拒绝')
+          Button(this.isSubmittingApproval ? '提交中...' : '拒绝')
             .fontSize(12)
             .backgroundColor('#EF4444')
             .fontColor('#FFFFFF')
+            .enabled(!this.isSubmittingApproval)
             .margin({ right: 8 })
             .onClick(() => {
               this.chatVm.submitApproval('reject');
             })
 
-          Button('批准')
+          Button(this.isSubmittingApproval ? '提交中...' : '批准')
             .fontSize(12)
             .backgroundColor('#10B981')
             .fontColor('#FFFFFF')
+            .enabled(!this.isSubmittingApproval)
             .onClick(() => {
               this.chatVm.submitApproval('approve');
             })
@@ -239,7 +272,7 @@ struct Index {
         .borderRadius(8)
       }
 
-      // 3. 澄清问题悬浮栏
+      // 3. 澄清问题悬浮栏 (带加载与重试保护)
       if (this.hasClarify) {
         Column() {
           Text('Agent 正在等待您的澄清：')
@@ -257,6 +290,7 @@ struct Index {
                 .fontSize(12)
                 .backgroundColor('#DBEAFE')
                 .fontColor('#1D4ED8')
+                .enabled(!this.isSubmittingClarify)
                 .margin({ right: 6 })
                 .onClick(() => {
                   this.chatVm.submitClarify(opt);
@@ -481,7 +515,7 @@ struct Index {
               ListItem() {
                 Row() {
                   Column() {
-                    Text(s.title || '无标题会话')
+                    Text(s.title || '会话')
                       .fontSize(15)
                       .fontWeight(FontWeight.Medium)
                     Text(`Profile: ${s.profile || 'default'} | ID: ${s.id}`)
@@ -527,10 +561,10 @@ struct Index {
         .position({ x: '5%', y: '15%' })
       }
 
-      // 8. 模型选择列表弹窗
+      // 8. 模型选择列表弹窗 (真实触发 config.set)
       if (this.showModelDialog) {
         Column() {
-          Text('选择模型')
+          Text('选择会话模型')
             .fontSize(18)
             .fontWeight(FontWeight.Bold)
             .margin({ bottom: 12 })
@@ -543,13 +577,13 @@ struct Index {
                     .fontSize(14)
                     .fontWeight(FontWeight.Medium)
                   Blank()
-                  Button('选择')
+                  Button('应用')
                     .fontSize(12)
                     .backgroundColor('#007AFF')
                     .fontColor('#FFFFFF')
-                    .onClick(() => {
-                      this.currentModel = m.name;
+                    .onClick(async () => {
                       this.showModelDialog = false;
+                      await this.chatVm.switchModel(m.name);
                     })
                 }
                 .width('100%')

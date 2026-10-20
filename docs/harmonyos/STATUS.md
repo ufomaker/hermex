@@ -1,55 +1,63 @@
 # Hermex HarmonyOS 移植状态追踪
 
-- 状态：**阶段一完成 (Milestone 1 Completed)**
-- 当前阶段：阶段一（鸿蒙原生工程建立、上游基线与协议精确核查、核心原生交互闭环实现、DevEco 真实构建 HAP 成功与隔离协议回归验证）
-- 更新时间：2026-10-20 20:48
+- 状态：**阶段一 P1 缺陷修复与核心重构完成 (P1 Defects Remediated & Core Engine Verified)**
+- 当前阶段：阶段一深化阶段（消除伪造会话、Cookie认证与核验、会话代次隔离、RPC超时与清理、模型真实配置、审批失败恢复、生产核心逻辑回归测试）
+- 更新时间：2026-10-20 20:58
 - 当前分支：`harmonyos/native-port`
 - 实施者：AntiGravity
-- 监督审查参考：`REVIEW_01.md`, `REVIEW_02.md`
+- 监督审查参考：`REVIEW_01.md`, `REVIEW_02.md`, `REVIEW_CORE_01.md`, `REVIEW_NEXT.md`
 
-## 本阶段实际完成工作
+## 监督意见落实与本次 P1 缺陷修复详单
 
-1. **协议基线与准确方法核实 (锁定至 `UPSTREAM_BASELINE.md`)**：
-   - 依据 `HermesREST.swift:374` 将 WebSocket ticket 换取接口严格修正为 `POST /api/auth/ws-ticket`（空载荷 `{}`）；
-   - 依据 `HermesREST.swift:360-363` 将密码登录核实为 `POST /auth/password-login`；
-   - 依据 `HermesCall.swift:275-340, 400-475` 精准核实并实现核心 RPC 方法：
-     - 会话方法：`session.list`、`session.create`、`session.resume`
-     - 停止中断方法：`session.interrupt`（纠正之前草案中的 `prompt.interrupt`）
-     - 消息发送方法：`prompt.submit`（携带 `queued: true`）
-     - 审批控制方法：`approval.respond`（携带 `request_id`, `choice`）
-     - 澄清问答方法：`request.answer` / `clarify.lock`
-     - 模型能力方法：`model.options`
-     - 客户端协商握手：`client.capabilities`（携带 `server_requests: true`）
-   - 澄清版本兼容性：本地探测 `0.22.2 >= 0.21.3` 满足最低静态门槛，协议有效性经由真实 WebSocket 握手验证。
-2. **上游变更只读检查工具 (`scripts/check-upstream-sync`)**：
-   - 采用 `git ls-remote` 获取远端真实最新 SHA，杜绝使用 `--dry-run` 与隐藏错误；
-   - 独立清晰标识 `HERMES_AGENT_TESTED_SHA`（后端网关测试提交）与 `UPSTREAM_TESTED_SHA`（原作者 iOS 客户端提交）。
-3. **鸿蒙原生工程与构建配置 (`harmonyos/`)**：
-   - 清理所有模板占位页面（如 `generated/Index.ets`）与无用依赖；
-   - 规范配置 `module.json5`（添加 `ohos.permission.INTERNET` 权限，主页面指向 `pages/Index`）；
-   - 配置兼容性 `compatibleSdkVersion: "5.0.0(12)"`、`targetSdkVersion: "5.0.0(12)"`，匹配用户鸿蒙 6 及以上手机；
-   - 严格遵循 ArkTS 强类型约束，解决字面量声明与 spread 约束，完成 `model/`、`network/`、`storage/`、`viewmodel/` 及 `pages/Index.ets` 的完整实现。
-4. **真实构建与打包产物**：
-   - 运行 DevEco 工具链执行真实 `assembleHap` 构建，退出码为 0，成功生成 HAP 安装包。
-5. **隔离协议回归自动化测试 (`harmonyos/tests/protocol-suite.js`)**：
-   - 覆盖子协议头、握手首帧 `gateway.ready`、能力协商 `client.capabilities`、中文 UTF-8 实时流式分包、推理 `reasoning.delta`、工具调用全生命周期、停止中断 `session.interrupt`、审批 `approval.respond`，测试 100% 通过（退出码 0）。
+1. **会话创建真实性与 runtime 恢复 (落实 REVIEW_CORE_01 第 1 项)**：
+   - 彻底废除前端 `session_${Date.now()}` 伪造会话行为；
+   - 新建会话统一通过 `HermesGatewayClient.createSession` 发起 RPC，由服务端返回真实 `session_id`；
+   - 会话恢复通过 `session.resume` 获取服务端 `runtime` ID，明确区分存储 ID（`stored_session_id`）与运行时实例 ID（`runtime_id`）；
+   - 进入会话时通过 `HermesRESTClient.getSessionMessages` 真实拉取服务端历史消息并注入聊天视窗。
+2. **Cookie Jar 与密码登录身份核验 (落实 REVIEW_CORE_01 第 2 项)**：
+   - 在 `HermesRESTClient` 中实现 Cookie 提取与全请求链路携带机制；
+   - `login` 流程在调用 `POST /auth/password-login` 提取 Cookie 后，强制调用 `GET /api/auth/me` 核验登录凭据，核验失败不进入系统，杜绝将空 Token/伪登录误判为成功；
+   - WebSocket Ticket 换取支持 Cookie 与 Bearer 双通道认证。
+3. **连接代次与多会话事件严格隔离 (落实 REVIEW_CORE_01 第 3 项)**：
+   - `ChatViewModel` 在 `attachSession` 时主动递增 `generation` 并关闭旧 WebSocket；
+   - `HermesGatewayClient` 维护连接代次与 `activeRuntimeId`，所有流式与工具事件必须匹配当前活跃 runtime，跨会话报文严格丢弃，杜绝串流。
+4. **RPC 超时清理、断开释放与心跳静默检测 (落实 REVIEW_CORE_01 第 4 项)**：
+   - `HermesGatewayClient` 为每个 RPC 请求绑定 30 秒独立超时定时器，超时主动移除并 reject，杜绝悬挂泄漏；
+   - 客户端断开连接时，遍历并 reject 所有 pending RPC，立即清理资源；
+   - 心跳定时器增加 45 秒静默检测，无报文时主动断开并触发状态回调。
+5. **真实模型配置切换 (落实 REVIEW_CORE_01 第 5 项)**：
+   - 废除仅修改本地 UI 变量的伪切换；
+   - 点击模型时通过 Gateway 发起 `config.set` RPC（参数包含 `key: "model"`, `value: "<model> --session"`），回执成功才更新当前模型，失败展示明确错误。
+6. **握手回执严格等待 (落实 REVIEW_CORE_01 第 6 项)**：
+   - 收到 `gateway.ready` 后发送 `client.capabilities`，必须 `await` 其 RPC 确认应答后才触发 `onConnected`，保证控制协议协商就绪。
+7. **审批与澄清交互可恢复 (落实 REVIEW_CORE_01 第 7 项)**：
+   - 用户点击审批或澄清时卡片进入提交中状态，不提前清空；
+   - 仅当服务端回执成功后清除卡片；若网络或服务端报错，展示提示并保留卡片供用户重试，杜绝静默吞错。
+8. **基线 Pin 语义修正与上游检查重构 (落实 REVIEW_NEXT 第 1、2 项)**：
+   - 澄清 `UPSTREAM_TESTED_SHA` 为 legacy webui 契约 pin，`HERMES_AGENT_TESTED_SHA` 为直连后端 pin；
+   - 建立机器可读的 `docs/harmonyos/upstream_baseline.json`，独立记录 `reviewed_upstream_master_sha`（`b26d7c564ae5459bffd2f448118b986741f6720f`）；
+   - 更新 `scripts/check-upstream-sync`，对比远端真实 master 与已审查基线，杜绝本地分支直接比对导致的虚假报告。
+9. **生产核心逻辑行为驱动回归测试 (落实 REVIEW_CORE_01 核验要求)**：
+   - 抽取纯 TS 协议核心 `HermesProtocolEngine.ts`；
+   - 重构 `harmonyos/tests/protocol-suite.js` 直接导入并执行生产核心代码；
+   - 真实断言 CookieJar 提取、JsonRpcManager 100ms 超时与 cancelAll 清理、会话严格隔离、中文 UTF-8 与推理流式累加、审批会话归属、Mock 服务端 401 拦截与真实 RPC 链路，测试全部通过（退出码 0）。
 
-## 真实命令、退出码与证据记录
+## 真实命令与退出码记录
 
 | 命令 | 退出码 | 产物/证据路径 | 说明 |
 | --- | --- | --- | --- |
-| `./scripts/check-upstream-sync` | 0 | 终端输出 / 脚本 | 远端 SHA 获取：`b26d7c564ae5459bffd2f448118b986741f6720f` |
-| `hvigorw --no-daemon assembleHap` | 0 | `harmonyos/entry/build/default/outputs/default/entry-default-unsigned.hap` | 生成 318KB 原生 HAP 包 (SHA256: `89bacfdbe092a8c52aca579f9758c0c8eb2494017296f284515be1b88efaf97b`)，详细日志存至 `harmonyos/artifacts/build_log.txt` |
-| `node harmonyos/tests/protocol-suite.js` | 0 | `harmonyos/artifacts/protocol_test_report.txt` | 隔离协议回归套件全部通过 (包含中文流式、停止、审批控制) |
+| `./scripts/check-upstream-sync` | 0 | 终端输出 / 脚本 | 远端与 reviewed 基线一致 (`b26d7c564ae5459bffd2f448118b986741f6720f`) |
+| `node harmonyos/tests/protocol-suite.js` | 0 | `harmonyos/artifacts/protocol_test_report.txt` | 直接导入并驱动生产核心逻辑的回归测试，全部通过 |
+| `hvigorw --no-daemon assembleHap` | 0 | `harmonyos/entry/build/default/outputs/default/entry-default-unsigned.hap` | 生成 347KB 中间编译 HAP (SHA-256: `3373086b41819896735f8263b9e3174266bf4c30656131a146f781dade3bd03d`)，详细日志写至 `harmonyos/artifacts/build_log.txt` |
 
-## 剩余任务与下一阶段计划
+## 剩余任务与后续规划
 
-- [ ] 阶段二：实现项目与远程工作区文件浏览与预览 (`HermesWorkspaceClient.ets`)
-- [ ] 阶段二：实现文件/图片附件上传与产物下载 (`HermesFileClient.ets`)
-- [ ] 阶段二：实现定时任务管理 (`HermesCronClient.ets`)
-- [ ] 阶段三：真机 USB 连接调试、签名配置与蜂窝网络直连测试
+- [ ] 阶段二：远程工作区与文件浏览模块 (`HermesWorkspaceClient.ets`)
+- [ ] 阶段二：图片/附件上传与产物下载模块 (`HermesFileClient.ets`)
+- [ ] 阶段二：定时任务调度模块 (`HermesCronClient.ets`)
+- [ ] 阶段三：真机 USB 调试、真机签名配置（当前 unsigned HAP 仅为中间编译产物，非最终可安装交付包）及外网免翻墙直连实测
 
 ## 人工依赖与门禁说明
 
-- 当前阶段 DevEco Studio 本地工具链构建及隔离协议测试均在无设备阻塞下圆满完成；
-- 后续真机安装签名需要用户提供开发者证书/设备授权时，将提前写入 STATUS 提请确认。
+- 当前阶段 DevEco Studio 本地工具链构建与隔离测试已全部通过；
+- 真机签名与物理设备接入由监督者 Codex 视真机阶段向用户提出。
