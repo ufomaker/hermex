@@ -1,33 +1,31 @@
 # Hermex HarmonyOS 移植状态追踪
 
-- 状态：**阶段四平台核心能力接入、Kanban 原生 RCP PATCH、Legacy SSE 轮次生命周期与深链/分享/语音系统集成完成 (Stage 4 Platform Native RCP, Legacy SSE Streaming Lifecycle, Voice AVRecorder/AVPlayer, Share & DeepLink Platform Integration)**
-- 当前阶段：Run 13 工作块已全部落实：
-  1. **Kanban 原生 RCP PATCH 与契约对齐 (F11)**：
-     - 在 `HermesKanbanClient.ets` 中使用华为 HarmonyOS `@kit.RemoteCommunicationKit` (`rcp`) 发送真实 HTTP `PATCH` 动词执行 `updateCardStatus`，彻底解决 `@ohos.net.http` 底层 NAPI 对非标准动词抛出 `code:401 Parameter error` 异常的问题；
-     - 对齐 upstream 看板响应包装结构 `{ boards: [{ slug, name, ... }], current, readOnly }`，采用 `slug` 作为唯一标识、`name` 呈现界面；解析驼峰整数 `latestEventId` 游标；
-     - 彻底清理 `EntryAbility.ets` 中的临时探针 `runNativeSelfCheck` 与 `testSelfCheck`。
-  2. **Legacy WebUI SSE 完整轮次与跨分包流式解码 (F12)**：
-     - 将 `LegacySSEClient.cancelChatTurn` 修正为 HTTP `GET /api/chat/cancel?stream_id=...`，严格对齐 upstream `APIClient+Chat.swift:34-35`；
-     - 采用跨 TCP 分包持续会话的单例 `util.TextDecoder.create('utf-8')` 并配置 `{ stream: true }`，彻底解决中文字符多字节（如 `'好'` [0xe5, 0xa5, 0xbd]）被网络块切分时损坏的隐患；
-     - 严格处理非 200 HTTP 响应（如 401/403/5xx），触发确定性 `onError` 回调与资源销毁；
-     - 接入生产 `SessionListViewModel.loadSessions` 与 `ChatViewModel.sendMessage`/`stopGenerating`，实现 legacy-webui 历史查看、消息流式接收与生成中断。
-  3. **原生平台级语音录音与播放状态机 (F10 - VoiceUtils.ets)**：
-     - 彻底剔除布尔占位符，基于 `@ohos.multimedia.media` (`AVRecorder` 与 `AVPlayer`)、`@ohos.file.fs` 及 `@ohos.abilityAccessCtrl` 完整实现平台能力；
-     - 录音使用 AAC 编码、M4A 容器（`CFT_MPEG_4A`）、44100Hz、96kbps，绑定文件描述符 `fd://${file.fd}`，落盘验证真实文件大小 `statSync.size > 0`；
-     - 播放使用 AVPlayer 驱动状态机（`initialized` -> `prepared` -> `playing` -> `completed`/`error`）；并在底部输入栏接入录音/停止/附加交互。
-  4. **系统分享、深层链接与前后台生命周期集成 (F10 - ShareUtils.ets, DeepLinkUtils.ets, EntryAbility.ets, Index.ets)**：
-     - 接入华为官方 ShareKit `@hms.collaboration.systemShare` (`ShareController` + `SharedData` + `SharedRecord`)，并保留 `startAbility` 安全降级；
-     - 严格脱敏公共 `hilog` 输出，仅记录事件类型与布尔标记（`hasText=true, hasUri=false`），绝不泄漏私密会话内容或带凭证 URI；
-     - `AppDeepLinkRouter` 区分冷启动挂起队列与热启动活跃监听器分发，避免二次重复消费与监听器泄漏；
-     - `Index.ets` 观察 `appScenePhase`，在从后台切回前台（`active`）时触发会话连接检查与无感恢复。
-  5. **测试与多维验收**：
-     - `protocol-suite.js` 扩展至 30 项全生命周期生产业务类测试，全部通过（退出码 0）；
-     - `hvigorw --no-daemon assembleHap` 构建成功（退出码 0），生成 1,066,700 字节 signed HAP；
-     - 并在 OpenHarmony 6 模拟器（`127.0.0.1:5555`）上通过 `hdc` 安装、启动、热分发深链 want 及外部分享 want，hilog 回读全部成功。
-- 更新时间：2026-10-21 01:30
+- 状态：**阶段五官方模拟器 Hypium 端到端 UI 审批流与原生 RCP 实机验证全线闭环 (Stage 5 Official Hypium UiTest End-to-End Chat Approval & Native RCP Device Verified)**
+- 当前阶段：Run 14 工作块已全部落实：
+  1. **官方 Hypium UiTest 真机端到端全旅程页面测试 (F01/F03/F04/F10)**：
+     - 在 `harmonyos/entry/src/ohosTest/ets/test/ChatApprovalUi.test.ets` 中建立标准 stageMode 测试套件；
+     - 在 OpenHarmony 6 官方模拟器（`127.0.0.1:5555`）上运行真实 `aa test`，通过 `@ohos.UiTest` 的 `Driver` 真实驱动应用界面组件（包含 `btn_server_settings`, `input_server_url`, `input_username`, `input_password`, `btn_connect_save`, `btn_new_session`, `input_chat_message`, `btn_send_message`, `btn_approval_once`）；
+     - 完整闭环走完：输入服务器与公开测试账号凭据 -> 连接保存认证成功 -> 新建独立真实会话 -> 中文输入命令发出 -> 界面捕捉到审批卡片并点击【允许一次】 -> 服务端执行 `python3 -c "print(1)"` -> 界面回显包含 `'1'` 且生成停止 -> 切前后台（`appScenePhase`）断线重连 -> 会话历史回填验证完好无损；
+     - 测试退出码：0，`Tests run: 3, Failure: 0, Error: 0, Pass: 3, Ignore: 0`。
+  2. **官方 RemoteCommunicationKit 原生 RCP PATCH 动词主机实机证据 (F11 - REVIEW_DEVICE_14 审查项 3)**：
+     - 在 `ChatApprovalUi.test.ets` 中加入 `testRcpNativePatchEcho`，通过真实业务类 `HermesKanbanClient.updateCardStatus` 触发 HarmonyOS 原生 `@kit.RemoteCommunicationKit` (`rcp.Request`)；
+     - 经由设备反向映射端口 9198，在宿主机回显服务中捕获到确定性的请求凭证：
+       `{"timestamp":"2026-10-20T18:27:49.553Z","method":"PATCH","url":"/api/plugins/kanban/tasks/card-patch-007?board=kanban-board-echo","headers":{"host":"127.0.0.1:9198","user-agent":"libcurl-agent/1.0",...},"body":"{\"status\":\"done\"}"}`；
+     - 证实 HarmonyOS 官方 RCP 确实完整支持 HTTP `PATCH` 动词，无临时探针滞留生产 `EntryAbility`。
+  3. **手机附件与语音录音真实网络管道对齐 (REVIEW_DEVICE_14 审查项 1)**：
+     - `toggleVoiceRecording` 录音完成后读取二进制转为 Base64 dataURL，经由真实 Gateway RPC `file.attach` 附加到会话中，杜绝手机沙箱 `/data/...` 裸露路径；
+     - 消息列表增加交互式语音播放按钮（`▶ 播放语音` / `⏹ 停止播放`），驱动 `VoiceUtils.playAudio`；
+     - `handleInboundShare` 区分图片与文件，分别经由 `HermesFileClient.uploadImage` 或 `chatVm.attachDocument` 上传与附加，失败保留重试提示，取消不发假链接。
+  4. **深链连接归一化与待认证平滑恢复 (REVIEW_DEVICE_14 审查项 2)**：
+     - `findMatchingConnection` 实现稳定 ID、规范化 URL、名称三级递进精确匹配；
+     - 当深链指定的服务器未预置时，自动为用户填入待配置服务器地址并打开连接设置弹窗，实现平滑待认证恢复。
+  5. **环境与依赖纯净化**：
+     - 恢复 `harmonyos/entry/oh-package.json5` 中 `@ohos/hypium` 为标准语义版本 `"1.0.19"`，消除本机绝对文件依赖；
+     - 保持 `harmonyos/build-profile.json5` 的 `skip-worktree` 状态，严禁签名字段泄漏与修改。
+- 更新时间：2026-10-21 02:30
 - 当前分支：`harmonyos/native-port`
 - 实施者：AntiGravity
-- 监督审查参考：`REVIEW_01.md` ~ `REVIEW_WS_DEVICE_01.md`, `REVIEW_APPROVAL_DEVICE_01.md`, `RESUME_RUN12.md`, `REVIEW_SCOPE_12.md`, `RESUME_RUN13.md`, `REVIEW_PLATFORM_13.md`
+- 监督审查参考：`REVIEW_DEVICE_14.md`, `RESUME_RUN14.md`
 
 ## 监督意见落实与本次核心重构详单
 

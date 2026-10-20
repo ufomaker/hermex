@@ -31,6 +31,10 @@ import Want from '@ohos.app.ability.Want';
 import { DeepLinkUtils, AppDeepLinkRouter, DeepLinkRoute, InboundShareData } from '../utils/DeepLinkUtils';
 import { ShareUtils } from '../utils/ShareUtils';
 import { VoiceUtils } from '../utils/VoiceUtils';
+import { hilog } from '@kit.PerformanceAnalysisKit';
+
+const DOMAIN = 0x0000;
+const TAG = 'HermexIndex';
 
 @Entry
 @Component
@@ -41,6 +45,8 @@ struct Index {
   @State statusProbeText: string = '';
   @State inputText: string = '';
   @State isRecordingVoice: boolean = false;
+  @State isPlayingAudio: boolean = false;
+  @State currentlyPlayingAudioUrl: string = '';
   @State currentSessionTitle: string = '未选择会话';
   @State currentSessionId: string = '';
   @State showServerDialog: boolean = false;
@@ -185,7 +191,23 @@ struct Index {
     }
   }
 
-  private handleInboundShare(share: InboundShareData): void {
+  private findMatchingConnection(targetServer: string): BotConnection | null {
+    if (!targetServer) return null;
+    const allConns = this.connVm.getSavedConnections();
+    const cleanTarget = targetServer.trim().toLowerCase().replace(/\/+$/, '');
+    // 1. 精确匹配稳定 ID
+    const byId = allConns.find((c) => c.id === targetServer);
+    if (byId) return byId;
+    // 2. 精确匹配规范化 URL
+    const byUrl = allConns.find((c) => c.url.trim().toLowerCase().replace(/\/+$/, '') === cleanTarget);
+    if (byUrl) return byUrl;
+    // 3. 精确匹配名称
+    const byName = allConns.find((c) => c.name.trim().toLowerCase() === cleanTarget);
+    if (byName) return byName;
+    return null;
+  }
+
+  private async handleInboundShare(share: InboundShareData): Promise<void> {
     if (!share) return;
     if (share.text) {
       this.inputText = this.inputText ? `${this.inputText}\n${share.text}` : share.text;
@@ -193,20 +215,56 @@ struct Index {
     }
     if (share.uri) {
       const uriStr = share.uri;
-      const lastSlash = Math.max(uriStr.lastIndexOf('/'), uriStr.lastIndexOf('\\'));
-      const rawName = lastSlash >= 0 ? uriStr.substring(lastSlash + 1) : uriStr;
-      const cleanName = rawName.split('?')[0] || `share_${Date.now()}`;
-      const lower = cleanName.toLowerCase();
-      const isImg = lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.webp') || lower.endsWith('.gif');
+      const cur = this.connVm.getCurrentConnection();
+      if (!cur) {
+        this.showToast('未连接服务器，分享文件未能上传');
+        return;
+      }
 
-      if (isImg) {
-        const refTag = `![${cleanName}](${uriStr})\n`;
-        this.inputText = this.inputText ? `${this.inputText}\n${refTag}` : refTag;
-        this.showToast(`已导入外部分享图片: ${cleanName}`);
-      } else {
-        const refTag = `[📎 分享文件: ${cleanName}](${uriStr})\n`;
-        this.inputText = this.inputText ? `${this.inputText}\n${refTag}` : refTag;
-        this.showToast(`已导入外部分享文件: ${cleanName}`);
+      try {
+        const lastSlash = Math.max(uriStr.lastIndexOf('/'), uriStr.lastIndexOf('\\'));
+        const rawName = lastSlash >= 0 ? uriStr.substring(lastSlash + 1) : uriStr;
+        const cleanName = sanitizeFilename(rawName.split('?')[0] || `share_${Date.now()}`);
+        const mime = getMimeType(cleanName);
+        const isImg = isImageFile(cleanName);
+
+        const file = fs.openSync(uriStr, fs.OpenMode.READ_ONLY);
+        let buf: ArrayBuffer;
+        try {
+          const stat = fs.statSync(file.fd);
+          buf = new ArrayBuffer(stat.size);
+          fs.readSync(file.fd, buf);
+        } finally {
+          fs.closeSync(file.fd);
+        }
+
+        const base64Helper = new util.Base64Helper();
+        const b64 = base64Helper.encodeToStringSync(new Uint8Array(buf));
+        const dataUrl = `data:${mime};base64,${b64}`;
+
+        if (isImg) {
+          const profile = cur.activeProfile ? cur.activeProfile : 'default';
+          const uploadResult = await HermesFileClient.uploadImage(
+            cur.url,
+            profile,
+            cleanName,
+            dataUrl,
+            cur.token,
+            cur.cookies
+          );
+          const targetPath = uploadResult.path || uploadResult.url || cleanName;
+          const refTag = `![${cleanName}](${targetPath})\n`;
+          this.inputText = this.inputText ? `${this.inputText}\n${refTag}` : refTag;
+          this.showToast(`已上传外部分享图片: ${cleanName}`);
+        } else {
+          const attachName = generateAttachmentName(cleanName);
+          await this.chatVm.attachDocument(attachName, dataUrl);
+          const refTag = `[📎 附件: ${cleanName}](${attachName})\n`;
+          this.inputText = this.inputText ? `${this.inputText}\n${refTag}` : refTag;
+          this.showToast(`已附加外部分享文件: ${cleanName}`);
+        }
+      } catch (e) {
+        this.showToast(`读取或上传分享文件失败: ${e}`);
       }
     }
   }
@@ -215,12 +273,7 @@ struct Index {
     if (route.type === 'session') {
       let targetConn: BotConnection | null = null;
       if (route.server) {
-        const allConns = this.connVm.getSavedConnections();
-        const matched = allConns.find((c) =>
-          c.id === route.server ||
-          c.name.toLowerCase() === route.server!.toLowerCase() ||
-          c.url.toLowerCase().includes(route.server!.toLowerCase())
-        );
+        const matched = this.findMatchingConnection(route.server);
         if (!matched) {
           this.showToast(`深层链接指定的服务器未配置: ${route.server}`);
           return;
@@ -257,16 +310,26 @@ struct Index {
         }
       }
     } else if (route.type === 'new_chat_profile') {
+      if (route.server) {
+        const matched = this.findMatchingConnection(route.server);
+        if (matched) {
+          await this.connVm.selectConnection(matched.id);
+        } else {
+          this.showToast(`未找到指定服务器: ${route.server}`);
+          return;
+        }
+      }
       const sessId = await this.createNewSession(route.profile);
       if (sessId) {
         this.showToast(`已在配置 Profile【${route.profile}】下创建新会话`);
       }
     } else if (route.type === 'bot') {
-      const allConns = this.connVm.getSavedConnections();
-      const matched = allConns.find((c) =>
-        (route.server && (c.id === route.server || c.name.toLowerCase() === route.server.toLowerCase() || c.url.includes(route.server))) ||
-        (route.connection && (c.id === route.connection || c.name.toLowerCase() === route.connection.toLowerCase()))
-      );
+      let matched: BotConnection | null = null;
+      if (route.server) {
+        matched = this.findMatchingConnection(route.server);
+      } else if (route.connection) {
+        matched = this.findMatchingConnection(route.connection);
+      }
       if (matched) {
         if (route.profile) {
           matched.activeProfile = route.profile;
@@ -314,13 +377,70 @@ struct Index {
       const recordedPath = await VoiceUtils.stopRecording();
       this.isRecordingVoice = false;
       if (recordedPath) {
-        const filename = sanitizeFilename(recordedPath);
-        const tag = `[🎤 语音消息: ${filename}](${recordedPath})\n`;
-        this.inputText = this.inputText ? `${this.inputText}\n${tag}` : tag;
-        this.showToast('录音完成并已附加');
+        const cur = this.connVm.getCurrentConnection();
+        if (!cur || !this.chatVm.isConnected) {
+          this.showToast('未连接服务器，录音已保存但未附加');
+          return;
+        }
+        try {
+          const file = fs.openSync(recordedPath, fs.OpenMode.READ_ONLY);
+          let buf: ArrayBuffer;
+          try {
+            const stat = fs.statSync(file.fd);
+            buf = new ArrayBuffer(stat.size);
+            fs.readSync(file.fd, buf);
+          } finally {
+            fs.closeSync(file.fd);
+          }
+          const base64Helper = new util.Base64Helper();
+          const b64 = base64Helper.encodeToStringSync(new Uint8Array(buf));
+          const dataUrl = `data:audio/m4a;base64,${b64}`;
+          const attachName = generateAttachmentName('voice_recording.m4a');
+          await this.chatVm.attachDocument(attachName, dataUrl);
+          const tag = `[🎤 语音: ${attachName}](${attachName})\n`;
+          this.inputText = this.inputText ? `${this.inputText}\n${tag}` : tag;
+          this.showToast('录音完成并已附加到会话');
+        } catch (err) {
+          this.showToast(`语音附加失败: ${err}`);
+        }
       } else {
         this.showToast('未录制到有效音频');
       }
+    }
+  }
+
+  private async handlePlayVoiceMessage(content: string): Promise<void> {
+    if (this.isPlayingAudio) {
+      await VoiceUtils.stopAudio();
+      this.isPlayingAudio = false;
+      this.currentlyPlayingAudioUrl = '';
+      return;
+    }
+    const match = content.match(/\[🎤 语音[^\]]*\]\(([^)]+)\)/);
+    const audioTarget = match ? match[1] : '';
+    if (!audioTarget) {
+      this.showToast('未找到有效音频地址');
+      return;
+    }
+    this.isPlayingAudio = true;
+    this.currentlyPlayingAudioUrl = audioTarget;
+    this.showToast('正在播放音频...');
+    const ok = await VoiceUtils.playAudio(audioTarget, {
+      onStart: () => {},
+      onComplete: () => {
+        this.isPlayingAudio = false;
+        this.currentlyPlayingAudioUrl = '';
+      },
+      onError: (err: string) => {
+        this.isPlayingAudio = false;
+        this.currentlyPlayingAudioUrl = '';
+        this.showToast(`播放失败: ${err}`);
+      }
+    });
+    if (!ok) {
+      this.isPlayingAudio = false;
+      this.currentlyPlayingAudioUrl = '';
+      this.showToast('无法启动音频播放');
     }
   }
 
@@ -399,12 +519,15 @@ struct Index {
 
   private async connectAndStart() {
     try {
+      hilog.info(DOMAIN, TAG, 'connectAndStart: url=%{public}s user=%{public}s', this.serverUrl, this.usernameInput);
       this.statusProbeText = '正在连接认证并核验 /api/auth/me ...';
       const conn = await this.connVm.loginAndSave('Hermes', this.serverUrl, this.usernameInput, this.passwordInput);
+      hilog.info(DOMAIN, TAG, 'connectAndStart: logged in successfully, conn=%{public}s', conn.id);
       this.showServerDialog = false;
 
       // 拉取会话列表
       this.sessions = await this.sessionVm.loadSessions(conn);
+      hilog.info(DOMAIN, TAG, 'connectAndStart: loaded %{public}d sessions', this.sessions.length);
       if (this.sessions.length > 0) {
         // 自动接入最近的一个真实会话
         await this.switchSession(this.sessions[0]);
@@ -414,6 +537,7 @@ struct Index {
         this.showSessionListDialog = true;
       }
     } catch (e) {
+      hilog.error(DOMAIN, TAG, 'connectAndStart failed: %{public}s', JSON.stringify(e));
       this.statusProbeText = `连接失败: ${e}`;
     }
   }
@@ -442,8 +566,10 @@ struct Index {
   }
 
   private async createNewSession(profile?: string): Promise<string | null> {
+    hilog.info(DOMAIN, TAG, 'createNewSession requested with profile=%{public}s', profile || 'default');
     const cur = this.connVm.getCurrentConnection();
     if (!cur) {
+      hilog.warn(DOMAIN, TAG, 'createNewSession: no active connection!');
       this.showToast('请先配置并连接 Hermes 服务器');
       return null;
     }
@@ -452,15 +578,18 @@ struct Index {
         cur.activeProfile = profile;
       }
       if (!this.chatVm.isConnected) {
+        hilog.info(DOMAIN, TAG, 'createNewSession: chatVm not connected, attaching...');
         await this.chatVm.attachSession(cur, '');
       }
       const realSessionId = await this.chatVm.createAndAttachNewSession(cur);
+      hilog.info(DOMAIN, TAG, 'createNewSession: created and attached real session ID=%{public}s', realSessionId);
       this.currentSessionId = realSessionId;
       this.currentSessionTitle = '新对话';
       this.showSessionListDialog = false;
       this.refreshSessions();
       return realSessionId;
     } catch (e) {
+      hilog.error(DOMAIN, TAG, 'createNewSession failed: %{public}s', JSON.stringify(e));
       this.showToast(`创建会话失败: ${e}`);
       return null;
     }
@@ -808,6 +937,7 @@ struct Index {
           })
 
         Button('会话')
+          .id('btn_sessions_list')
           .fontSize(11)
           .height(32)
           .backgroundColor('#E5E5EA')
@@ -843,6 +973,7 @@ struct Index {
           })
 
         Button('设置')
+          .id('btn_server_settings')
           .fontSize(11)
           .height(32)
           .backgroundColor('#007AFF')
@@ -879,6 +1010,7 @@ struct Index {
             Blank()
             if (this.approvalChoices.includes('deny')) {
               Button(this.isSubmittingApproval ? '提交中...' : '拒绝')
+                .id('btn_approval_deny')
                 .fontSize(12)
                 .backgroundColor('#EF4444')
                 .fontColor('#FFFFFF')
@@ -890,6 +1022,7 @@ struct Index {
             }
             if (this.approvalChoices.includes('session')) {
               Button(this.isSubmittingApproval ? '提交中...' : '本次会话')
+                .id('btn_approval_session')
                 .fontSize(12)
                 .backgroundColor('#6366F1')
                 .fontColor('#FFFFFF')
@@ -901,6 +1034,7 @@ struct Index {
             }
             if (this.approvalChoices.includes('once')) {
               Button(this.isSubmittingApproval ? '提交中...' : '允许一次')
+                .id('btn_approval_once')
                 .fontSize(12)
                 .backgroundColor('#10B981')
                 .fontColor('#FFFFFF')
@@ -1002,6 +1136,7 @@ struct Index {
               .margin({ bottom: 20 })
 
               Button('立即配置 Hermes 服务器')
+                .id('btn_configure_server')
                 .fontSize(14)
                 .fontWeight(FontWeight.Medium)
                 .height(42)
@@ -1100,6 +1235,17 @@ struct Index {
                   } else {
                     MarkdownView({ content: msg.content || (msg.status === 'streaming' ? '思考与撰写中...' : '') })
                   }
+                  if (msg.content && msg.content.includes('[🎤 语音')) {
+                    Button(this.isPlayingAudio && this.currentlyPlayingAudioUrl.length > 0 ? '⏹ 停止播放' : '▶ 播放语音')
+                      .fontSize(11)
+                      .height(26)
+                      .backgroundColor('#E0F2FE')
+                      .fontColor('#0284C7')
+                      .margin({ top: 6 })
+                      .onClick(async () => {
+                        await this.handlePlayVoiceMessage(msg.content);
+                      })
+                  }
                 }
                 .padding(12)
                 .backgroundColor(msg.role === 'user' ? '#007AFF' : '#F2F2F7')
@@ -1139,17 +1285,20 @@ struct Index {
             await this.toggleVoiceRecording();
           })
 
-        TextInput({ text: this.inputText, placeholder: '发送消息给 Hermes...' })
+        TextInput({ text: $$this.inputText, placeholder: '发送消息给 Hermes...' })
+          .id('input_chat_message')
           .layoutWeight(1)
           .height(40)
           .margin({ right: 8 })
           .onChange((val: string) => {
+            hilog.info(DOMAIN, TAG, 'input_chat_message onChange: %{public}s', val);
             this.inputText = val;
           })
 
         if (this.isGenerating) {
           // 停止按钮
           Button('停止')
+            .id('btn_stop_generating')
             .fontSize(13)
             .height(40)
             .backgroundColor('#FF3B30')
@@ -1160,11 +1309,13 @@ struct Index {
         } else {
           // 发送按钮
           Button('发送')
+            .id('btn_send_message')
             .fontSize(13)
             .height(40)
             .backgroundColor('#007AFF')
             .fontColor('#FFFFFF')
             .onClick(() => {
+              hilog.info(DOMAIN, TAG, 'Send button clicked, inputText=%{public}s', this.inputText);
               if (this.inputText.trim().length > 0) {
                 const text = this.inputText;
                 this.inputText = '';
@@ -1186,10 +1337,12 @@ struct Index {
             .fontWeight(FontWeight.Bold)
             .margin({ bottom: 16 })
 
-          TextInput({ text: this.serverUrl, placeholder: '服务器地址 (例如 https://hermes.domain.com 或 http://192.168.1.100:8787)' })
+          TextInput({ text: $$this.serverUrl, placeholder: '服务器地址 (例如 https://hermes.domain.com 或 http://192.168.1.100:8787)' })
+            .id('input_server_url')
             .height(40)
             .margin({ bottom: 4 })
             .onChange((val: string) => {
+              hilog.info(DOMAIN, TAG, 'input_server_url onChange: %{public}s', val);
               this.serverUrl = val;
             })
 
@@ -1198,18 +1351,22 @@ struct Index {
             .fontColor('#6B7280')
             .margin({ bottom: 10 })
 
-          TextInput({ text: this.usernameInput, placeholder: '用户名 (可选)' })
+          TextInput({ text: $$this.usernameInput, placeholder: '用户名 (可选)' })
+            .id('input_username')
             .height(40)
             .margin({ bottom: 10 })
             .onChange((val: string) => {
+              hilog.info(DOMAIN, TAG, 'input_username onChange: %{public}s', val);
               this.usernameInput = val;
             })
 
-          TextInput({ text: this.passwordInput, placeholder: '密码 (可选)' })
+          TextInput({ text: $$this.passwordInput, placeholder: '密码 (可选)' })
+            .id('input_password')
             .type(InputType.Password)
             .height(40)
             .margin({ bottom: 12 })
             .onChange((val: string) => {
+              hilog.info(DOMAIN, TAG, 'input_password onChange: %{public}s', val ? '***' : '');
               this.passwordInput = val;
             })
 
@@ -1222,6 +1379,7 @@ struct Index {
 
           Row() {
             Button('探测状态')
+              .id('btn_probe_status')
               .fontSize(13)
               .backgroundColor('#F2F2F7')
               .fontColor('#007AFF')
@@ -1231,6 +1389,7 @@ struct Index {
               })
 
             Button('连接并保存')
+              .id('btn_connect_save')
               .fontSize(13)
               .backgroundColor('#007AFF')
               .fontColor('#FFFFFF')
@@ -1240,6 +1399,7 @@ struct Index {
               })
 
             Button('取消')
+              .id('btn_cancel_server')
               .fontSize(13)
               .backgroundColor('#E5E5EA')
               .fontColor('#374151')
@@ -1265,6 +1425,7 @@ struct Index {
               .fontWeight(FontWeight.Bold)
             Blank()
             Button('+ 新建会话')
+              .id('btn_new_session')
               .fontSize(12)
               .backgroundColor('#007AFF')
               .fontColor('#FFFFFF')
