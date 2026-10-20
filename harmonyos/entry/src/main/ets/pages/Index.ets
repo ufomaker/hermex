@@ -2,18 +2,29 @@ import { ConnectionViewModel } from '../viewmodel/ConnectionViewModel';
 import { SessionListViewModel } from '../viewmodel/SessionListViewModel';
 import { ChatViewModel } from '../viewmodel/ChatViewModel';
 import { WorkspaceViewModel } from '../viewmodel/WorkspaceViewModel';
+import { CronViewModel } from '../viewmodel/CronViewModel';
+import { SkillsViewModel } from '../viewmodel/SkillsViewModel';
+import { InsightsViewModel } from '../viewmodel/InsightsViewModel';
+import { GitWorkspaceViewModel } from '../viewmodel/GitWorkspaceViewModel';
 import { BotConnection, HermesStatus } from '../model/Connection';
 import { HermesSession } from '../model/Session';
 import { ChatMessage, ToolCallItem } from '../model/ChatMessage';
 import { ModelOption } from '../model/Approval';
 import { WorkspaceFileEntry } from '../network/HermesWorkspaceClient';
 import { HermesFileClient } from '../network/HermesFileClient';
+import { CronJobItem } from '../network/HermesCronClient';
+import { SkillSummary } from '../network/HermesSkillsClient';
+import { ModelUsageItem } from '../network/HermesInsightsClient';
+import { GitBranchInfo } from '../network/HermesProjectClient';
 import { AuthStore } from '../storage/AuthStore';
 import { MarkdownView } from '../components/MarkdownView';
+import { getMimeType, isImageFile, sanitizeFilename, generateAttachmentName } from '../utils/AttachmentUtils';
 import promptAction from '@ohos.promptAction';
 import picker from '@ohos.file.picker';
 import fs from '@ohos.file.fs';
 import util from '@ohos.util';
+import common from '@ohos.app.ability.common';
+import Want from '@ohos.app.ability.Want';
 
 @Entry
 @Component
@@ -30,12 +41,18 @@ struct Index {
   @State showModelDialog: boolean = false;
   @State showWorkspaceDialog: boolean = false;
   @State showAttachmentDialog: boolean = false;
+  @State showToolsDialog: boolean = false;
+  @State selectedToolsTab: number = 0; // 0:任务, 1:技能, 2:设定, 3:用量, 4:Git
 
   // ViewModels
   private connVm: ConnectionViewModel = new ConnectionViewModel();
   private sessionVm: SessionListViewModel = new SessionListViewModel();
   private chatVm: ChatViewModel = new ChatViewModel();
   private workspaceVm: WorkspaceViewModel = new WorkspaceViewModel();
+  private cronVm: CronViewModel = new CronViewModel();
+  private skillsVm: SkillsViewModel = new SkillsViewModel();
+  private insightsVm: InsightsViewModel = new InsightsViewModel();
+  private gitVm: GitWorkspaceViewModel = new GitWorkspaceViewModel();
 
   // Observable UI States
   @State isConnected: boolean = false;
@@ -62,6 +79,13 @@ struct Index {
   @State viewingFileText: string = '';
   @State isViewingFile: boolean = false;
   @State isDownloadingFile: boolean = false;
+  @State lastDownloadedFileName: string = '';
+  @State lastDownloadedFilePath: string = '';
+
+  // Tools Observable States
+  @State isToolsLoading: boolean = false;
+  @State toolsStatusText: string = '';
+  @State editingSoulText: string = '';
 
   // Attachment States
   @State isUploadingAttachment: boolean = false;
@@ -217,8 +241,36 @@ struct Index {
     }
   }
 
+  private async loadCurrentToolsData() {
+    const cur = this.connVm.getCurrentConnection();
+    if (!cur) return;
+    this.isToolsLoading = true;
+    this.toolsStatusText = '正在加载...';
+    try {
+      if (this.selectedToolsTab === 0) {
+        await this.cronVm.loadJobs(cur);
+        this.toolsStatusText = this.cronVm.statusMessage;
+      } else if (this.selectedToolsTab === 1 || this.selectedToolsTab === 2) {
+        await this.skillsVm.loadSkillsAndMemory(cur);
+        this.editingSoulText = this.skillsVm.soulText;
+        this.toolsStatusText = this.skillsVm.statusMessage;
+      } else if (this.selectedToolsTab === 3) {
+        await this.insightsVm.loadInsights(cur, 7);
+        this.toolsStatusText = this.insightsVm.statusMessage;
+      } else if (this.selectedToolsTab === 4) {
+        await this.gitVm.loadProjectsAndGit(cur, this.workspacePath);
+        this.toolsStatusText = this.gitVm.statusMessage;
+      }
+    } catch (e) {
+      this.toolsStatusText = `加载异常: ${e}`;
+    } finally {
+      this.isToolsLoading = false;
+    }
+  }
+
   /**
    * 下载文件并实际保存到文件系统或用户选择的存储位置
+   * 严格遵循路径安全、用户取消处理、写入完整性校验与文件描述符关闭
    */
   private async handleDownloadFile(entry: WorkspaceFileEntry) {
     const cur = this.connVm.getCurrentConnection();
@@ -227,40 +279,93 @@ struct Index {
     try {
       this.showToast(`正在下载 ${entry.name}...`);
       const buffer = await this.workspaceVm.downloadFile(cur, entry, this.currentSessionId);
+      const safeName = sanitizeFilename(entry.name);
 
       let savedLocation = '';
+      let isUserCancelled = false;
+
       try {
         const docPicker = new picker.DocumentViewPicker();
         const saveOptions = new picker.DocumentSaveOptions();
-        saveOptions.newFileNames = [entry.name];
+        saveOptions.newFileNames = [safeName];
         const uris = await docPicker.save(saveOptions);
         if (uris && uris.length > 0) {
           const file = fs.openSync(uris[0], fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
-          fs.writeSync(file.fd, buffer);
-          fs.closeSync(file.fd);
+          try {
+            const written = fs.writeSync(file.fd, buffer);
+            if (written !== buffer.byteLength) {
+              throw new Error(`写入不完整: 预期 ${buffer.byteLength} 字节, 实际写入 ${written} 字节`);
+            }
+          } finally {
+            fs.closeSync(file.fd);
+          }
           savedLocation = uris[0];
+        } else {
+          isUserCancelled = true;
         }
       } catch (pickerErr) {
-        // DocumentViewPicker 异常时优雅降级写入沙箱
+        const errStr = String(pickerErr || '').toLowerCase();
+        if (errStr.includes('cancel') || errStr.includes('13900020')) {
+          isUserCancelled = true;
+        }
       }
 
+      if (isUserCancelled) {
+        this.showToast('已取消保存文件');
+        return;
+      }
+
+      // 若系统选择器未提供返回但非用户主动取消，安全降级写入应用沙箱
       if (!savedLocation) {
         const ctx = getContext(this);
-        const targetPath = `${ctx.filesDir}/${entry.name}`;
+        const targetPath = `${ctx.filesDir}/${safeName}`;
         const file = fs.openSync(targetPath, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
-        fs.writeSync(file.fd, buffer);
-        fs.closeSync(file.fd);
+        try {
+          const written = fs.writeSync(file.fd, buffer);
+          if (written !== buffer.byteLength) {
+            throw new Error(`写入不完整: 预期 ${buffer.byteLength} 字节, 实际写入 ${written} 字节`);
+          }
+        } finally {
+          fs.closeSync(file.fd);
+        }
         savedLocation = targetPath;
       }
 
-      this.showToast(`文件已成功保存: ${savedLocation} (${buffer.byteLength} 字节)`);
+      this.lastDownloadedFileName = safeName;
+      this.lastDownloadedFilePath = savedLocation;
+      this.showToast(`文件已成功保存: ${safeName} (${buffer.byteLength} 字节)`);
     } catch (e) {
       this.showToast(`下载或保存失败: ${e}`);
     }
   }
 
   /**
-   * 从系统相册选择真实图片并上传
+   * 调起系统应用打开或分享已保存的文件
+   */
+  private openOrShareFile(filePath: string, filename: string) {
+    if (!filePath) {
+      this.showToast('暂无已保存的文件路径');
+      return;
+    }
+    try {
+      const ctx = getContext(this) as common.UIAbilityContext;
+      const want: Want = {
+        action: 'ohos.want.action.viewData',
+        uri: filePath.startsWith('file://') ? filePath : `file://${filePath}`,
+        type: getMimeType(filename)
+      };
+      ctx.startAbility(want).then(() => {
+        this.showToast(`正在打开 ${filename}...`);
+      }).catch((err: Object) => {
+        this.showToast(`系统无法打开该类型文件: ${JSON.stringify(err)}`);
+      });
+    } catch (e) {
+      this.showToast(`调用系统打开失败: ${e}`);
+    }
+  }
+
+  /**
+   * 从系统相册选择真实图片并上传 (严格检测真实媒体类型)
    */
   private async pickPhotoAndUpload() {
     const cur = this.connVm.getCurrentConnection();
@@ -281,20 +386,25 @@ struct Index {
       }
 
       const selectedUri = result.photoUris[0];
-      const filename = selectedUri.split('/').pop() || 'photo.jpg';
+      const filename = sanitizeFilename(selectedUri.split('/').pop() || 'photo.jpg');
+      const mime = getMimeType(filename);
 
       this.isUploadingAttachment = true;
       this.attachmentStatusText = `正在读取并上传 ${filename}...`;
 
       const file = fs.openSync(selectedUri, fs.OpenMode.READ_ONLY);
-      const stat = fs.statSync(file.fd);
-      const buf = new ArrayBuffer(stat.size);
-      fs.readSync(file.fd, buf);
-      fs.closeSync(file.fd);
+      let buf: ArrayBuffer;
+      try {
+        const stat = fs.statSync(file.fd);
+        buf = new ArrayBuffer(stat.size);
+        fs.readSync(file.fd, buf);
+      } finally {
+        fs.closeSync(file.fd);
+      }
 
       const base64Helper = new util.Base64Helper();
       const b64 = base64Helper.encodeToStringSync(new Uint8Array(buf));
-      const dataUrl = `data:image/jpeg;base64,${b64}`;
+      const dataUrl = `data:${mime};base64,${b64}`;
 
       const profile = cur.activeProfile ? cur.activeProfile : 'default';
       const uploadResult = await HermesFileClient.uploadImage(
@@ -322,6 +432,8 @@ struct Index {
 
   /**
    * 从系统文件管理器选择文档并上传
+   * - 普通文档/代码/PDF/音频等按上游规范走 Gateway RPC file.attach
+   * - 图片类型则自动分流至 image-upload 路由
    */
   private async pickDocumentAndUpload() {
     const cur = this.connVm.getCurrentConnection();
@@ -338,36 +450,51 @@ struct Index {
       }
 
       const selectedUri = uris[0];
-      const filename = selectedUri.split('/').pop() || 'document.bin';
+      const filename = sanitizeFilename(selectedUri.split('/').pop() || 'document.bin');
+      const mime = getMimeType(filename);
+      const isImg = isImageFile(filename);
 
       this.isUploadingAttachment = true;
       this.attachmentStatusText = `正在读取并上传 ${filename}...`;
 
       const file = fs.openSync(selectedUri, fs.OpenMode.READ_ONLY);
-      const stat = fs.statSync(file.fd);
-      const buf = new ArrayBuffer(stat.size);
-      fs.readSync(file.fd, buf);
-      fs.closeSync(file.fd);
+      let buf: ArrayBuffer;
+      try {
+        const stat = fs.statSync(file.fd);
+        buf = new ArrayBuffer(stat.size);
+        fs.readSync(file.fd, buf);
+      } finally {
+        fs.closeSync(file.fd);
+      }
 
       const base64Helper = new util.Base64Helper();
       const b64 = base64Helper.encodeToStringSync(new Uint8Array(buf));
-      const dataUrl = `data:application/octet-stream;base64,${b64}`;
+      const dataUrl = `data:${mime};base64,${b64}`;
 
-      const profile = cur.activeProfile ? cur.activeProfile : 'default';
-      const uploadResult = await HermesFileClient.uploadImage(
-        cur.url,
-        profile,
-        filename,
-        dataUrl,
-        cur.token,
-        cur.cookies
-      );
+      if (isImg) {
+        // 图片走 image-upload 路由
+        const profile = cur.activeProfile ? cur.activeProfile : 'default';
+        const uploadResult = await HermesFileClient.uploadImage(
+          cur.url,
+          profile,
+          filename,
+          dataUrl,
+          cur.token,
+          cur.cookies
+        );
+        const targetPath = uploadResult.path || uploadResult.url || filename;
+        const refTag = `![${filename}](${targetPath})\n`;
+        this.inputText = this.inputText ? `${this.inputText}\n${refTag}` : refTag;
+        this.showToast(`图片已上传: ${filename}`);
+      } else {
+        // 普通文档/代码/PDF等按上游规范走 Gateway RPC file.attach
+        const attachName = generateAttachmentName(filename);
+        await this.chatVm.attachDocument(attachName, dataUrl);
+        const refTag = `[📎 附件: ${filename}](${attachName})\n`;
+        this.inputText = this.inputText ? `${this.inputText}\n${refTag}` : refTag;
+        this.showToast(`文档已附加到当前会话: ${filename}`);
+      }
 
-      const targetPath = uploadResult.path || uploadResult.url || filename;
-      const refTag = `[${filename}](${targetPath})\n`;
-      this.inputText = this.inputText ? `${this.inputText}\n${refTag}` : refTag;
-
-      this.showToast(`文件已上传: ${filename}`);
       this.showAttachmentDialog = false;
     } catch (e) {
       this.showToast(`选择/上传文件失败: ${e}`);
@@ -420,60 +547,66 @@ struct Index {
 
   build() {
     Column() {
-      // 1. 顶部导航与状态栏
+      // 1. 顶部导航与状态栏 (移动端自适应布局，杜绝标题挤压)
       Row() {
         Column() {
           Text(this.currentSessionTitle)
-            .fontSize(18)
+            .fontSize(16)
             .fontWeight(FontWeight.Bold)
             .maxLines(1)
             .textOverflow({ overflow: TextOverflow.Ellipsis })
           Row() {
-            Circle({ width: 8, height: 8 })
+            Circle({ width: 7, height: 7 })
               .fill(this.isConnected ? '#34C759' : '#FF3B30')
               .margin({ right: 4 })
             Text(this.connectionStatusText)
-              .fontSize(12)
+              .fontSize(11)
               .fontColor('#8E8E93')
+              .maxLines(1)
           }
         }
         .alignItems(HorizontalAlign.Start)
         .layoutWeight(1)
+        .margin({ right: 6 })
 
         Button(this.currentModel)
-          .fontSize(12)
+          .fontSize(11)
+          .height(32)
           .backgroundColor('#F2F2F7')
           .fontColor('#007AFF')
-          .margin({ right: 6 })
+          .margin({ right: 4 })
           .onClick(() => {
             this.showModelDialog = true;
           })
 
-        Button('工作区')
-          .fontSize(12)
-          .backgroundColor('#E5E5EA')
-          .fontColor('#000000')
-          .margin({ right: 6 })
-          .onClick(async () => {
-            const cur = this.connVm.getCurrentConnection();
-            if (cur) {
-              await this.workspaceVm.loadDirectory(cur, '');
-            }
-            this.showWorkspaceDialog = true;
-          })
-
         Button('会话')
-          .fontSize(12)
+          .fontSize(11)
+          .height(32)
           .backgroundColor('#E5E5EA')
           .fontColor('#000000')
-          .margin({ right: 6 })
+          .margin({ right: 4 })
           .onClick(() => {
             this.refreshSessions();
             this.showSessionListDialog = true;
           })
 
+        Button('功能')
+          .fontSize(11)
+          .height(32)
+          .backgroundColor('#E5E5EA')
+          .fontColor('#000000')
+          .margin({ right: 4 })
+          .onClick(async () => {
+            const cur = this.connVm.getCurrentConnection();
+            if (cur) {
+              await this.loadCurrentToolsData();
+            }
+            this.showToolsDialog = true;
+          })
+
         Button('设置')
-          .fontSize(12)
+          .fontSize(11)
+          .height(32)
           .backgroundColor('#007AFF')
           .fontColor('#FFFFFF')
           .onClick(() => {
@@ -481,7 +614,7 @@ struct Index {
           })
       }
       .width('100%')
-      .padding({ left: 16, right: 16, top: 12, bottom: 12 })
+      .padding({ left: 12, right: 12, top: 10, bottom: 10 })
       .backgroundColor('#FFFFFF')
       .border({ width: { bottom: 1 }, color: '#E5E5EA' })
 
@@ -560,81 +693,168 @@ struct Index {
         .borderRadius(8)
       }
 
-      // 4. 消息列表主视窗
-      List({ space: 12 }) {
-        ForEach(this.messages, (msg: ChatMessage) => {
-          ListItem() {
+      // 4. 消息列表或空态引导视窗
+      if (this.messages.length === 0) {
+        Column() {
+          if (!this.isConnected) {
+            // 未连接服务器的首次引导与空态界面 (对齐 REVIEW_DEVICE_01.md)
             Column() {
-              // 角色标题
-              Text(msg.role === 'user' ? '用户' : 'Hermes')
-                .fontSize(11)
-                .fontColor('#8E8E93')
-                .alignSelf(msg.role === 'user' ? ItemAlign.End : ItemAlign.Start)
-                .margin({ bottom: 2 })
-
-              // 思考/推理过程折叠卡片
-              if (msg.reasoning && msg.reasoning.length > 0) {
-                Column() {
-                  Text('思考过程')
-                    .fontSize(11)
-                    .fontWeight(FontWeight.Bold)
-                    .fontColor('#6B7280')
-                  Text(msg.reasoning)
-                    .fontSize(12)
-                    .fontColor('#4B5563')
-                    .margin({ top: 2 })
-                }
-                .width('100%')
-                .padding(8)
+              Text('Hermex')
+                .fontSize(26)
+                .fontWeight(FontWeight.Bold)
+                .fontColor('#111827')
                 .margin({ bottom: 6 })
-                .backgroundColor('#F3F4F6')
-                .borderRadius(6)
-              }
 
-              // 工具调用状态卡片
-              if (msg.toolCalls && msg.toolCalls.length > 0) {
-                ForEach(msg.toolCalls, (tool: ToolCallItem) => {
-                  Row() {
-                    Text(`工具: ${tool.name}`)
+              Text('自托管 Hermes Agent 原生鸿蒙客户端')
+                .fontSize(13)
+                .fontColor('#6B7280')
+                .margin({ bottom: 18 })
+
+              Column({ space: 12 }) {
+                Row() {
+                  Text('🌐').fontSize(18).margin({ right: 10 })
+                  Column() {
+                    Text('灵活连接').fontSize(13).fontWeight(FontWeight.Medium).fontColor('#1F2937')
+                    Text('局域网、Tailscale、Cloudflare 隧道或直连 IP/域名').fontSize(11).fontColor('#8E8E93')
+                  }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+                }.width('100%')
+
+                Row() {
+                  Text('🔒').fontSize(18).margin({ right: 10 })
+                  Column() {
+                    Text('硬件级凭据保护').fontSize(13).fontWeight(FontWeight.Medium).fontColor('#1F2937')
+                    Text('通过 AssetStoreKit 密文隔离存储 Token 与密码').fontSize(11).fontColor('#8E8E93')
+                  }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+                }.width('100%')
+
+                Row() {
+                  Text('⚡').fontSize(18).margin({ right: 10 })
+                  Column() {
+                    Text('实时双向交互').fontSize(13).fontWeight(FontWeight.Medium).fontColor('#1F2937')
+                    Text('流式 Markdown、思考过程、工具调用与审批控制').fontSize(11).fontColor('#8E8E93')
+                  }.alignItems(HorizontalAlign.Start).layoutWeight(1)
+                }.width('100%')
+              }
+              .width('100%')
+              .padding(14)
+              .backgroundColor('#F9FAFB')
+              .borderRadius(12)
+              .margin({ bottom: 20 })
+
+              Button('立即配置 Hermes 服务器')
+                .fontSize(14)
+                .fontWeight(FontWeight.Medium)
+                .height(42)
+                .width('100%')
+                .backgroundColor('#007AFF')
+                .fontColor('#FFFFFF')
+                .onClick(() => {
+                  this.showServerDialog = true;
+                })
+            }
+            .width('90%')
+            .padding(18)
+            .backgroundColor('#FFFFFF')
+            .borderRadius(16)
+            .shadow({ radius: 10, color: '#15000000' })
+          } else {
+            // 已连接但当前无消息
+            Column() {
+              Text('💬').fontSize(36).margin({ bottom: 10 })
+              Text('会话已准备就绪')
+                .fontSize(15)
+                .fontWeight(FontWeight.Bold)
+                .fontColor('#374151')
+                .margin({ bottom: 4 })
+              Text('在下方输入框发送提示词开始对话，或点击 📎 附加图片与文档')
+                .fontSize(12)
+                .fontColor('#8E8E93')
+                .textAlign(TextAlign.Center)
+            }
+            .width('85%')
+            .padding(20)
+          }
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .justifyContent(FlexAlign.Center)
+        .alignItems(HorizontalAlign.Center)
+      } else {
+        List({ space: 12 }) {
+          ForEach(this.messages, (msg: ChatMessage) => {
+            ListItem() {
+              Column() {
+                // 角色标题
+                Text(msg.role === 'user' ? '用户' : 'Hermes')
+                  .fontSize(11)
+                  .fontColor('#8E8E93')
+                  .alignSelf(msg.role === 'user' ? ItemAlign.End : ItemAlign.Start)
+                  .margin({ bottom: 2 })
+
+                // 思考/推理过程折叠卡片
+                if (msg.reasoning && msg.reasoning.length > 0) {
+                  Column() {
+                    Text('思考过程')
                       .fontSize(11)
-                      .fontWeight(FontWeight.Medium)
-                      .fontColor('#374151')
-                    Blank()
-                    Text(tool.status === 'running' ? '执行中...' : '已完成')
-                      .fontSize(11)
-                      .fontColor(tool.status === 'running' ? '#D97706' : '#10B981')
+                      .fontWeight(FontWeight.Bold)
+                      .fontColor('#6B7280')
+                    Text(msg.reasoning)
+                      .fontSize(12)
+                      .fontColor('#4B5563')
+                      .margin({ top: 2 })
                   }
                   .width('100%')
-                  .padding(6)
-                  .margin({ bottom: 4 })
-                  .backgroundColor('#E5E7EB')
-                  .borderRadius(4)
-                })
-              }
-
-              // 主文字气泡 (集成 MarkdownView)
-              Column() {
-                if (msg.role === 'user') {
-                  Text(msg.content)
-                    .fontSize(15)
-                    .fontColor('#FFFFFF')
-                } else {
-                  MarkdownView({ content: msg.content || (msg.status === 'streaming' ? '思考与撰写中...' : '') })
+                  .padding(8)
+                  .margin({ bottom: 6 })
+                  .backgroundColor('#F3F4F6')
+                  .borderRadius(6)
                 }
+
+                // 工具调用状态卡片
+                if (msg.toolCalls && msg.toolCalls.length > 0) {
+                  ForEach(msg.toolCalls, (tool: ToolCallItem) => {
+                    Row() {
+                      Text(`工具: ${tool.name}`)
+                        .fontSize(11)
+                        .fontWeight(FontWeight.Medium)
+                        .fontColor('#374151')
+                      Blank()
+                      Text(tool.status === 'running' ? '执行中...' : '已完成')
+                        .fontSize(11)
+                        .fontColor(tool.status === 'running' ? '#D97706' : '#10B981')
+                    }
+                    .width('100%')
+                    .padding(6)
+                    .margin({ bottom: 4 })
+                    .backgroundColor('#E5E7EB')
+                    .borderRadius(4)
+                  })
+                }
+
+                // 主文字气泡 (集成 MarkdownView)
+                Column() {
+                  if (msg.role === 'user') {
+                    Text(msg.content)
+                      .fontSize(15)
+                      .fontColor('#FFFFFF')
+                  } else {
+                    MarkdownView({ content: msg.content || (msg.status === 'streaming' ? '思考与撰写中...' : '') })
+                  }
+                }
+                .padding(12)
+                .backgroundColor(msg.role === 'user' ? '#007AFF' : '#F2F2F7')
+                .borderRadius(12)
+                .alignSelf(msg.role === 'user' ? ItemAlign.End : ItemAlign.Start)
               }
-              .padding(12)
-              .backgroundColor(msg.role === 'user' ? '#007AFF' : '#F2F2F7')
-              .borderRadius(12)
-              .alignSelf(msg.role === 'user' ? ItemAlign.End : ItemAlign.Start)
+              .width('100%')
+              .alignItems(msg.role === 'user' ? HorizontalAlign.End : HorizontalAlign.Start)
             }
-            .width('100%')
-            .alignItems(msg.role === 'user' ? HorizontalAlign.End : HorizontalAlign.Start)
-          }
-        }, (msg: ChatMessage) => msg.id)
+          }, (msg: ChatMessage) => msg.id)
+        }
+        .width('100%')
+        .layoutWeight(1)
+        .padding({ left: 16, right: 16, top: 12, bottom: 12 })
       }
-      .width('100%')
-      .layoutWeight(1)
-      .padding({ left: 16, right: 16, top: 12, bottom: 12 })
 
       // 5. 底部输入栏与控制 (支持原生附件调起)
       Row() {
@@ -985,6 +1205,29 @@ struct Index {
             }
             .width('100%')
           } else {
+            if (this.lastDownloadedFileName.length > 0) {
+              Row() {
+                Text(`已下载: ${this.lastDownloadedFileName}`)
+                  .fontSize(11)
+                  .fontColor('#059669')
+                  .layoutWeight(1)
+                  .maxLines(1)
+                Button('系统打开/分享')
+                  .fontSize(11)
+                  .height(26)
+                  .backgroundColor('#10B981')
+                  .fontColor('#FFFFFF')
+                  .onClick(() => {
+                    this.openOrShareFile(this.lastDownloadedFilePath, this.lastDownloadedFileName);
+                  })
+              }
+              .width('100%')
+              .padding(6)
+              .margin({ bottom: 6 })
+              .backgroundColor('#ECFDF5')
+              .borderRadius(6)
+            }
+
             // 文件与目录列表
             List({ space: 6 }) {
               ForEach(this.workspaceEntries, (entry: WorkspaceFileEntry) => {
@@ -1127,6 +1370,504 @@ struct Index {
         .borderRadius(16)
         .shadow({ radius: 20, color: '#40000000' })
         .position({ x: '7.5%', y: '25%' })
+      }
+
+      // 11. 更多功能弹窗 (任务、技能、设定与记忆、用量、Git与工作区)
+      if (this.showToolsDialog) {
+        Column() {
+          Row() {
+            Text('扩展功能与运维')
+              .fontSize(18)
+              .fontWeight(FontWeight.Bold)
+            Blank()
+            Button('关闭')
+              .fontSize(12)
+              .backgroundColor('#E5E5EA')
+              .fontColor('#374151')
+              .onClick(() => {
+                this.showToolsDialog = false;
+              })
+          }
+          .width('100%')
+          .margin({ bottom: 12 })
+
+          // 选项卡切换
+          Row() {
+            Button('任务')
+              .fontSize(11)
+              .height(30)
+              .backgroundColor(this.selectedToolsTab === 0 ? '#007AFF' : '#F2F2F7')
+              .fontColor(this.selectedToolsTab === 0 ? '#FFFFFF' : '#374151')
+              .margin({ right: 4 })
+              .onClick(async () => {
+                this.selectedToolsTab = 0;
+                await this.loadCurrentToolsData();
+              })
+
+            Button('技能')
+              .fontSize(11)
+              .height(30)
+              .backgroundColor(this.selectedToolsTab === 1 ? '#007AFF' : '#F2F2F7')
+              .fontColor(this.selectedToolsTab === 1 ? '#FFFFFF' : '#374151')
+              .margin({ right: 4 })
+              .onClick(async () => {
+                this.selectedToolsTab = 1;
+                await this.loadCurrentToolsData();
+              })
+
+            Button('设定')
+              .fontSize(11)
+              .height(30)
+              .backgroundColor(this.selectedToolsTab === 2 ? '#007AFF' : '#F2F2F7')
+              .fontColor(this.selectedToolsTab === 2 ? '#FFFFFF' : '#374151')
+              .margin({ right: 4 })
+              .onClick(async () => {
+                this.selectedToolsTab = 2;
+                await this.loadCurrentToolsData();
+              })
+
+            Button('用量')
+              .fontSize(11)
+              .height(30)
+              .backgroundColor(this.selectedToolsTab === 3 ? '#007AFF' : '#F2F2F7')
+              .fontColor(this.selectedToolsTab === 3 ? '#FFFFFF' : '#374151')
+              .margin({ right: 4 })
+              .onClick(async () => {
+                this.selectedToolsTab = 3;
+                await this.loadCurrentToolsData();
+              })
+
+            Button('Git')
+              .fontSize(11)
+              .height(30)
+              .backgroundColor(this.selectedToolsTab === 4 ? '#007AFF' : '#F2F2F7')
+              .fontColor(this.selectedToolsTab === 4 ? '#FFFFFF' : '#374151')
+              .onClick(async () => {
+                this.selectedToolsTab = 4;
+                await this.loadCurrentToolsData();
+              })
+          }
+          .width('100%')
+          .margin({ bottom: 10 })
+
+          if (this.isToolsLoading) {
+            Text(this.toolsStatusText || '正在加载数据...')
+              .fontSize(12)
+              .fontColor('#6B7280')
+              .margin({ top: 20, bottom: 20 })
+          } else {
+            // Tab 0: 定时任务 (F08)
+            if (this.selectedToolsTab === 0) {
+              Column() {
+                Row() {
+                  Text(`定时任务列表 (${this.cronVm.jobs.length})`)
+                    .fontSize(13)
+                    .fontWeight(FontWeight.Bold)
+                    .layoutWeight(1)
+                  Button('刷新')
+                    .fontSize(11)
+                    .height(26)
+                    .backgroundColor('#E5E5EA')
+                    .fontColor('#007AFF')
+                    .onClick(async () => {
+                      const cur = this.connVm.getCurrentConnection();
+                      if (cur) await this.cronVm.loadJobs(cur);
+                    })
+                }
+                .width('100%')
+                .margin({ bottom: 8 })
+
+                if (this.cronVm.jobs.length === 0) {
+                  Text('暂无配置的定时任务')
+                    .fontSize(12)
+                    .fontColor('#9CA3AF')
+                    .margin({ top: 20 })
+                } else {
+                  List({ space: 6 }) {
+                    ForEach(this.cronVm.jobs, (job: CronJobItem) => {
+                      ListItem() {
+                        Row() {
+                          Column() {
+                            Text(job.name)
+                              .fontSize(13)
+                              .fontWeight(FontWeight.Medium)
+                            Text(`表达式: ${job.schedule || '无'} | 状态: ${job.enabled ? '运行中' : '已暂停'}`)
+                              .fontSize(10)
+                              .fontColor('#8E8E93')
+                              .margin({ top: 2 })
+                          }
+                          .alignItems(HorizontalAlign.Start)
+                          .layoutWeight(1)
+
+                          Button('运行')
+                            .fontSize(11)
+                            .height(26)
+                            .backgroundColor('#E0E7FF')
+                            .fontColor('#4338CA')
+                            .margin({ right: 4 })
+                            .onClick(async () => {
+                              const cur = this.connVm.getCurrentConnection();
+                              if (cur) {
+                                await this.cronVm.runJob(cur, job.id);
+                                this.showToast(this.cronVm.statusMessage);
+                              }
+                            })
+
+                          Button(job.enabled ? '暂停' : '恢复')
+                            .fontSize(11)
+                            .height(26)
+                            .backgroundColor(job.enabled ? '#FEE2E2' : '#DCFCE7')
+                            .fontColor(job.enabled ? '#B91C1C' : '#15803D')
+                            .onClick(async () => {
+                              const cur = this.connVm.getCurrentConnection();
+                              if (cur) {
+                                await this.cronVm.toggleJob(cur, job);
+                              }
+                            })
+                        }
+                        .width('100%')
+                        .padding(8)
+                        .backgroundColor('#F9FAFB')
+                        .borderRadius(6)
+                      }
+                    })
+                  }
+                  .height(220)
+                  .width('100%')
+                }
+              }
+              .width('100%')
+            }
+
+            // Tab 1: 技能扩展 (F09)
+            if (this.selectedToolsTab === 1) {
+              Column() {
+                Row() {
+                  Text(`已安装技能 (${this.skillsVm.skills.length})`)
+                    .fontSize(13)
+                    .fontWeight(FontWeight.Bold)
+                    .layoutWeight(1)
+                  Button('刷新')
+                    .fontSize(11)
+                    .height(26)
+                    .backgroundColor('#E5E5EA')
+                    .fontColor('#007AFF')
+                    .onClick(async () => {
+                      const cur = this.connVm.getCurrentConnection();
+                      if (cur) await this.skillsVm.loadSkillsAndMemory(cur);
+                    })
+                }
+                .width('100%')
+                .margin({ bottom: 8 })
+
+                if (this.skillsVm.skills.length === 0) {
+                  Text('当前 Profile 暂无可用技能')
+                    .fontSize(12)
+                    .fontColor('#9CA3AF')
+                    .margin({ top: 20 })
+                } else {
+                  List({ space: 6 }) {
+                    ForEach(this.skillsVm.skills, (s: SkillSummary) => {
+                      ListItem() {
+                        Row() {
+                          Column() {
+                            Text(s.name)
+                              .fontSize(13)
+                              .fontWeight(FontWeight.Medium)
+                            if (s.description) {
+                              Text(s.description)
+                                .fontSize(10)
+                                .fontColor('#8E8E93')
+                                .maxLines(1)
+                                .margin({ top: 2 })
+                            }
+                          }
+                          .alignItems(HorizontalAlign.Start)
+                          .layoutWeight(1)
+
+                          Button(s.enabled ? '已启用' : '已禁用')
+                            .fontSize(11)
+                            .height(26)
+                            .backgroundColor(s.enabled ? '#DCFCE7' : '#F3F4F6')
+                            .fontColor(s.enabled ? '#15803D' : '#6B7280')
+                            .onClick(async () => {
+                              const cur = this.connVm.getCurrentConnection();
+                              if (cur) {
+                                await this.skillsVm.toggleSkill(cur, s);
+                              }
+                            })
+                        }
+                        .width('100%')
+                        .padding(8)
+                        .backgroundColor('#F9FAFB')
+                        .borderRadius(6)
+                      }
+                    })
+                  }
+                  .height(220)
+                  .width('100%')
+                }
+              }
+              .width('100%')
+            }
+
+            // Tab 2: 设定与记忆档案 (F09)
+            if (this.selectedToolsTab === 2) {
+              Column() {
+                Text('Profile 设定 (Soul)')
+                  .fontSize(12)
+                  .fontWeight(FontWeight.Bold)
+                  .alignSelf(ItemAlign.Start)
+                  .margin({ bottom: 4 })
+
+                TextArea({ text: this.editingSoulText })
+                  .height(90)
+                  .width('100%')
+                  .fontSize(11)
+                  .fontFamily('monospace')
+                  .margin({ bottom: 6 })
+                  .onChange((val: string) => {
+                    this.editingSoulText = val;
+                  })
+
+                Button('保存设定修改')
+                  .fontSize(11)
+                  .height(28)
+                  .backgroundColor('#007AFF')
+                  .fontColor('#FFFFFF')
+                  .margin({ bottom: 10 })
+                  .onClick(async () => {
+                    const cur = this.connVm.getCurrentConnection();
+                    if (cur) {
+                      const ok = await this.skillsVm.saveSoul(cur, this.editingSoulText);
+                      this.showToast(ok ? '设定已更新' : '更新失败');
+                    }
+                  })
+
+                Text('长期记忆内容 (memories/MEMORY.md)')
+                  .fontSize(12)
+                  .fontWeight(FontWeight.Bold)
+                  .alignSelf(ItemAlign.Start)
+                  .margin({ bottom: 4 })
+
+                Scroll() {
+                  Text(this.skillsVm.memoryText || '(暂无长期记忆条目)')
+                    .fontSize(11)
+                    .fontColor('#4B5563')
+                    .fontFamily('monospace')
+                }
+                .height(90)
+                .width('100%')
+                .padding(6)
+                .backgroundColor('#F9FAFB')
+                .borderRadius(6)
+              }
+              .width('100%')
+            }
+
+            // Tab 3: 用量分析统计 (F09/F12)
+            if (this.selectedToolsTab === 3) {
+              Column() {
+                Row() {
+                  Text('近期用量汇总 (最近 7 天)')
+                    .fontSize(13)
+                    .fontWeight(FontWeight.Bold)
+                    .layoutWeight(1)
+                  Button('刷新')
+                    .fontSize(11)
+                    .height(26)
+                    .backgroundColor('#E5E5EA')
+                    .fontColor('#007AFF')
+                    .onClick(async () => {
+                      const cur = this.connVm.getCurrentConnection();
+                      if (cur) await this.insightsVm.loadInsights(cur, 7);
+                    })
+                }
+                .width('100%')
+                .margin({ bottom: 8 })
+
+                Row() {
+                  Column() {
+                    Text('总调用')
+                      .fontSize(10)
+                      .fontColor('#8E8E93')
+                    Text(String(this.insightsVm.usage ? this.insightsVm.usage.totalApiCalls : 0))
+                      .fontSize(16)
+                      .fontWeight(FontWeight.Bold)
+                  }.layoutWeight(1)
+
+                  Column() {
+                    Text('总 Tokens')
+                      .fontSize(10)
+                      .fontColor('#8E8E93')
+                    Text(String(this.insightsVm.usage ? (this.insightsVm.usage.totalInputTokens + this.insightsVm.usage.totalOutputTokens) : 0))
+                      .fontSize(16)
+                      .fontWeight(FontWeight.Bold)
+                  }.layoutWeight(1)
+
+                  Column() {
+                    Text('输入/输出')
+                      .fontSize(10)
+                      .fontColor('#8E8E93')
+                    Text(`${this.insightsVm.usage ? this.insightsVm.usage.totalInputTokens : 0} / ${this.insightsVm.usage ? this.insightsVm.usage.totalOutputTokens : 0}`)
+                      .fontSize(11)
+                      .fontColor('#4B5563')
+                  }.layoutWeight(1)
+                }
+                .width('100%')
+                .padding(10)
+                .backgroundColor('#EFF6FF')
+                .borderRadius(8)
+                .margin({ bottom: 10 })
+
+                Text('模型消耗明细')
+                  .fontSize(12)
+                  .fontWeight(FontWeight.Bold)
+                  .alignSelf(ItemAlign.Start)
+                  .margin({ bottom: 4 })
+
+                if (this.insightsVm.modelStats.length === 0) {
+                  Text('暂无模型明细记录')
+                    .fontSize(11)
+                    .fontColor('#9CA3AF')
+                    .margin({ top: 10 })
+                } else {
+                  List({ space: 4 }) {
+                    ForEach(this.insightsVm.modelStats, (item: ModelUsageItem) => {
+                      ListItem() {
+                        Row() {
+                          Text(item.model)
+                            .fontSize(11)
+                            .fontWeight(FontWeight.Medium)
+                            .layoutWeight(1)
+                          Text(`${item.inputTokens + item.outputTokens} tokens`)
+                            .fontSize(11)
+                            .fontColor('#6B7280')
+                        }
+                        .width('100%')
+                        .padding(6)
+                        .backgroundColor('#F9FAFB')
+                        .borderRadius(4)
+                      }
+                    })
+                  }
+                  .height(130)
+                  .width('100%')
+                }
+              }
+              .width('100%')
+            }
+
+            // Tab 4: 项目与 Git (F06)
+            if (this.selectedToolsTab === 4) {
+              Column() {
+                Row() {
+                  Text('项目与 Git 仓库管理')
+                    .fontSize(13)
+                    .fontWeight(FontWeight.Bold)
+                    .layoutWeight(1)
+                  Button('刷新')
+                    .fontSize(11)
+                    .height(26)
+                    .backgroundColor('#E5E5EA')
+                    .fontColor('#007AFF')
+                    .onClick(async () => {
+                      const cur = this.connVm.getCurrentConnection();
+                      if (cur) await this.gitVm.loadProjectsAndGit(cur, this.workspacePath);
+                    })
+                }
+                .width('100%')
+                .margin({ bottom: 8 })
+
+                if (this.gitVm.gitStatus) {
+                  Row() {
+                    Column() {
+                      Text(`当前分支: ${this.gitVm.gitStatus.branch}`)
+                        .fontSize(13)
+                        .fontWeight(FontWeight.Bold)
+                      Text(`改动文件: ${this.gitVm.gitStatus.changed} | 未跟踪: ${this.gitVm.gitStatus.untracked}`)
+                        .fontSize(11)
+                        .fontColor('#6B7280')
+                        .margin({ top: 2 })
+                    }
+                    .alignItems(HorizontalAlign.Start)
+                    .layoutWeight(1)
+                  }
+                  .width('100%')
+                  .padding(8)
+                  .backgroundColor('#F0FDF4')
+                  .borderRadius(8)
+                  .margin({ bottom: 10 })
+
+                  Text('切换分支')
+                    .fontSize(12)
+                    .fontWeight(FontWeight.Bold)
+                    .alignSelf(ItemAlign.Start)
+                    .margin({ bottom: 4 })
+
+                  List({ space: 4 }) {
+                    ForEach(this.gitVm.branches, (b: GitBranchInfo) => {
+                      ListItem() {
+                        Row() {
+                          Text(b.name + (b.isCurrent ? ' (当前)' : ''))
+                            .fontSize(12)
+                            .fontColor(b.isCurrent ? '#16A34A' : '#1F2937')
+                            .layoutWeight(1)
+
+                          if (!b.isCurrent) {
+                            Button('切至该分支')
+                              .fontSize(11)
+                              .height(24)
+                              .backgroundColor('#E5E5EA')
+                              .fontColor('#007AFF')
+                              .onClick(async () => {
+                                const cur = this.connVm.getCurrentConnection();
+                                if (cur) {
+                                  await this.gitVm.switchBranch(cur, b.name);
+                                  this.showToast(this.gitVm.statusMessage);
+                                }
+                              })
+                          }
+                        }
+                        .width('100%')
+                        .padding(6)
+                        .backgroundColor('#F9FAFB')
+                        .borderRadius(4)
+                      }
+                    })
+                  }
+                  .height(130)
+                  .width('100%')
+                } else {
+                  Column() {
+                    Text('当前工作区未检测到 Git 仓库')
+                      .fontSize(12)
+                      .fontColor('#9CA3AF')
+                      .margin({ top: 10, bottom: 10 })
+
+                    Button('📂 打开工作区文件浏览器')
+                      .fontSize(13)
+                      .height(36)
+                      .backgroundColor('#E0E7FF')
+                      .fontColor('#3730A3')
+                      .onClick(() => {
+                        this.showToolsDialog = false;
+                        this.showWorkspaceDialog = true;
+                      })
+                  }
+                  .width('100%')
+                }
+              }
+              .width('100%')
+            }
+          }
+        }
+        .width('92%')
+        .padding(16)
+        .backgroundColor('#FFFFFF')
+        .borderRadius(16)
+        .shadow({ radius: 20, color: '#40000000' })
+        .position({ x: '4%', y: '10%' })
       }
     }
     .width('100%')

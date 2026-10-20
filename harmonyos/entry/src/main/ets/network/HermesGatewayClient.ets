@@ -76,6 +76,10 @@ export class HermesGatewayClient {
    * @param baseUrl HTTP 或 HTTPS 服务器根地址
    * @param ticket 通过 /api/auth/ws-ticket 换取的单次 ticket
    */
+  public isGatewayConnected(): boolean {
+    return this.isConnected;
+  }
+
   public async connect(baseUrl: string, ticket: string): Promise<void> {
     this.disconnect();
     this.generation += 1;
@@ -178,13 +182,14 @@ export class HermesGatewayClient {
         settleReject(new Error(`WebSocket error: ${JSON.stringify(err)}`));
       });
 
-      const connectHeaders: Record<string, string> = {
-        'Sec-WebSocket-Protocol': subprotocol
+      const connectOptions: webSocket.WebSocketRequestOptions = {
+        protocol: subprotocol,
+        header: {
+          'Sec-WebSocket-Protocol': subprotocol
+        }
       };
 
-      this.ws.connect(wsUrl, {
-        header: connectHeaders
-      }, (err, value) => {
+      this.ws.connect(wsUrl, connectOptions, (err, value) => {
         if (err) {
           settleReject(new Error(`Failed to connect ws: ${JSON.stringify(err)}`));
         }
@@ -517,6 +522,19 @@ export class HermesGatewayClient {
       'session_id': sessionId
     };
     return this.call('session.interrupt', params);
+  }
+
+  /**
+   * 附加文件/文档：file.attach (HermesCall.swift:305, 418)
+   * 专用于普通文件、代码、PDF、音频等非纯图片附件
+   */
+  public async fileAttach(sessionId: string, filename: string, dataUrl: string): Promise<Record<string, Object>> {
+    const params: Record<string, Object> = {
+      'session_id': sessionId,
+      'name': filename,
+      'data_url': dataUrl
+    };
+    return this.call('file.attach', params);
   }
 
   /**

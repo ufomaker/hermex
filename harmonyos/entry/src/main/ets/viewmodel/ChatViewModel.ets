@@ -17,6 +17,7 @@ export class ChatViewModel {
   public currentApproval: ApprovalRequest | null = null;
   public currentClarify: ClarifyRequest | null = null;
   public connectionStatusText: string = '未连接';
+  public lastErrorDetail: string = '';
   public isConnected: boolean = false;
   public isSubmittingApproval: boolean = false;
   public isSubmittingClarify: boolean = false;
@@ -151,7 +152,8 @@ export class ChatViewModel {
           this.isConnected = false;
           this.isGenerating = false;
           this.runtimeSessionId = '';
-          this.connectionStatusText = `已断开: ${reason}`;
+          this.connectionStatusText = '已断开';
+          this.lastErrorDetail = reason;
           this.notify();
         },
         onMessageStart: (sid: string) => {
@@ -268,7 +270,8 @@ export class ChatViewModel {
       }
       this.isConnected = false;
       this.runtimeSessionId = '';
-      this.connectionStatusText = `连接失败: ${e}`;
+      this.connectionStatusText = '连接失败';
+      this.lastErrorDetail = `${e}`;
       this.toast(`网关握手失败: ${e}`);
       this.notify();
     }
@@ -439,6 +442,20 @@ export class ChatViewModel {
     } catch (e) {
       // ignore
     }
+  }
+
+  /**
+   * 附加普通文档到会话上下文 (file.attach RPC)
+   */
+  public async attachDocument(filename: string, dataUrl: string): Promise<Record<string, Object>> {
+    if (!this.gateway) {
+      throw new Error('未连接到活跃会话网关');
+    }
+    const targetSession = this.runtimeSessionId || this.storedSessionId;
+    if (!targetSession) {
+      throw new Error('未选择有效会话');
+    }
+    return await this.gateway.fileAttach(targetSession, filename, dataUrl);
   }
 
   public disconnect(): void {

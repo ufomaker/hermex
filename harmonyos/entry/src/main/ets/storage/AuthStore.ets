@@ -1,5 +1,6 @@
 import dataPreferences from '@ohos.data.preferences';
 import asset from '@ohos.security.asset';
+import util from '@ohos.util';
 import { BusinessError } from '@ohos.base';
 import { BotConnection, cloneConnection } from '../model/Connection';
 
@@ -220,25 +221,95 @@ export class HarmonyPlatformAuthAdapter implements AuthStorageAdapter {
   }
 
   public async clearAll(): Promise<void> {
+    try {
+      const metaList = await this.loadMetadata();
+      for (let i = 0; i < metaList.length; i++) {
+        try {
+          await this.removeCredential(metaList[i].id);
+        } catch (_e) {
+          // 清除流程中吞噬个别凭据清除异常，确保所有凭据尽可能清理完毕
+        }
+      }
+    } catch (_e) {
+      // 容错处理
+    }
     const pref = await this.getMetaPref();
     await pref.clear();
     await pref.flush();
   }
 
   public static stringToUint8Array(str: string): Uint8Array {
-    const buf = new Uint8Array(str.length);
-    for (let i = 0; i < str.length; i++) {
-      buf[i] = str.charCodeAt(i) & 0xff;
+    try {
+      const enc = new util.TextEncoder('utf-8');
+      return enc.encodeInto(str);
+    } catch (_e) {
+      return HarmonyPlatformAuthAdapter.utf8EncodeFallback(str);
     }
-    return buf;
   }
 
   public static uint8ArrayToString(arr: Uint8Array): string {
-    let s = '';
-    for (let i = 0; i < arr.length; i++) {
-      s += String.fromCharCode(arr[i]);
+    try {
+      const dec = util.TextDecoder.create('utf-8');
+      return dec.decodeToString(arr);
+    } catch (_e) {
+      return HarmonyPlatformAuthAdapter.utf8DecodeFallback(arr);
     }
-    return s;
+  }
+
+  public static utf8EncodeFallback(str: string): Uint8Array {
+    const codePoints: number[] = [];
+    for (let i = 0; i < str.length; i++) {
+      let code = str.charCodeAt(i);
+      if (code >= 0xD800 && code <= 0xDBFF && i + 1 < str.length) {
+        const next = str.charCodeAt(i + 1);
+        if (next >= 0xDC00 && next <= 0xDFFF) {
+          code = ((code - 0xD800) << 10) + (next - 0xDC00) + 0x10000;
+          i++;
+        }
+      }
+      if (code < 0x80) {
+        codePoints.push(code);
+      } else if (code < 0x800) {
+        codePoints.push(0xC0 | (code >> 6));
+        codePoints.push(0x80 | (code & 0x3F));
+      } else if (code < 0x10000) {
+        codePoints.push(0xE0 | (code >> 12));
+        codePoints.push(0x80 | ((code >> 6) & 0x3F));
+        codePoints.push(0x80 | (code & 0x3F));
+      } else {
+        codePoints.push(0xF0 | (code >> 18));
+        codePoints.push(0x80 | ((code >> 12) & 0x3F));
+        codePoints.push(0x80 | ((code >> 6) & 0x3F));
+        codePoints.push(0x80 | (code & 0x3F));
+      }
+    }
+    return new Uint8Array(codePoints);
+  }
+
+  public static utf8DecodeFallback(arr: Uint8Array): string {
+    let result = '';
+    let i = 0;
+    while (i < arr.length) {
+      const b0 = arr[i++];
+      if (b0 < 0x80) {
+        result += String.fromCharCode(b0);
+      } else if ((b0 & 0xE0) === 0xC0) {
+        const b1 = arr[i++];
+        result += String.fromCharCode(((b0 & 0x1F) << 6) | (b1 & 0x3F));
+      } else if ((b0 & 0xF0) === 0xE0) {
+        const b1 = arr[i++];
+        const b2 = arr[i++];
+        result += String.fromCharCode(((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F));
+      } else if ((b0 & 0xF8) === 0xF0) {
+        const b1 = arr[i++];
+        const b2 = arr[i++];
+        const b3 = arr[i++];
+        let code = ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F);
+        code -= 0x10000;
+        result += String.fromCharCode(0xD800 + (code >> 10), 0xDC00 + (code & 0x3FF));
+      }
+    }
+    return result;
   }
 }
 
@@ -391,6 +462,7 @@ export class AuthStore {
 
   /**
    * 保存连接：先物理持久化敏感凭据到安全保管库，再写入元数据与更新内存
+   * 包含原子回滚：如果后续元数据落盘失败，立即恢复内存映射与选中态，杜绝内存与磁盘不一致
    */
   public async saveConnection(conn: BotConnection): Promise<void> {
     const meta: ConnectionMetadata = {
@@ -410,6 +482,11 @@ export class AuthStore {
       password: conn.password
     };
 
+    // 快照旧内存状态以便发生异常时原子回滚
+    const prevMeta = this.metadataMap.get(conn.id);
+    const prevCred = this.vaultMap.get(conn.id);
+    const prevCurrentId = this.currentConnectionId;
+
     // 1. 物理写入安全硬件保管库 (若失败会抛出异常，杜绝伪成功)
     await this.adapter.saveCredential(cred);
 
@@ -424,8 +501,50 @@ export class AuthStore {
       });
     }
 
-    // 3. 物理持久化元数据
-    await this.persistMetadata();
+    // 3. 物理持久化元数据 (若失败必须原子回滚内存映射与保管库，保持一致性)
+    try {
+      await this.persistMetadata();
+    } catch (err) {
+      // 物理回滚凭证保管库状态
+      if (!prevCred) {
+        try {
+          await this.adapter.removeCredential(conn.id);
+        } catch (_ignore) {}
+      } else {
+        try {
+          await this.adapter.saveCredential(prevCred);
+        } catch (_ignore) {}
+      }
+
+      if (prevMeta) {
+        this.metadataMap.set(conn.id, prevMeta);
+      } else {
+        this.metadataMap.delete(conn.id);
+      }
+      if (prevCred) {
+        this.vaultMap.set(conn.id, prevCred);
+      } else {
+        this.vaultMap.delete(conn.id);
+      }
+      this.currentConnectionId = prevCurrentId;
+      this.metadataMap.forEach((m, mId) => {
+        m.isCurrent = (mId === prevCurrentId);
+      });
+      if (err instanceof Error) {
+        throw err;
+      }
+      throw new Error(`Persist metadata failed: ${err}`);
+    }
+  }
+
+  /**
+   * 彻底清空所有连接与硬件保管库凭证
+   */
+  public async clearAll(): Promise<void> {
+    await this.adapter.clearAll();
+    this.metadataMap.clear();
+    this.vaultMap.clear();
+    this.currentConnectionId = '';
   }
 
   /**

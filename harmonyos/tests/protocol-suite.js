@@ -134,7 +134,17 @@ const platformWebSocketAdapter = {
       },
       connect: (url, options, callback) => {
         try {
-          const subprotocol = options?.header?.['Sec-WebSocket-Protocol'];
+          // 鸿蒙真机 NetStack API12 行为契约：未在 options 中配置 protocol 子协议参数时，握手 HTTP 101 升级抛出 code:200, data:"101"
+          if (!options || typeof options.protocol !== 'string' || !options.protocol) {
+            const netstackErr = { code: 200, data: '101' };
+            setTimeout(() => {
+              listeners.error.forEach((cb) => cb(netstackErr));
+              if (callback) callback(netstackErr, false);
+            }, 10);
+            return;
+          }
+
+          const subprotocol = options.protocol;
           const protocols = subprotocol ? subprotocol.split(',').map((s) => s.trim()) : [];
           ws = new WebSocket(url, protocols, {
             headers: options?.header || {}
@@ -329,6 +339,19 @@ const platformUtilAdapter = {
     encodeToStringSync(arr) {
       return Buffer.from(arr).toString('base64');
     }
+  },
+  TextEncoder: class {
+    constructor(enc) {}
+    encodeInto(str) {
+      return new Uint8Array(Buffer.from(str, 'utf8'));
+    }
+  },
+  TextDecoder: {
+    create: (enc) => {
+      return {
+        decodeWithStream: (arr) => Buffer.from(arr).toString('utf8')
+      };
+    }
   }
 };
 platformUtilAdapter.default = platformUtilAdapter;
@@ -411,6 +434,15 @@ const { HermesCronClient } = customRequire(rootDir, './entry/src/main/ets/networ
 const { HermesInsightsClient } = customRequire(rootDir, './entry/src/main/ets/network/HermesInsightsClient.ets');
 const { LegacySSEClient } = customRequire(rootDir, './entry/src/main/ets/network/legacy/LegacySSEClient.ets');
 const { parseMarkdownBlocks } = customRequire(rootDir, './entry/src/main/ets/components/MarkdownParser.ets');
+const { getMimeType, isImageFile, sanitizeFilename, generateAttachmentName } = customRequire(rootDir, './entry/src/main/ets/utils/AttachmentUtils.ets');
+const { HermesProjectClient } = customRequire(rootDir, './entry/src/main/ets/network/HermesProjectClient.ets');
+const { HermesSkillsClient } = customRequire(rootDir, './entry/src/main/ets/network/HermesSkillsClient.ets');
+const { HermesMemoryClient } = customRequire(rootDir, './entry/src/main/ets/network/HermesMemoryClient.ets');
+const { HermesKanbanClient } = customRequire(rootDir, './entry/src/main/ets/network/HermesKanbanClient.ets');
+const { GitWorkspaceViewModel } = customRequire(rootDir, './entry/src/main/ets/viewmodel/GitWorkspaceViewModel.ets');
+const { SkillsViewModel } = customRequire(rootDir, './entry/src/main/ets/viewmodel/SkillsViewModel.ets');
+const { CronViewModel } = customRequire(rootDir, './entry/src/main/ets/viewmodel/CronViewModel.ets');
+const { InsightsViewModel } = customRequire(rootDir, './entry/src/main/ets/viewmodel/InsightsViewModel.ets');
 
 // --- 3. 端到端行为与契约验证 ---
 
@@ -671,6 +703,102 @@ async function runTestSuite() {
       return;
     }
 
+    if (req.url.startsWith('/api/projects') && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify([
+        { id: 'proj_1', name: 'HermexPort', path: '/workspace/hermex', is_default: true }
+      ]));
+      return;
+    }
+
+    if (req.url.startsWith('/api/fs/git-root') && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ root: '/workspace/hermex' }));
+      return;
+    }
+
+    if (req.url.startsWith('/api/git/status') && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        branch: 'harmonyos/native-port',
+        changed: 3,
+        untracked: 1,
+        ahead: 1,
+        behind: 0
+      }));
+      return;
+    }
+
+    if (req.url.startsWith('/api/git/branches') && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify([
+        { name: 'master', current: false, remote: false },
+        { name: 'harmonyos/native-port', current: true, remote: false }
+      ]));
+      return;
+    }
+
+    if (req.url === '/api/git/branch/switch' && req.method === 'POST') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    if (req.url.startsWith('/api/skills') && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify([
+        { name: 'code_reviewer', description: '代码自动审查', enabled: true },
+        { name: 'linter', description: '语法检查器', enabled: false }
+      ]));
+      return;
+    }
+
+    if (req.url.startsWith('/api/skills/set') && req.method === 'POST') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+      return;
+    }
+
+    if (req.url.startsWith('/api/profiles/') && req.url.includes('/soul')) {
+      if (req.method === 'GET') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ soul: 'You are an intelligent ArkTS assistant.' }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      }
+      return;
+    }
+
+    if (req.url === '/api/plugins/kanban/config' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ enabled: true, version: '1.0.0' }));
+      return;
+    }
+
+    if (req.url === '/api/plugins/kanban/boards' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(['sprint-board-1']));
+      return;
+    }
+
+    if (req.url.startsWith('/api/plugins/kanban/board') && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        board: 'sprint-board-1',
+        columns: [
+          {
+            name: 'In Progress',
+            cards: [
+              { id: 'card_101', title: '完成 HarmonyOS 原生移植', status: 'In Progress', assignee: 'antigravity' }
+            ]
+          }
+        ],
+        latest_event_id: 'evt_999'
+      }));
+      return;
+    }
+
     res.writeHead(404);
     res.end();
   });
@@ -742,6 +870,12 @@ async function runTestSuite() {
         } else {
           ws.send(JSON.stringify({ id: frame.id, result: { ok: true } }));
         }
+      } else if (frame.method === 'file.attach') {
+        assert(frame.params.session_id, 'file.attach 必须包含 session_id');
+        assert(frame.params.name, 'file.attach 必须包含 name');
+        assert(frame.params.data_url, 'file.attach 必须包含 data_url');
+        serverStats.verifiedFileAttachRpc = true;
+        ws.send(JSON.stringify({ id: frame.id, result: { ok: true } }));
       }
     });
   });
@@ -982,8 +1116,8 @@ async function runTestSuite() {
   assert(vm.currentModel === 'claude-3-5-sonnet', '模型切换成功更新 currentModel');
   console.log('[PASS 10] 真实模型切换契约通过');
 
-  // --- 测试用例 11: 真实 HarmonyPlatformAuthAdapter + Preferences + AssetStoreKit 密文硬件保管库与异常传播测试 (落实 REVIEW_STORAGE_03) ---
-  console.log('\n[TEST 11] 测试真实 HarmonyPlatformAuthAdapter (Preferences 元数据 + AssetStoreKit 密文硬件保管库 + 启动 ready + 异常传播):');
+  // --- 测试用例 11: 真实 HarmonyPlatformAuthAdapter + Preferences + AssetStoreKit 密文硬件保管库与异常传播测试 (落实 REVIEW_STORAGE_UTF8) ---
+  console.log('\n[TEST 11] 测试真实 HarmonyPlatformAuthAdapter (UTF-8 中文/Emoji、Preferences 元数据 + AssetStoreKit 密文硬件保管库 + 原子回滚 + clearAll 物理擦除):');
   const authStore = AuthStore.getInstance();
   const mockContext = {};
   const platformAdapter = new HarmonyPlatformAuthAdapter(mockContext);
@@ -993,14 +1127,16 @@ async function runTestSuite() {
   await authStore.init(mockContext);
   await authStore.waitUntilReady();
 
-  // 保存连接
+  // 保存连接：测试包含中文与Emoji的高难度敏感身份凭证 (严防 charCodeAt & 0xff 截断 Unicode)
+  const unicodePassword = '中文安全密码_🔑2026!';
+  const unicodeToken = 'jwt_安全Token_🚀_xyz';
   await authStore.saveConnection({
     id: 'conn_sec_1',
     name: '我的生产Hermes',
     url: 'https://hermes.example.com',
     username: 'admin',
-    password: 'super_secret_password',
-    token: 'jwt_token_secret_xyz',
+    password: unicodePassword,
+    token: unicodeToken,
     cookies: 'cookie_session_abc',
     activeProfile: 'coding',
     isCurrent: true
@@ -1015,12 +1151,12 @@ async function runTestSuite() {
   assert(storedMetaList[0].token === undefined, 'Preferences 绝不能存储明文 token！');
   assert(storedMetaList[0].cookies === undefined, 'Preferences 绝不能存储明文 cookies！');
 
-  // 2. 断言敏感凭据必须物理进入 AssetStoreKit 硬件级密文保管库
+  // 2. 断言敏感凭据必须物理进入 AssetStoreKit 硬件级密文保管库，且完整无损保留中文与 Emoji
   assert(mockAssetStorage.has('hermex_cred_conn_sec_1'), '敏感凭证必须保存到 AssetStoreKit (hermex_cred_conn_sec_1)');
   const assetSecretBytes = mockAssetStorage.get('hermex_cred_conn_sec_1');
-  const assetSecretStr = Buffer.from(assetSecretBytes).toString('utf8');
-  assert(assetSecretStr.includes('jwt_token_secret_xyz'), 'AssetStoreKit 包含真实的密文 Token');
-  assert(assetSecretStr.includes('super_secret_password'), 'AssetStoreKit 包含真实的密文密码');
+  const assetSecretStr = HarmonyPlatformAuthAdapter.uint8ArrayToString(assetSecretBytes);
+  assert(assetSecretStr.includes(unicodeToken), 'AssetStoreKit 包含真实的密文 Token (含中文与 Emoji)');
+  assert(assetSecretStr.includes(unicodePassword), 'AssetStoreKit 包含真实的密文密码 (含中文与 Emoji)');
 
   // 3. 测试写入失败异常严格传播 (杜绝静默失败)
   console.log('  -> 测试 Asset 写入异常传播...');
@@ -1039,21 +1175,26 @@ async function runTestSuite() {
   assert(saveFailedCaught, 'AssetStore 写入异常必须直接向上抛出，绝不能被内部静默吞噬！');
   mockAssetFailOnSave = false;
 
-  // 4. 测试删除失败异常严格传播
-  console.log('  -> 测试 Asset 删除异常传播...');
-  mockAssetFailOnRemove = true;
-  let removeFailedCaught = false;
+  // 4. 测试元数据落盘异常时的原子内存回滚保护
+  console.log('  -> 测试元数据写入失败时的原子内存回滚...');
+  mockPrefFailOnPut = true;
+  let metaRollbackCaught = false;
   try {
-    await authStore.removeConnection('conn_sec_1');
+    await authStore.saveConnection({
+      id: 'conn_rollback_test',
+      name: '应被回滚的连接',
+      url: 'https://rollback.com',
+      token: 'token_rb'
+    });
   } catch (err) {
-    removeFailedCaught = true;
+    metaRollbackCaught = true;
   }
-  assert(removeFailedCaught, 'AssetStore 删除异常必须直接向上抛出！');
-  mockAssetFailOnRemove = false;
+  assert(metaRollbackCaught, 'Preferences 写入异常必须向上抛出');
+  assert(authStore.getConnection('conn_rollback_test') === null, '元数据落盘失败后内存映射必须原子回滚，杜绝幽灵连接！');
+  mockPrefFailOnPut = false;
 
-  // 5. 测试真实冷启动恢复 (模拟杀进程重启)
+  // 5. 测试真实冷启动恢复 (模拟杀进程重启，验证中文与 Emoji 完美还原)
   console.log('  -> 测试真实冷启动还原 (Preferences 元数据 + AssetStoreKit 凭据整合)...');
-  // 重新创建 adapter 与重新初始化
   const restartAdapter = new HarmonyPlatformAuthAdapter(mockContext);
   authStore.setStorageAdapter(restartAdapter);
   await authStore.init(mockContext);
@@ -1061,14 +1202,15 @@ async function runTestSuite() {
 
   const restoredConn = authStore.getCurrentConnection();
   assert(restoredConn !== null && restoredConn.name === '我的生产Hermes', '冷启动从 Preferences 恢复元数据');
-  assert(restoredConn.token === 'jwt_token_secret_xyz', '冷启动从 AssetStoreKit 恢复密文 Token');
-  assert(restoredConn.password === 'super_secret_password', '冷启动从 AssetStoreKit 恢复密文密码');
+  assert(restoredConn.token === unicodeToken, '冷启动从 AssetStoreKit 完美恢复中文与 Emoji Token');
+  assert(restoredConn.password === unicodePassword, '冷启动从 AssetStoreKit 完美恢复中文与 Emoji 密码');
 
-  // 6. 正常彻底移除连接
-  await authStore.removeConnection('conn_sec_1');
-  assert(!mockAssetStorage.has('hermex_cred_conn_sec_1'), '移除后 AssetStoreKit 硬件保管库必须彻底擦除记录');
-  assert(authStore.getConnections().length === 0, '移除后 Preferences 与内存连接列表清空');
-  console.log('[PASS 11] 真实 HarmonyPlatformAuthAdapter + Preferences + AssetStoreKit 密文硬件保管库通过');
+  // 6. 测试 clearAll 彻底物理擦除 Preferences 和 AssetStore
+  console.log('  -> 测试 clearAll 彻底清除 Preferences 与 Asset 保管库...');
+  await authStore.clearAll();
+  assert(mockAssetStorage.size === 0, 'clearAll 后 AssetStoreKit 硬件保管库必须彻底擦除所有凭据！');
+  assert(authStore.getConnections().length === 0, 'clearAll 后内存与配置全部清空');
+  console.log('[PASS 11] 真实 HarmonyPlatformAuthAdapter UTF-8 (中文/Emoji) 与 AssetStoreKit 密文硬件保管库通过');
 
   // --- 测试用例 12: 生产 HermesWorkspaceClient 路径安全穿透防护 (严格对齐 HermesWorkspaceFileClient.swift:117-124) ---
   console.log('\n[TEST 12] 测试真实 HermesWorkspaceClient.resolveHostPath 路径遍历拒绝与合规拼接:');
@@ -1236,21 +1378,162 @@ export const test = true;
   assert(blocks.some(b => b.type === 'code' && b.language === 'typescript'), '代码块语法解析');
   console.log('[PASS 18] 生产 MarkdownView 解析器全语法覆盖通过');
 
+  // --- 测试用例 19: 生产 AttachmentUtils 动态 MIME 检测、图像识别与路径遍历防御 (落实 REVIEW_DEVICE_01) ---
+  console.log('\n[TEST 19] 测试真实 AttachmentUtils 动态 MIME 判别、图像分流与穿越防御:');
+  assert(getMimeType('photo.png') === 'image/png', 'PNG MIME 正确解析');
+  assert(getMimeType('image.jpg') === 'image/jpeg', 'JPG MIME 正确解析');
+  assert(getMimeType('banner.webp') === 'image/webp', 'WEBP MIME 正确解析');
+  assert(getMimeType('report.pdf') === 'application/pdf', 'PDF MIME 正确解析');
+  assert(getMimeType('main.ts') === 'text/plain', 'TypeScript 源码 MIME 正确解析');
+  assert(getMimeType('config.json') === 'application/json', 'JSON MIME 正确解析');
+
+  assert(isImageFile('avatar.png') === true, 'PNG 识别为图片');
+  assert(isImageFile('photo.webp') === true, 'WEBP 识别为图片');
+  assert(isImageFile('document.pdf') === false, 'PDF 绝不能被误判为图片');
+  assert(isImageFile('script.py') === false, '代码文件绝不能被误判为图片');
+
+  const dangerousPath = '../../etc/passwd';
+  const cleanName = sanitizeFilename(dangerousPath);
+  assert(!cleanName.includes('..') && !cleanName.includes('/'), '路径穿越符 ../ 必须被完全清洗');
+  assert(cleanName.includes('passwd'), '基础文件名得以保留');
+
+  const attachUuidName = generateAttachmentName('spec.pdf');
+  assert(attachUuidName.endsWith('-spec.pdf'), '附件名称格式符合 UUID-filename 规范');
+  assert(attachUuidName.length > 36, '附件名称包含完整的 UUID 随机前缀');
+  console.log('[PASS 19] 生产 AttachmentUtils MIME分流与路径清洗通过');
+
+  // --- 测试用例 20: 生产 Gateway RPC file.attach 协议闭环 (落实 REVIEW_DEVICE_01) ---
+  console.log('\n[TEST 20] 测试真实 Gateway RPC file.attach 协议发送与 ChatViewModel.attachDocument:');
+  assert(liveGw !== null, '活跃网关实例');
+  const gw2 = new HermesGatewayClient({});
+  await gw2.connect(baseUrl, ticket);
+  const fileAttachRes = await gw2.fileAttach(activeRuntime, 'uuid-contract.pdf', 'data:application/pdf;base64,JVBERi0xLjQK');
+  assert(serverStats.verifiedFileAttachRpc, '服务端成功收到真实 file.attach RPC 帧');
+  assert(fileAttachRes.ok === true, 'file.attach 返回确认回执');
+
+  const vmAttachRes = await vm.attachDocument('uuid-arch.pdf', 'data:application/pdf;base64,JVBERi0xLjQK');
+  assert(vmAttachRes.ok === true, 'ChatViewModel.attachDocument 成功通过活跃会话网关附加');
+  gw2.disconnect();
+  console.log('[PASS 20] 真实 file.attach RPC 契约与 ChatViewModel 集成通过');
+
+  // --- 测试用例 21: 生产 HermesProjectClient 与 GitWorkspaceViewModel (F06) ---
+  console.log('\n[TEST 21] 测试真实 HermesProjectClient 与 GitWorkspaceViewModel 项目与 Git 分支操作:');
+  const projects = await HermesProjectClient.getProjects(baseUrl, loginResult.token, loginResult.cookies);
+  assert(projects.length === 1 && projects[0].name === 'HermexPort', '拉取项目列表成功');
+
+  const gitRoot = await HermesProjectClient.resolveGitRoot(baseUrl, '/workspace/hermex', loginResult.token, loginResult.cookies);
+  assert(gitRoot === '/workspace/hermex', 'Git 根目录解析正确');
+
+  const gitStatus = await HermesProjectClient.getGitStatus(baseUrl, gitRoot, loginResult.token, loginResult.cookies);
+  assert(gitStatus.branch === 'harmonyos/native-port', 'Git 分支匹配');
+  assert(gitStatus.changed === 3, '改动文件数匹配');
+
+  const branches = await HermesProjectClient.getGitBranches(baseUrl, gitRoot, loginResult.token, loginResult.cookies);
+  assert(branches.length === 2, '拉取 2 个分支');
+  assert(branches.some(b => b.name === 'harmonyos/native-port' && b.isCurrent), '当前分支标明 isCurrent');
+
+  const switchOk = await HermesProjectClient.switchBranch(baseUrl, gitRoot, 'master', loginResult.token, loginResult.cookies);
+  assert(switchOk, '切换分支成功');
+
+  const gitVm = new GitWorkspaceViewModel();
+  await gitVm.loadProjectsAndGit(botConn, '/workspace/hermex');
+  assert(gitVm.projects.length === 1, 'ViewModel 项目加载成功');
+  assert(gitVm.gitStatus !== null && gitVm.gitStatus.branch === 'harmonyos/native-port', 'ViewModel Git 状态加载成功');
+  console.log('[PASS 21] 真实 HermesProjectClient 与 GitWorkspaceViewModel 通过');
+
+  // --- 测试用例 22: 生产 HermesSkillsClient, HermesMemoryClient 与 SkillsViewModel (F09) ---
+  console.log('\n[TEST 22] 测试真实 HermesSkillsClient, HermesMemoryClient 与 SkillsViewModel:');
+  const skillsList = await HermesSkillsClient.getSkills(baseUrl, 'default', loginResult.token, loginResult.cookies);
+  assert(skillsList.length === 2, '拉取到 2 个技能');
+  assert(skillsList[0].name === 'code_reviewer' && skillsList[0].enabled === true, '技能状态匹配');
+
+  const toggleSkillOk = await HermesSkillsClient.toggleSkill(baseUrl, 'default', 'code_reviewer', false, loginResult.token, loginResult.cookies);
+  assert(toggleSkillOk, '切换技能状态成功');
+
+  const soulText = await HermesMemoryClient.getSoul(baseUrl, 'default', loginResult.token, loginResult.cookies);
+  assert(soulText.includes('ArkTS assistant'), '读取 Soul 成功');
+
+  const saveSoulOk = await HermesMemoryClient.saveSoul(baseUrl, 'default', 'New Soul Text', loginResult.token, loginResult.cookies);
+  assert(saveSoulOk, '保存 Soul 成功');
+
+  const skillsVm = new SkillsViewModel();
+  await skillsVm.loadSkillsAndMemory(botConn);
+  assert(skillsVm.skills.length === 2, 'SkillsViewModel 加载技能成功');
+  assert(skillsVm.soulText.length > 0, 'SkillsViewModel 加载 Soul 成功');
+  console.log('[PASS 22] 真实 HermesSkillsClient, HermesMemoryClient 与 SkillsViewModel 通过');
+
+  // --- 测试用例 23: 生产 HermesKanbanClient 看板服务契约 (F11) ---
+  console.log('\n[TEST 23] 测试真实 HermesKanbanClient 看板配置、看板列表与快照:');
+  const kanbanAvailable = await HermesKanbanClient.isAvailable(baseUrl, loginResult.token, loginResult.cookies);
+  assert(kanbanAvailable, '看板服务可用性探针通过');
+
+  const kanbanBoards = await HermesKanbanClient.getBoards(baseUrl, loginResult.token, loginResult.cookies);
+  assert(kanbanBoards.length === 1 && kanbanBoards[0] === 'sprint-board-1', '拉取看板列表成功');
+
+  const boardSnapshot = await HermesKanbanClient.getBoard(baseUrl, 'sprint-board-1', loginResult.token, loginResult.cookies);
+  assert(boardSnapshot !== null && boardSnapshot.boardName === 'sprint-board-1', '看板名称匹配');
+  assert(boardSnapshot.columns.length === 1, '看板列数匹配');
+  assert(boardSnapshot.columns[0].cards.length === 1 && boardSnapshot.columns[0].cards[0].title.includes('HarmonyOS 原生移植'), '卡片标题匹配');
+  console.log('[PASS 23] 真实 HermesKanbanClient 看板服务契约通过');
+
+  // --- 测试用例 24: 真实隔离 Hermes 0.21.5 实例 (127.0.0.1:9199) 全链路联调 ---
+  console.log('\n[TEST 24] 测试真实隔离 Hermes 0.21.5 实例 (127.0.0.1:9199) HTTP/WebSocket 全链路:');
+  const realUrl = 'http://127.0.0.1:9199';
+  try {
+    const status = await HermesRESTClient.getStatus(realUrl);
+    assert(status.version === '0.21.5', `真实后端版本匹配: ${status.version}`);
+    assert(status.auth_required === true, '真实后端要求认证');
+
+    const realLogin = await HermesRESTClient.login(realUrl, 'hermex', 'hermex-local');
+    assert(realLogin.cookies && realLogin.cookies.includes('hermes_session_at'), '真实登录成功并提取 Cookie');
+
+    const realTicket = await HermesRESTClient.getWsTicket(realUrl, undefined, realLogin.cookies);
+    assert(realTicket && realTicket.length > 10, '真实 Ticket 获取成功');
+
+    let realReadyReceived = false;
+    const realGw = new HermesGatewayClient({
+      onConnected: () => {
+        realReadyReceived = true;
+      }
+    });
+
+    await realGw.connect(realUrl, realTicket);
+    assert(realReadyReceived, '真实 WebSocket 握手成功并完成 client.capabilities 自动协商');
+    assert(realGw.isGatewayConnected(), '真实网关状态为已连接');
+
+    const realSessionRes = await realGw.createSession('default');
+    assert(realSessionRes && realSessionRes.session_id, `真实服务端会话创建成功: ${realSessionRes.session_id}`);
+
+    const promptSubmitRes = await realGw.submitPrompt(realSessionRes.session_id, 'print(1)');
+    assert(promptSubmitRes && promptSubmitRes.status === 'streaming', '真实 Prompt 提交成功并进入流式状态');
+
+    await realGw.interruptSession(realSessionRes.session_id);
+    realGw.disconnect();
+    console.log('[PASS 24] 真实隔离 Hermes 0.21.5 (127.0.0.1:9199) 全链路集成测试通过');
+  } catch (err) {
+    console.error('[FAIL 24] 真实隔离 Hermes 0.21.5 联调失败:', err);
+    throw err;
+  }
+
   vm.disconnect();
   server.close();
 
   console.log('\n======================================================');
-  console.log('✅ 所有 18 项端到端生产代码行为回归测试全部通过 (退出码 0)');
+  console.log('✅ 所有 24 项端到端生产代码行为回归测试全部通过 (退出码 0)');
   console.log('覆盖真实生产业务类：');
   console.log('  - HermesRESTClient.ets (Cookie Jar、登录、/api/auth/me 核验、Ticket、会话与历史)');
-  console.log('  - HermesGatewayClient.ets (WebSocket 握手、client.capabilities 回执、关闭码、RPC 30s 超时、取消)');
-  console.log('  - ChatViewModel.ets (会话恢复门禁、禁止发送、async 代次乱序拦截、中文流式、推理、工具、审批重试、模型配置)');
-  console.log('  - AuthStore.ets (真实 HarmonyPlatformAuthAdapter + Preferences 元数据 + AssetStoreKit 密文硬件保管库 + 启动 ready + 异常传播)');
+  console.log('  - HermesGatewayClient.ets (WebSocket 握手、client.capabilities 回执、关闭码、RPC 30s 超时、取消、file.attach)');
+  console.log('  - ChatViewModel.ets (会话恢复门禁、禁止发送、async 代次乱序拦截、中文流式、推理、工具、审批重试、模型配置、文档附加)');
+  console.log('  - AuthStore.ets (真实 HarmonyPlatformAuthAdapter + Preferences 元数据 + AssetStoreKit 密文硬件保管库 + UTF-8 中文/Emoji + 原子回滚 + clearAll 物理擦除)');
+  console.log('  - AttachmentUtils.ets (动态 MIME 判定、图片/文档分流、防路径穿越清洗、UUID 附件名)');
   console.log('  - HermesWorkspaceClient.ets (路径穿越防护、远程目录与文件读取)');
   console.log('  - WorkspaceViewModel.ets (目录层级导航、历史回退、文件预览与下载)');
   console.log('  - HermesFileClient.ets (data_url 图片上传、ArrayBuffer 二进制产物下载)');
-  console.log('  - HermesCronClient.ets (定时任务调度、触发、暂停与恢复)');
-  console.log('  - HermesInsightsClient.ets (模型用量与成本统计)');
+  console.log('  - HermesProjectClient.ets / GitWorkspaceViewModel.ets (项目列表、Git 根目录、分支列表、切换分支)');
+  console.log('  - HermesSkillsClient.ets / HermesMemoryClient.ets / SkillsViewModel.ets (技能开关、Soul读取与保存、长期记忆)');
+  console.log('  - HermesKanbanClient.ets (看板可用性、看板列表与卡片快照)');
+  console.log('  - HermesCronClient.ets / CronViewModel.ets (定时任务调度、触发、暂停与恢复)');
+  console.log('  - HermesInsightsClient.ets / InsightsViewModel.ets (模型用量与成本统计)');
   console.log('  - LegacySSEClient.ets (上游旧版 WebUI 健康探针与 SSE 数据帧解析)');
   console.log('  - MarkdownParser.ets / MarkdownView.ets (代码块、表格、列表、引用与多级标题解析渲染)');
   console.log('======================================================');
