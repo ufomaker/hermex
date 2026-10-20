@@ -5,7 +5,15 @@
  * - HermesGatewayClient.ets
  * - ChatViewModel.ets
  * - AuthStore.ets
- * 注入 @ohos.net.http 和 @ohos.net.webSocket 适配器，由独立 Mock Hermes 网关驱动真实网络与协议全闭环
+ * - WorkspaceViewModel.ets
+ * - HermesWorkspaceClient.ets
+ * - HermesFileClient.ets
+ * - HermesCronClient.ets
+ * - HermesInsightsClient.ets
+ * - LegacySSEClient.ets
+ * - MarkdownParser.ets
+ * 注入 @ohos.net.http, @ohos.net.webSocket, @ohos.data.preferences 平台适配器
+ * 由独立 Mock Hermes 网关驱动真实网络与协议全闭环
  */
 
 const http = require('http');
@@ -24,6 +32,11 @@ function assert(condition, message) {
 // --- 1. 构造 @ohos 平台适配器 ---
 
 const platformHttpAdapter = {
+  HttpDataType: {
+    STRING: 0,
+    OBJECT: 1,
+    ARRAY_BUFFER: 2
+  },
   RequestMethod: {
     GET: 'GET',
     POST: 'POST',
@@ -55,17 +68,31 @@ const platformHttpAdapter = {
               timeout: options.readTimeout || 10000
             },
             (res) => {
-              let raw = '';
-              res.setEncoding('utf8');
+              const chunks = [];
               res.on('data', (chunk) => {
-                raw += chunk;
+                chunks.push(chunk);
               });
               res.on('end', () => {
-                resolve({
-                  responseCode: res.statusCode || 200,
-                  header: res.headers,
-                  result: raw
-                });
+                const fullBuffer = Buffer.concat(chunks);
+                // 处理 ArrayBuffer 期望类型 (expectDataType === 2 / ARRAY_BUFFER)
+                if (options.expectDataType === 2) {
+                  const ab = new ArrayBuffer(fullBuffer.length);
+                  const view = new Uint8Array(ab);
+                  for (let i = 0; i < fullBuffer.length; ++i) {
+                    view[i] = fullBuffer[i];
+                  }
+                  resolve({
+                    responseCode: res.statusCode || 200,
+                    header: res.headers,
+                    result: ab
+                  });
+                } else {
+                  resolve({
+                    responseCode: res.statusCode || 200,
+                    header: res.headers,
+                    result: fullBuffer.toString('utf8')
+                  });
+                }
               });
             }
           );
@@ -159,6 +186,28 @@ const platformWebSocketAdapter = {
 };
 platformWebSocketAdapter.default = platformWebSocketAdapter;
 
+const memoryPrefs = new Map();
+const platformPreferencesAdapter = {
+  default: {
+    getPreferences: async (ctx, name) => {
+      if (!memoryPrefs.has(name)) {
+        memoryPrefs.set(name, new Map());
+      }
+      const store = memoryPrefs.get(name);
+      return {
+        put: async (key, val) => store.set(key, val),
+        get: async (key, defVal) => store.has(key) ? store.get(key) : defVal,
+        delete: async (key) => store.delete(key),
+        clear: async () => store.clear(),
+        flush: async () => {}
+      };
+    }
+  },
+  getPreferences: async (ctx, name) => {
+    return platformPreferencesAdapter.default.getPreferences(ctx, name);
+  }
+};
+
 // --- 2. 真实 ArkTS 模块加载器 ---
 
 const moduleCache = new Map();
@@ -169,6 +218,9 @@ function customRequire(callerDir, modPath) {
   }
   if (modPath === '@ohos.net.webSocket') {
     return platformWebSocketAdapter;
+  }
+  if (modPath === '@ohos.data.preferences') {
+    return platformPreferencesAdapter;
   }
   if (modPath === '@ohos.promptAction') {
     return {
@@ -217,6 +269,7 @@ const { ChatViewModel } = customRequire(rootDir, './entry/src/main/ets/viewmodel
 const { AuthStore } = customRequire(rootDir, './entry/src/main/ets/storage/AuthStore.ets');
 const { HermesWorkspaceClient } = customRequire(rootDir, './entry/src/main/ets/network/HermesWorkspaceClient.ets');
 const { HermesFileClient } = customRequire(rootDir, './entry/src/main/ets/network/HermesFileClient.ets');
+const { WorkspaceViewModel } = customRequire(rootDir, './entry/src/main/ets/viewmodel/WorkspaceViewModel.ets');
 const { HermesCronClient } = customRequire(rootDir, './entry/src/main/ets/network/HermesCronClient.ets');
 const { HermesInsightsClient } = customRequire(rootDir, './entry/src/main/ets/network/HermesInsightsClient.ets');
 const { LegacySSEClient } = customRequire(rootDir, './entry/src/main/ets/network/legacy/LegacySSEClient.ets');
@@ -226,7 +279,7 @@ const { parseMarkdownBlocks } = customRequire(rootDir, './entry/src/main/ets/com
 
 async function runTestSuite() {
   console.log('=== 开始执行 Hermes 鸿蒙原生生产代码全生命周期测试 ===');
-  console.log('目标源码：HermesRESTClient.ets, HermesGatewayClient.ets, ChatViewModel.ets, AuthStore.ets\n');
+  console.log('目标源码：HermesRESTClient.ets, HermesGatewayClient.ets, ChatViewModel.ets, AuthStore.ets, WorkspaceViewModel.ets\n');
 
   const port = 49500 + Math.floor(Math.random() * 400);
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -246,7 +299,10 @@ async function runTestSuite() {
     configSetCalls: 0,
     promptSubmitCalls: 0,
     approvalResponded: false,
-    lastCloseCode: null
+    lastCloseCode: null,
+    verifiedImageUploadDataUrl: false,
+    verifiedDownloadArtifactBinary: false,
+    verifiedAnalyticsDays: false
   };
 
   let connectedClientWs = null;
@@ -373,17 +429,29 @@ async function runTestSuite() {
     }
 
     if (req.url.startsWith('/api/chat/image-upload') && req.method === 'POST') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        url: '/uploads/screenshot.png',
-        path: 'uploads/screenshot.png'
-      }));
+      let body = '';
+      req.on('data', (c) => (body += c));
+      req.on('end', () => {
+        const payload = JSON.parse(body || '{}');
+        assert(payload.filename, 'image-upload 必须包含 filename');
+        assert(payload.data_url, 'image-upload 必须使用 data_url 字段 (严格对齐 HermesREST.swift:379-384)');
+        assert(!payload.data, 'image-upload 绝不能使用已被废弃的 data 字段！');
+        serverStats.verifiedImageUploadDataUrl = true;
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          url: '/uploads/screenshot.png',
+          path: 'uploads/screenshot.png'
+        }));
+      });
       return;
     }
 
     if (req.url.startsWith('/api/fs/download') && req.method === 'GET') {
+      serverStats.verifiedDownloadArtifactBinary = true;
       res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
-      res.end('BINARY_ARTIFACT_CONTENT_DATA');
+      // 返回带有 PNG 签名的 12 字节二进制测试产物
+      const bin = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0x02, 0xff]);
+      res.end(bin);
       return;
     }
 
@@ -422,25 +490,39 @@ async function runTestSuite() {
     }
 
     if (req.url.startsWith('/api/analytics/usage') && req.method === 'GET') {
+      assert(req.url.includes('days=7'), 'analytics/usage 必须携带 ?days=7 参数');
+      assert(req.url.includes('profile=default'), 'analytics/usage 必须携带 ?profile=default 参数');
+      serverStats.verifiedAnalyticsDays = true;
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
-        total_tokens: 32000,
-        prompt_tokens: 20000,
-        completion_tokens: 12000,
-        cost_usd: 0.28
+        days: 7,
+        totals: {
+          total_input: 20000,
+          total_output: 12000,
+          total_reasoning: 4000,
+          total_api_calls: 18,
+          total_actual_cost: 0.28,
+          total_estimated_cost: 0.35
+        }
       }));
       return;
     }
 
     if (req.url.startsWith('/api/analytics/models') && req.method === 'GET') {
+      assert(req.url.includes('days=7'), 'analytics/models 必须携带 ?days=7 参数');
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
+        days: 7,
         models: [
           {
             model: 'claude-3-5-sonnet',
-            calls: 18,
-            total_tokens: 32000,
-            cost_usd: 0.28
+            provider: 'anthropic',
+            api_calls: 18,
+            input_tokens: 20000,
+            output_tokens: 12000,
+            reasoning_tokens: 4000,
+            actual_cost: 0.28,
+            estimated_cost: 0.35
           }
         ]
       }));
@@ -584,11 +666,10 @@ async function runTestSuite() {
   const pendingConnect = cancelGw.connect(baseUrl, ticket).catch((err) => {
     cancelRejected = true;
   });
-  cancelGw.disconnect(); // 握手尚未完成立即 disconnect
+  cancelGw.disconnect();
   await pendingConnect;
   assert(cancelRejected, '握手前被 disconnect 时 connect Promise 必须被确定性 reject 而非永远挂起');
 
-  // 测试 RPC 超时清理
   const liveGw = new HermesGatewayClient({});
   await liveGw.connect(baseUrl, ticket);
   let rpcTimeoutTriggered = false;
@@ -622,7 +703,6 @@ async function runTestSuite() {
     activeProfile: 'default'
   };
 
-  // 连接到 resume 会失败的会话
   await vm.attachSession(botConn, 'sess_fail_resume');
   await new Promise((r) => setTimeout(r, 200));
 
@@ -630,7 +710,6 @@ async function runTestSuite() {
   assert(vm.getRuntimeSessionId() === '', 'resume 失败时 runtimeSessionId 必须重置为空');
   assert(vm.connectionStatusText === '会话恢复失败', '状态文本必须展示会话恢复失败');
 
-  // 尝试发送消息
   toastMessage = '';
   await vm.sendMessage('试图发送消息');
   assert(toastMessage.includes('当前会话尚未就绪或恢复失败，无法发送'), '未就绪状态下发送消息必须被严格拦截并提示用户');
@@ -647,7 +726,6 @@ async function runTestSuite() {
   assert(vm.getRuntimeSessionId() === 'runtime_sess_prod_1', '必须记录真实服务端 runtime ID (runtime_sess_prod_1)');
   assert(vm.messages.length >= 2, '历史消息必须真实加载到 messages 列表');
 
-  // 真实发送消息
   await vm.sendMessage('测试真实提问');
   assert(serverStats.promptSubmitCalls === 1, '提问时必须向服务端发起 prompt.submit RPC');
   assert(vm.messages.some((m) => m.content === '测试真实提问' && m.role === 'user'), '用户提问必须注入消息流');
@@ -655,9 +733,7 @@ async function runTestSuite() {
 
   // --- 测试用例 7: 生产 ChatViewModel 快速切换与 async 代次乱序拦截 ---
   console.log('\n[TEST 7] 测试真实 ChatViewModel async 代次保护 (先切慢会话再切快会话，拦截逆序覆盖):');
-  // 1. 触发 attachSession A (模拟慢会话)
   const slowAttach = vm.attachSession(botConn, 'sess_slow_A');
-  // 2. 紧接着快速触发 attachSession B (快会话)
   const fastAttach = vm.attachSession(botConn, 'sess_prod_1');
 
   await Promise.all([slowAttach, fastAttach]);
@@ -672,7 +748,7 @@ async function runTestSuite() {
   console.log('\n[TEST 8] 测试多会话隔离、中文 UTF-8、推理内容与工具调用状态机:');
   assert(connectedClientWs !== null, '已连接网关 WebSocket');
 
-  // 1. 发送不属于当前活跃 runtime 的串流报文，验证隔离
+  // 1. 发送不属于当前活跃 runtime 的串流报文
   connectedClientWs.send(JSON.stringify({
     method: 'event',
     params: {
@@ -739,7 +815,6 @@ async function runTestSuite() {
 
   // --- 测试用例 9: 生产 ChatViewModel 审批失败恢复与澄清交互 ---
   console.log('\n[TEST 9] 测试真实 ChatViewModel 审批交互、失败保留与重试闭环:');
-  // 服务端下发审批请求
   connectedClientWs.send(JSON.stringify({
     id: 'app_fail_once',
     method: 'approval.request',
@@ -755,11 +830,9 @@ async function runTestSuite() {
   assert(vm.currentApproval !== null, '当前会话的审批请求必须被挂载到 currentApproval');
   assert(vm.currentApproval.command.includes('git push'), '审批命令匹配');
 
-  // 第一次提交审批 (服务端模拟失败)
   await vm.submitApproval('approve');
   assert(vm.currentApproval !== null, '审批请求在服务端返回错误时必须保留在界面供用户重试，杜绝静默吞错！');
 
-  // 修改 requestId 为正常请求，重试审批
   vm.currentApproval.id = 'app_success_now';
   await vm.submitApproval('approve');
   assert(vm.currentApproval === null, '审批成功后才彻底清除待审批状态');
@@ -773,10 +846,10 @@ async function runTestSuite() {
   assert(vm.currentModel === 'claude-3-5-sonnet', '模型切换成功更新 currentModel');
   console.log('[PASS 10] 真实模型切换契约通过');
 
-  // --- 测试用例 11: 生产 AuthStore 元数据与敏感凭证隔离持久化 ---
-  console.log('\n[TEST 11] 测试真实 AuthStore 配置与凭据隔离存储:');
+  // --- 测试用例 11: 生产 AuthStore 真实持久化与跨重启还原 ---
+  console.log('\n[TEST 11] 测试真实 AuthStore 配置与凭据物理隔离持久化与启动恢复:');
   const authStore = AuthStore.getInstance();
-  authStore.saveConnection({
+  await authStore.saveConnection({
     id: 'conn_sec_1',
     name: '我的生产Hermes',
     url: 'https://hermes.example.com',
@@ -800,44 +873,102 @@ async function runTestSuite() {
   assert(exportedVault[0].token === 'jwt_token_secret_xyz', '敏感凭据隔离存储 token');
   assert(exportedVault[0].cookies === 'cookie_session_abc', '敏感凭据隔离存储 cookies');
 
-  // 测试从存储还原
-  const newStore = AuthStore.getInstance();
-  newStore.loadFromStores(exportedMeta, exportedVault);
-  const reloaded = newStore.getCurrentConnection();
-  assert(reloaded !== null && reloaded.name === '我的生产Hermes', '重新加载连接正常');
-  assert(reloaded.token === 'jwt_token_secret_xyz', '重新加载还原隔离凭据');
+  // 模拟应用完全退出并冷启动
+  console.log('  -> 模拟冷启动 restoreFromStorage()...');
+  await authStore.restoreFromStorage();
+  const reloaded = authStore.getCurrentConnection();
+  assert(reloaded !== null && reloaded.name === '我的生产Hermes', '冷启动还原连接元数据成功');
+  assert(reloaded.token === 'jwt_token_secret_xyz', '冷启动从隔离保管库还原敏感 Token');
+  assert(reloaded.password === 'super_secret_password', '冷启动从隔离保管库还原密码');
 
-  // 测试移除连接彻底擦除凭据
-  newStore.removeConnection('conn_sec_1');
-  assert(newStore.getConnections().length === 0, '移除连接后配置列表为空');
-  assert(newStore.exportVault().length === 0, '移除连接后凭据库对应项彻底擦除');
-  console.log('[PASS 11] AuthStore 元数据与凭据隔离安全存储通过');
+  // 彻底擦除凭据
+  await authStore.removeConnection('conn_sec_1');
+  assert(authStore.getConnections().length === 0, '移除连接后配置列表为空');
+  assert(authStore.exportVault().length === 0, '移除连接后凭据库对应项彻底物理擦除');
+  console.log('[PASS 11] AuthStore 元数据与凭据隔离安全存储及重启恢复通过');
 
-  // --- 测试用例 12: 生产 HermesWorkspaceClient 远程目录与代码读取 ---
-  console.log('\n[TEST 12] 测试真实 HermesWorkspaceClient 目录浏览与文件内容读取:');
-  const dirResult = await HermesWorkspaceClient.listDirectory(baseUrl, '/workspace/project', 'src', loginResult.token, loginResult.cookies);
-  assert(dirResult.entries.length === 2, '真实拉取目录条目数应为 2');
-  assert(dirResult.entries[0].name === 'src' && dirResult.entries[0].isDirectory, '条目 1 为 src 文件夹');
-  assert(dirResult.entries[1].name === 'package.json' && !dirResult.entries[1].isDirectory, '条目 2 为 package.json 文件');
+  // --- 测试用例 12: 生产 HermesWorkspaceClient 路径安全穿透防护 (严格对齐 HermesWorkspaceFileClient.swift:117-124) ---
+  console.log('\n[TEST 12] 测试真实 HermesWorkspaceClient.resolveHostPath 路径遍历拒绝与合规拼接:');
+  // 1. 合规拼接测试
+  assert(HermesWorkspaceClient.resolveHostPath('/workspace/root', '') === '/workspace/root', '空相对路径返回根');
+  assert(HermesWorkspaceClient.resolveHostPath('/workspace/root', '.') === '/workspace/root', '. 相对路径返回根');
+  assert(HermesWorkspaceClient.resolveHostPath('/workspace/root', 'src/app') === '/workspace/root/src/app', '正常相对路径正确组合');
 
-  const fileText = await HermesWorkspaceClient.readTextFile(baseUrl, '/workspace/project', 'src/version.ts', loginResult.token, loginResult.cookies);
-  assert(fileText.includes('export const version = "1.0.0";'), '真实文件内容读取匹配');
-  console.log('[PASS 12] 真实 HermesWorkspaceClient 工作区文件浏览通过');
+  // 2. 注入拒绝测试
+  let rejectedTraversal = false;
+  try {
+    HermesWorkspaceClient.resolveHostPath('/workspace/root', '../outside/secret.txt');
+  } catch (e) {
+    if (e.message.includes('directory traversal')) rejectedTraversal = true;
+  }
+  assert(rejectedTraversal, '拒绝 .. 向上目录穿越攻击');
 
-  // --- 测试用例 13: 生产 HermesFileClient 附件上传与产物下载 ---
-  console.log('\n[TEST 13] 测试真实 HermesFileClient 图片附件上传与会话产物下载:');
+  let rejectedAbsolute = false;
+  try {
+    HermesWorkspaceClient.resolveHostPath('/workspace/root', '/etc/passwd');
+  } catch (e) {
+    if (e.message.includes('absolute path not allowed')) rejectedAbsolute = true;
+  }
+  assert(rejectedAbsolute, '拒绝 / 绝对路径攻击');
+
+  let rejectedHome = false;
+  try {
+    HermesWorkspaceClient.resolveHostPath('/workspace/root', '~/.ssh/id_rsa');
+  } catch (e) {
+    if (e.message.includes('home directory traversal')) rejectedHome = true;
+  }
+  assert(rejectedHome, '拒绝 ~ 家目录攻击');
+
+  let rejectedNull = false;
+  try {
+    HermesWorkspaceClient.resolveHostPath('/workspace/root', 'valid\0file.txt');
+  } catch (e) {
+    if (e.message.includes('null bytes forbidden')) rejectedNull = true;
+  }
+  assert(rejectedNull, '拒绝空字节注入攻击');
+  console.log('[PASS 12] HermesWorkspaceClient.resolveHostPath 严密安全防线通过');
+
+  // --- 测试用例 13: 生产 WorkspaceViewModel 目录进入、返回与文件查看 ---
+  console.log('\n[TEST 13] 测试真实 WorkspaceViewModel 目录加载、导航与文件读取:');
+  const wsVm = new WorkspaceViewModel();
+  wsVm.setCwd('/workspace/project');
+
+  await wsVm.loadDirectory(botConn, '');
+  assert(wsVm.entries.length === 2, '真实加载工作区 2 个条目');
+  assert(wsVm.entries[0].name === 'src' && wsVm.entries[0].isDirectory, '首个条目为 src 目录');
+
+  // 进入子目录
+  await wsVm.enterDirectory(botConn, wsVm.entries[0]);
+  assert(wsVm.pathHistory.length === 1, '进入子目录后历史深度为 1');
+
+  // 返回上一级
+  await wsVm.navigateUp(botConn);
+  assert(wsVm.currentRelativePath === '', '返回上一级后 relativePath 回到根');
+
+  // 查看文本文件
+  await wsVm.viewFile(botConn, { name: 'version.ts', path: 'src/version.ts', isDirectory: false });
+  assert(wsVm.isViewingFile === true, '标记正在查看文件');
+  assert(wsVm.selectedFileText.includes('export const version = "1.0.0";'), '预览文本内容解析成功');
+
+  wsVm.closeFileView();
+  assert(wsVm.isViewingFile === false, '关闭预览恢复状态');
+  console.log('[PASS 13] 真实 WorkspaceViewModel 导航与文件查看闭环通过');
+
+  // --- 测试用例 14: 生产 HermesFileClient 图片附件上传 (data_url) 与二进制产物下载 (ArrayBuffer) ---
+  console.log('\n[TEST 14] 测试真实 HermesFileClient data_url 字段与 ArrayBuffer 二进制接收:');
   const uploadRes = await HermesFileClient.uploadImage(
     baseUrl,
     'default',
     'screenshot.png',
-    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
-    'image/png',
+    'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
     loginResult.token,
     loginResult.cookies
   );
-  assert(uploadRes.url === '/uploads/screenshot.png', '附件图片上传成功获取 URL');
+  assert(serverStats.verifiedImageUploadDataUrl, '上传图片 payload 必须携带 data_url 字段 (严格对齐 HermesREST.swift:379-384)');
+  assert(uploadRes.path === 'uploads/screenshot.png', '附件图片上传成功获取 remote path');
 
-  const artifactData = await HermesFileClient.downloadArtifact(
+  // 产物二进制下载测试
+  const artifactBuffer = await HermesFileClient.downloadArtifact(
     baseUrl,
     'output/build.bin',
     'default',
@@ -845,11 +976,19 @@ async function runTestSuite() {
     loginResult.token,
     loginResult.cookies
   );
-  assert(artifactData === 'BINARY_ARTIFACT_CONTENT_DATA', '产物文件真实下载匹配');
-  console.log('[PASS 13] 真实 HermesFileClient 附件上传与产物下载通过');
+  assert(serverStats.verifiedDownloadArtifactBinary, '产物下载请求到达服务器');
+  assert(artifactBuffer instanceof ArrayBuffer, '下载产物返回值必须是 ArrayBuffer (杜绝文本转换损坏二进制！)');
+  assert(artifactBuffer.byteLength === 12, '二进制长度必须完整匹配 12 字节');
+  const binView = new Uint8Array(artifactBuffer);
+  assert(binView[0] === 0x89 && binView[1] === 0x50 && binView[2] === 0x4e && binView[3] === 0x47, 'PNG 魔数签名完整保留');
 
-  // --- 测试用例 14: 生产 HermesCronClient 定时任务调度管理 ---
-  console.log('\n[TEST 14] 测试真实 HermesCronClient 定时任务列表、触发执行、暂停与恢复:');
+  // 同时验证 WorkspaceViewModel.downloadFile
+  const wsBuffer = await wsVm.downloadFile(botConn, { name: 'build.bin', path: 'output/build.bin', isDirectory: false });
+  assert(wsBuffer instanceof ArrayBuffer && wsBuffer.byteLength === 12, 'WorkspaceViewModel.downloadFile 成功产出 ArrayBuffer');
+  console.log('[PASS 14] 真实 HermesFileClient data_url 上传与 ArrayBuffer 二进制下载通过');
+
+  // --- 测试用例 15: 生产 HermesCronClient 定时任务调度管理 ---
+  console.log('\n[TEST 15] 测试真实 HermesCronClient 定时任务列表、触发执行、暂停与恢复:');
   const cronJobs = await HermesCronClient.listCronJobs(baseUrl, loginResult.token, loginResult.cookies);
   assert(cronJobs.length === 1, '定时任务拉取 1 条');
   assert(cronJobs[0].id === 'job_daily_1', '任务 ID 匹配');
@@ -863,21 +1002,26 @@ async function runTestSuite() {
 
   const resumeSuccess = await HermesCronClient.resumeCronJob(baseUrl, 'job_daily_1', 'default', loginResult.token, loginResult.cookies);
   assert(resumeSuccess, '恢复定时任务成功');
-  console.log('[PASS 14] 真实 HermesCronClient 定时任务生命周期通过');
+  console.log('[PASS 15] 真实 HermesCronClient 定时任务生命周期通过');
 
-  // --- 测试用例 15: 生产 HermesInsightsClient 用量与模型统计 ---
-  console.log('\n[TEST 15] 测试真实 HermesInsightsClient 用量总计与模型明细统计:');
-  const usage = await HermesInsightsClient.getUsageSummary(baseUrl, 'default', loginResult.token, loginResult.cookies);
-  assert(usage.totalTokens === 32000, '总 Token 数匹配');
-  assert(usage.totalCostUsd === 0.28, '总费用 USD 匹配');
+  // --- 测试用例 16: 生产 HermesInsightsClient 用量与模型统计 (对齐 analytics.json totals 结构) ---
+  console.log('\n[TEST 16] 测试真实 HermesInsightsClient 用量总计与模型明细统计:');
+  const usage = await HermesInsightsClient.getUsageSummary(baseUrl, 7, 'default', loginResult.token, loginResult.cookies);
+  assert(serverStats.verifiedAnalyticsDays, '请求参数携带 ?days=7 与 ?profile=default');
+  assert(usage.totalInputTokens === 20000, '总 Input Token 数匹配');
+  assert(usage.totalOutputTokens === 12000, '总 Output Token 数匹配');
+  assert(usage.totalReasoningTokens === 4000, '总 Reasoning Token 数匹配');
+  assert(usage.totalActualCostUsd === 0.28, '总实际费用 USD 匹配');
+  assert(usage.totalApiCalls === 18, '总 API 调用次数匹配');
 
-  const modelUsage = await HermesInsightsClient.getModelUsageList(baseUrl, 'default', loginResult.token, loginResult.cookies);
+  const modelUsage = await HermesInsightsClient.getModelUsageList(baseUrl, 7, 'default', loginResult.token, loginResult.cookies);
   assert(modelUsage.length === 1 && modelUsage[0].model === 'claude-3-5-sonnet', '模型统计明细匹配');
-  assert(modelUsage[0].calls === 18, '调用次数匹配');
-  console.log('[PASS 15] 真实 HermesInsightsClient 用量分析通过');
+  assert(modelUsage[0].apiCalls === 18, '调用次数匹配');
+  assert(modelUsage[0].reasoningTokens === 4000, '模型推理 Token 匹配');
+  console.log('[PASS 16] 真实 HermesInsightsClient 用量分析通过');
 
-  // --- 测试用例 16: 生产 LegacySSEClient 兼容性探针与 SSE 数据帧解析 ---
-  console.log('\n[TEST 16] 测试真实 LegacySSEClient /health 探针与 SSE 数据帧解析:');
+  // --- 测试用例 17: 生产 LegacySSEClient 兼容性探针与 SSE 数据帧解析 ---
+  console.log('\n[TEST 17] 测试真实 LegacySSEClient /health 探针与 SSE 数据帧解析:');
   const healthOk = await LegacySSEClient.probeHealth(baseUrl);
   assert(healthOk, 'Legacy webui /health 探针响应成功');
 
@@ -886,10 +1030,10 @@ async function runTestSuite() {
   assert(sseEvents.length === 2, '正确解析出 2 个 SSE 事件帧');
   assert(sseEvents[0].event === 'message.delta', '首帧事件名称匹配');
   assert(sseEvents[0].data.includes('hello legacy'), '首帧数据载荷匹配');
-  console.log('[PASS 16] 真实 LegacySSEClient 兼容层通过');
+  console.log('[PASS 17] 真实 LegacySSEClient 兼容层通过');
 
-  // --- 测试用例 17: 生产 MarkdownView 结构化 AST 解析引擎 ---
-  console.log('\n[TEST 17] 测试真实 MarkdownView 标题、代码块、表格、列表与段落解析:');
+  // --- 测试用例 18: 生产 MarkdownView 结构化 AST 解析引擎 ---
+  console.log('\n[TEST 18] 测试真实 MarkdownView 标题、代码块、表格、列表与段落解析:');
   const markdownText = `# 一级标题
 这是普通段落文本。
 
@@ -914,24 +1058,25 @@ export const test = true;
   assert(blocks.some(b => b.type === 'list' && b.content === '列表项一'), '列表解析');
   assert(blocks.some(b => b.type === 'table' && b.rows && b.rows.length >= 2), '表格解析');
   assert(blocks.some(b => b.type === 'code' && b.language === 'typescript'), '代码块语法解析');
-  console.log('[PASS 17] 生产 MarkdownView 解析器全语法覆盖通过');
+  console.log('[PASS 18] 生产 MarkdownView 解析器全语法覆盖通过');
 
   vm.disconnect();
   server.close();
 
   console.log('\n======================================================');
-  console.log('✅ 所有 17 项端到端生产代码行为回归测试全部通过 (退出码 0)');
-  console.log('覆盖生产类：');
+  console.log('✅ 所有 18 项端到端生产代码行为回归测试全部通过 (退出码 0)');
+  console.log('覆盖真实生产业务类：');
   console.log('  - HermesRESTClient.ets (Cookie Jar、登录、/api/auth/me 核验、Ticket、会话与历史)');
   console.log('  - HermesGatewayClient.ets (WebSocket 握手、client.capabilities 回执、关闭码、RPC 30s 超时、取消)');
   console.log('  - ChatViewModel.ets (会话恢复门禁、禁止发送、async 代次乱序拦截、中文流式、推理、工具、审批重试、模型配置)');
-  console.log('  - AuthStore.ets (普通元数据与敏感凭据物理隔离存储)');
-  console.log('  - HermesWorkspaceClient.ets (远程工作区文件树目录与源码读取)');
-  console.log('  - HermesFileClient.ets (图片附件上传与会话产物下载)');
+  console.log('  - AuthStore.ets (元数据与敏感凭据物理隔离存储、冷启动持久化恢复)');
+  console.log('  - HermesWorkspaceClient.ets (路径穿越防护、远程目录与文件读取)');
+  console.log('  - WorkspaceViewModel.ets (目录层级导航、历史回退、文件预览与下载)');
+  console.log('  - HermesFileClient.ets (data_url 图片上传、ArrayBuffer 二进制产物下载)');
   console.log('  - HermesCronClient.ets (定时任务调度、触发、暂停与恢复)');
   console.log('  - HermesInsightsClient.ets (模型用量与成本统计)');
   console.log('  - LegacySSEClient.ets (上游旧版 WebUI 健康探针与 SSE 数据帧解析)');
-  console.log('  - MarkdownView.ets (代码块、表格、列表、引用与多级标题渲染)');
+  console.log('  - MarkdownParser.ets / MarkdownView.ets (代码块、表格、列表、引用与多级标题解析渲染)');
   console.log('======================================================');
 }
 

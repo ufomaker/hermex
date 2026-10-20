@@ -1,10 +1,13 @@
 import { ConnectionViewModel } from '../viewmodel/ConnectionViewModel';
 import { SessionListViewModel } from '../viewmodel/SessionListViewModel';
 import { ChatViewModel } from '../viewmodel/ChatViewModel';
+import { WorkspaceViewModel } from '../viewmodel/WorkspaceViewModel';
 import { BotConnection, HermesStatus } from '../model/Connection';
 import { HermesSession } from '../model/Session';
 import { ChatMessage, ToolCallItem } from '../model/ChatMessage';
 import { ModelOption } from '../model/Approval';
+import { WorkspaceFileEntry } from '../network/HermesWorkspaceClient';
+import { HermesFileClient } from '../network/HermesFileClient';
 import { MarkdownView } from '../components/MarkdownView';
 import promptAction from '@ohos.promptAction';
 
@@ -21,11 +24,14 @@ struct Index {
   @State showServerDialog: boolean = false;
   @State showSessionListDialog: boolean = false;
   @State showModelDialog: boolean = false;
+  @State showWorkspaceDialog: boolean = false;
+  @State showAttachmentDialog: boolean = false;
 
   // ViewModels
   private connVm: ConnectionViewModel = new ConnectionViewModel();
   private sessionVm: SessionListViewModel = new SessionListViewModel();
   private chatVm: ChatViewModel = new ChatViewModel();
+  private workspaceVm: WorkspaceViewModel = new WorkspaceViewModel();
 
   // Observable UI States
   @State isConnected: boolean = false;
@@ -43,6 +49,22 @@ struct Index {
   @State clarifyOptions: string[] = [];
   @State isSubmittingClarify: boolean = false;
 
+  // Workspace Observable States
+  @State workspaceEntries: WorkspaceFileEntry[] = [];
+  @State workspacePath: string = '';
+  @State isWorkspaceLoading: boolean = false;
+  @State workspaceError: string = '';
+  @State viewingFileName: string = '';
+  @State viewingFileText: string = '';
+  @State isViewingFile: boolean = false;
+  @State isDownloadingFile: boolean = false;
+
+  // Attachment States
+  @State attachmentFileName: string = 'screenshot.png';
+  @State attachmentDataUrl: string = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+  @State isUploadingAttachment: boolean = false;
+  @State attachmentStatusText: string = '';
+
   aboutToAppear() {
     this.chatVm.setListener({
       onStateChanged: () => {
@@ -56,6 +78,20 @@ struct Index {
         }
       }
     });
+
+    this.workspaceVm.setListener({
+      onStateChanged: () => {
+        this.workspaceEntries = this.workspaceVm.entries.slice();
+        this.workspacePath = this.workspaceVm.currentRelativePath;
+        this.isWorkspaceLoading = this.workspaceVm.isLoading;
+        this.workspaceError = this.workspaceVm.errorMessage;
+        this.viewingFileName = this.workspaceVm.selectedFileName;
+        this.viewingFileText = this.workspaceVm.selectedFileText;
+        this.isViewingFile = this.workspaceVm.isViewingFile;
+        this.isDownloadingFile = this.workspaceVm.isDownloading;
+      }
+    });
+
     this.initDefaultConnection();
   }
 
@@ -68,8 +104,8 @@ struct Index {
     this.connectionStatusText = this.chatVm.connectionStatusText;
     this.isGenerating = this.chatVm.isGenerating;
     this.currentModel = this.chatVm.currentModel;
-    this.messages = [...this.chatVm.messages];
-    this.availableModels = [...this.chatVm.availableModels];
+    this.messages = this.chatVm.messages.slice();
+    this.availableModels = this.chatVm.availableModels.slice();
     this.isSubmittingApproval = this.chatVm.isSubmittingApproval;
     this.isSubmittingClarify = this.chatVm.isSubmittingClarify;
 
@@ -160,9 +196,7 @@ struct Index {
     const cur = this.connVm.getCurrentConnection();
     if (!cur) return;
     try {
-      // 必须通过 Gateway 真实调用 session.create，杜绝伪造本地 ID！
       if (!this.chatVm.isConnected) {
-        // 若未连接先以临时标识建立握手再创建
         await this.chatVm.attachSession(cur, '');
       }
       const realSessionId = await this.chatVm.createAndAttachNewSession(cur);
@@ -174,6 +208,71 @@ struct Index {
       try {
         promptAction.showToast({ message: `创建会话失败: ${e}`, duration: 3000 });
       } catch (err) {}
+    }
+  }
+
+  private async handleDownloadFile(entry: WorkspaceFileEntry) {
+    const cur = this.connVm.getCurrentConnection();
+    if (!cur) return;
+    try {
+      const buffer = await this.workspaceVm.downloadFile(cur, entry, this.currentSessionId);
+      try {
+        promptAction.showToast({ message: `文件已下载: ${entry.name} (${buffer.byteLength} 字节)`, duration: 3000 });
+      } catch (e) {}
+    } catch (e) {
+      try {
+        promptAction.showToast({ message: `下载失败: ${e}`, duration: 3000 });
+      } catch (err) {}
+    }
+  }
+
+  private async handleUploadAttachment() {
+    const cur = this.connVm.getCurrentConnection();
+    if (!cur) {
+      try {
+        promptAction.showToast({ message: '请先连接服务器', duration: 3000 });
+      } catch (e) {}
+      return;
+    }
+
+    if (!this.attachmentDataUrl.trim()) {
+      try {
+        promptAction.showToast({ message: '请输入或选择图片 Data URL', duration: 3000 });
+      } catch (e) {}
+      return;
+    }
+
+    this.isUploadingAttachment = true;
+    this.attachmentStatusText = '正在上传图片...';
+
+    try {
+      const profile = cur.activeProfile ? cur.activeProfile : 'default';
+      const result = await HermesFileClient.uploadImage(
+        cur.url,
+        profile,
+        this.attachmentFileName || 'image.png',
+        this.attachmentDataUrl,
+        cur.token,
+        cur.cookies
+      );
+
+      const targetPath = result.path || result.url || this.attachmentFileName;
+      this.attachmentStatusText = `上传成功: ${targetPath}`;
+      const refTag = `![${this.attachmentFileName}](${targetPath})\n`;
+      this.inputText = this.inputText ? `${this.inputText}\n${refTag}` : refTag;
+
+      try {
+        promptAction.showToast({ message: `图片已上传并插入输入框: ${targetPath}`, duration: 3000 });
+      } catch (e) {}
+
+      this.showAttachmentDialog = false;
+    } catch (e) {
+      this.attachmentStatusText = `上传失败: ${e}`;
+      try {
+        promptAction.showToast({ message: `上传失败: ${e}`, duration: 3000 });
+      } catch (err) {}
+    } finally {
+      this.isUploadingAttachment = false;
     }
   }
 
@@ -203,9 +302,22 @@ struct Index {
           .fontSize(12)
           .backgroundColor('#F2F2F7')
           .fontColor('#007AFF')
-          .margin({ right: 8 })
+          .margin({ right: 6 })
           .onClick(() => {
             this.showModelDialog = true;
+          })
+
+        Button('工作区')
+          .fontSize(12)
+          .backgroundColor('#E5E5EA')
+          .fontColor('#000000')
+          .margin({ right: 6 })
+          .onClick(async () => {
+            const cur = this.connVm.getCurrentConnection();
+            if (cur) {
+              await this.workspaceVm.loadDirectory(cur, '');
+            }
+            this.showWorkspaceDialog = true;
           })
 
         Button('会话')
@@ -382,8 +494,18 @@ struct Index {
       .layoutWeight(1)
       .padding({ left: 16, right: 16, top: 12, bottom: 12 })
 
-      // 5. 底部输入栏与控制
+      // 5. 底部输入栏与控制 (支持附件上传)
       Row() {
+        Button('📎')
+          .fontSize(18)
+          .height(40)
+          .width(40)
+          .backgroundColor('#F2F2F7')
+          .margin({ right: 6 })
+          .onClick(() => {
+            this.showAttachmentDialog = true;
+          })
+
         TextInput({ text: this.inputText, placeholder: '发送消息给 Hermes...' })
           .layoutWeight(1)
           .height(40)
@@ -571,7 +693,7 @@ struct Index {
         .position({ x: '5%', y: '15%' })
       }
 
-      // 8. 模型选择列表弹窗 (真实触发 config.set)
+      // 8. 模型选择列表弹窗
       if (this.showModelDialog) {
         Column() {
           Text('选择会话模型')
@@ -617,6 +739,245 @@ struct Index {
         }
         .width('85%')
         .padding(20)
+        .backgroundColor('#FFFFFF')
+        .borderRadius(16)
+        .shadow({ radius: 20, color: '#40000000' })
+        .position({ x: '7.5%', y: '20%' })
+      }
+
+      // 9. 工作区文件浏览与下载弹窗
+      if (this.showWorkspaceDialog) {
+        Column() {
+          Row() {
+            Column() {
+              Text('工作区文件浏览器')
+                .fontSize(18)
+                .fontWeight(FontWeight.Bold)
+              Text(`当前路径: /workspace${this.workspacePath ? '/' + this.workspacePath : ''}`)
+                .fontSize(11)
+                .fontColor('#6B7280')
+                .margin({ top: 2 })
+            }
+            .alignItems(HorizontalAlign.Start)
+            .layoutWeight(1)
+
+            Button('刷新')
+              .fontSize(12)
+              .backgroundColor('#F2F2F7')
+              .fontColor('#007AFF')
+              .margin({ right: 6 })
+              .onClick(async () => {
+                const cur = this.connVm.getCurrentConnection();
+                if (cur) {
+                  await this.workspaceVm.loadDirectory(cur, this.workspacePath);
+                }
+              })
+
+            Button('关闭')
+              .fontSize(12)
+              .backgroundColor('#E5E5EA')
+              .fontColor('#374151')
+              .onClick(() => {
+                this.showWorkspaceDialog = false;
+                this.workspaceVm.closeFileView();
+              })
+          }
+          .width('100%')
+          .margin({ bottom: 10 })
+
+          if (this.workspacePath.length > 0) {
+            Button('⬆️ 返回上一级目录')
+              .fontSize(12)
+              .backgroundColor('#E0E7FF')
+              .fontColor('#3730A3')
+              .width('100%')
+              .margin({ bottom: 8 })
+              .onClick(async () => {
+                const cur = this.connVm.getCurrentConnection();
+                if (cur) {
+                  await this.workspaceVm.navigateUp(cur);
+                }
+              })
+          }
+
+          if (this.isWorkspaceLoading) {
+            Text('正在加载工作区...')
+              .fontSize(13)
+              .fontColor('#6B7280')
+              .margin({ top: 20, bottom: 20 })
+          } else if (this.workspaceError.length > 0) {
+            Text(`错误: ${this.workspaceError}`)
+              .fontSize(12)
+              .fontColor('#EF4444')
+              .margin({ top: 10, bottom: 10 })
+          } else if (this.isViewingFile) {
+            // 查看文件文本内容
+            Column() {
+              Row() {
+                Text(`预览: ${this.viewingFileName}`)
+                  .fontSize(14)
+                  .fontWeight(FontWeight.Bold)
+                  .layoutWeight(1)
+                Button('返回列表')
+                  .fontSize(12)
+                  .backgroundColor('#E5E5EA')
+                  .fontColor('#007AFF')
+                  .onClick(() => {
+                    this.workspaceVm.closeFileView();
+                  })
+              }
+              .width('100%')
+              .margin({ bottom: 8 })
+
+              Scroll() {
+                Text(this.viewingFileText)
+                  .fontSize(12)
+                  .fontFamily('monospace')
+                  .fontColor('#111827')
+              }
+              .height(220)
+              .width('100%')
+              .padding(8)
+              .backgroundColor('#F9FAFB')
+              .borderRadius(6)
+            }
+            .width('100%')
+          } else {
+            // 文件与目录列表
+            List({ space: 6 }) {
+              ForEach(this.workspaceEntries, (entry: WorkspaceFileEntry) => {
+                ListItem() {
+                  Row() {
+                    Text(entry.isDirectory ? '📁 ' : '📄 ')
+                      .fontSize(14)
+                    Column() {
+                      Text(entry.name)
+                        .fontSize(14)
+                        .fontWeight(FontWeight.Medium)
+                      if (entry.size !== undefined) {
+                        Text(`${entry.size} 字节`)
+                          .fontSize(10)
+                          .fontColor('#9CA3AF')
+                      }
+                    }
+                    .alignItems(HorizontalAlign.Start)
+                    .layoutWeight(1)
+
+                    if (entry.isDirectory) {
+                      Button('进入')
+                        .fontSize(12)
+                        .backgroundColor('#E5E5EA')
+                        .fontColor('#007AFF')
+                        .onClick(async () => {
+                          const cur = this.connVm.getCurrentConnection();
+                          if (cur) {
+                            await this.workspaceVm.enterDirectory(cur, entry);
+                          }
+                        })
+                    } else {
+                      Row() {
+                        Button('预览')
+                          .fontSize(11)
+                          .backgroundColor('#F2F2F7')
+                          .fontColor('#007AFF')
+                          .margin({ right: 4 })
+                          .onClick(async () => {
+                            const cur = this.connVm.getCurrentConnection();
+                            if (cur) {
+                              await this.workspaceVm.viewFile(cur, entry);
+                            }
+                          })
+
+                        Button('下载')
+                          .fontSize(11)
+                          .backgroundColor('#E0E7FF')
+                          .fontColor('#4338CA')
+                          .onClick(async () => {
+                            await this.handleDownloadFile(entry);
+                          })
+                      }
+                    }
+                  }
+                  .width('100%')
+                  .padding(8)
+                  .backgroundColor('#F9FAFB')
+                  .borderRadius(6)
+                }
+              })
+            }
+            .height(260)
+            .width('100%')
+          }
+        }
+        .width('90%')
+        .padding(16)
+        .backgroundColor('#FFFFFF')
+        .borderRadius(16)
+        .shadow({ radius: 20, color: '#40000000' })
+        .position({ x: '5%', y: '12%' })
+      }
+
+      // 10. 附件图片上传弹窗
+      if (this.showAttachmentDialog) {
+        Column() {
+          Text('上传图片附件')
+            .fontSize(18)
+            .fontWeight(FontWeight.Bold)
+            .margin({ bottom: 12 })
+
+          TextInput({ text: this.attachmentFileName, placeholder: '文件名 (例如 prompt.png)' })
+            .height(38)
+            .margin({ bottom: 8 })
+            .onChange((val: string) => {
+              this.attachmentFileName = val;
+            })
+
+          TextInput({ text: this.attachmentDataUrl, placeholder: '图片 Data URL (data:image/png;base64,...)' })
+            .height(38)
+            .margin({ bottom: 8 })
+            .onChange((val: string) => {
+              this.attachmentDataUrl = val;
+            })
+
+          if (this.attachmentStatusText.length > 0) {
+            Text(this.attachmentStatusText)
+              .fontSize(11)
+              .fontColor('#4B5563')
+              .margin({ bottom: 8 })
+          }
+
+          Row() {
+            Button('填入测试图')
+              .fontSize(12)
+              .backgroundColor('#F2F2F7')
+              .fontColor('#007AFF')
+              .margin({ right: 8 })
+              .onClick(() => {
+                this.attachmentFileName = 'sample-1px.png';
+                this.attachmentDataUrl = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+              })
+
+            Button(this.isUploadingAttachment ? '上传中...' : '上传并附加')
+              .fontSize(12)
+              .backgroundColor('#007AFF')
+              .fontColor('#FFFFFF')
+              .enabled(!this.isUploadingAttachment)
+              .margin({ right: 8 })
+              .onClick(async () => {
+                await this.handleUploadAttachment();
+              })
+
+            Button('取消')
+              .fontSize(12)
+              .backgroundColor('#E5E5EA')
+              .fontColor('#374151')
+              .onClick(() => {
+                this.showAttachmentDialog = false;
+              })
+          }
+        }
+        .width('85%')
+        .padding(18)
         .backgroundColor('#FFFFFF')
         .borderRadius(16)
         .shadow({ radius: 20, color: '#40000000' })

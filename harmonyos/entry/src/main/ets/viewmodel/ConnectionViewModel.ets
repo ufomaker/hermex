@@ -38,7 +38,7 @@ export class ConnectionViewModel {
       isCurrent: true
     };
 
-    this.authStore.saveConnection(conn);
+    await this.authStore.saveConnection(conn);
     return conn;
   }
 
@@ -50,7 +50,7 @@ export class ConnectionViewModel {
     return this.authStore.getCurrentConnection();
   }
 
-  public selectConnection(id: string): void {
-    this.authStore.setCurrentConnection(id);
+  public async selectConnection(id: string): Promise<void> {
+    await this.authStore.setCurrentConnection(id);
   }
 }

@@ -27,21 +27,54 @@ export class HermesWorkspaceClient {
   }
 
   /**
-   * 安全组合路径：防止跨越根目录跳跃
+   * 安全组合路径：防止跨越根目录跳跃与越界注入
+   * 严格对齐 HermesWorkspaceFileClient.swift:117-124 hostPath 安全防线
    */
   public static resolveHostPath(cwd: string, relativePath: string): string {
-    let base = cwd.trim();
-    if (base.endsWith('/')) {
-      base = base.substring(0, base.length - 1);
+    const trimmedCwd = cwd.trim();
+    const root = (trimmedCwd.length > 1 && trimmedCwd.endsWith('/')) ? trimmedCwd.substring(0, trimmedCwd.length - 1) : trimmedCwd;
+    const path = relativePath.trim();
+
+    // 根路径标识
+    if (!path || path === '.' || path === '') {
+      return root;
     }
-    let rel = relativePath.trim();
-    if (rel.startsWith('/')) {
-      rel = rel.substring(1);
+
+    // 拒绝绝对路径
+    if (path.startsWith('/')) {
+      throw new Error(`Invalid workspace path: absolute path not allowed (${relativePath})`);
     }
-    if (!rel) {
-      return base;
+
+    // 拒绝家目录波浪号前缀
+    if (path.startsWith('~')) {
+      throw new Error(`Invalid workspace path: home directory traversal not allowed (${relativePath})`);
     }
-    return `${base}/${rel}`;
+
+    // 拒绝空字节注入
+    if (path.includes('\0')) {
+      throw new Error('Invalid workspace path: null bytes forbidden');
+    }
+
+    const parts = path.split('/');
+
+    // 拒绝目录向上穿越 (..)
+    if (parts.includes('..')) {
+      throw new Error(`Invalid workspace path: directory traversal (..) forbidden (${relativePath})`);
+    }
+
+    // 必须包含有效路径片段
+    let hasValidSegment = false;
+    for (let i = 0; i < parts.length; i++) {
+      if (parts[i].length > 0 && parts[i] !== '.') {
+        hasValidSegment = true;
+        break;
+      }
+    }
+    if (!hasValidSegment) {
+      return root;
+    }
+
+    return (root === '/' ? '' : root) + '/' + path;
   }
 
   /**
