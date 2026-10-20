@@ -1,10 +1,26 @@
 import { HermesSession } from '../model/Session';
 import { HermesRESTClient } from '../network/HermesRESTClient';
 import { HermesGatewayClient } from '../network/HermesGatewayClient';
+import { LegacySSEClient } from '../network/legacy/LegacySSEClient';
 import { BotConnection } from '../model/Connection';
 
 export class SessionListViewModel {
   public async loadSessions(conn: BotConnection): Promise<HermesSession[]> {
+    if (conn.serverVersion === 'legacy-webui') {
+      const legacyItems = await LegacySSEClient.listSessions(conn.url, conn.token, conn.cookies);
+      return legacyItems.map((item) => {
+        const s: HermesSession = {
+          id: item.id,
+          runtime_id: item.id,
+          title: item.title || '历史会话',
+          profile: 'default',
+          created_at: item.createdAt || Date.now(),
+          updated_at: item.updatedAt || Date.now(),
+          running: false
+        };
+        return s;
+      });
+    }
     const profile = conn.activeProfile || 'default';
     return await HermesRESTClient.listSessions(conn.url, profile, conn.token, conn.cookies);
   }

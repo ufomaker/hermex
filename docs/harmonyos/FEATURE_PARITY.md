@@ -1,6 +1,6 @@
 # Hermex 鸿蒙功能移植对照表 (Feature Parity Matrix)
 
-最后更新：2026-10-21 00:15 (Run 12 阶段更新)
+最后更新：2026-10-21 01:30 (Run 13 阶段更新)
 
 > **验收标准分层说明**：
 > 1. **代码实现 (Implementation)**：ArkTS 生产代码、网络协议客户端、ViewModel 及原生 ArkUI 入口是否完整实现并接入主界面。
@@ -18,9 +18,9 @@
 | F07 | 文件与附件 | `HermesREST.swift` (`downloadArtifact`, `uploadImage`), `HermesCall.swift` (`file.attach`) | `HermesFileClient.ets`, `AttachmentUtils.ets`, `WorkspaceViewModel.ets`, `Index.ets` | ✅ 已实现 | ✅ 本地回归通过 (测试 14, 19, 20) | ⚪ 待真机操作 | 系统 PhotoViewPicker / DocumentViewPicker，图片转码 `data_url` 上传，二进制文件沙箱持久化与 DocumentSaveOptions，`file.attach` RPC 文档附加 |
 | F08 | 任务与定时 Job | `HermesCronClient.swift` | `HermesCronClient.ets`, `CronViewModel.ets`, `Index.ets` (运维弹窗-任务Tab) | ✅ 已实现 | ✅ 本地回归通过 (测试 15) | ⚪ 待真机操作 | Cron 任务列表查询、手动触发执行 (`/run`)、暂停 (`/pause`)、恢复 (`/resume`) |
 | F09 | 记忆与统计分析 | `HermesInsightsClient.ets`, `HermesSkillsClient.ets`, `HermesMemoryClient.ets` | `SkillsViewModel.ets`, `InsightsViewModel.ets`, `Index.ets` (运维弹窗-技能/设定/用量Tab) | ✅ 已实现 | ✅ 本地回归通过 (测试 16, 22) | ⚪ 待真机操作 | 对齐 `analytics.json` 字段，支持 7/30 天用量汇总与模型明细；技能开关；Soul 设定读取与保存 |
-| F10 | 平台特性集成 | `HermesLiveActivityWidget/`, `HermesNotificationService/` | `NotificationUtils.ets`, `ChatViewModel.ets`, `EntryAbility.ets` | ✅ 已实现 | ✅ 本地回归通过 (测试 28) | ⚪ 待真机操作 | 封装 `@ohos.notificationManager`，后台与多任务状态下分发审批待办与任务完成提醒，前后台切换与异常平滑降级 |
-| F11 | 看板与高级特性 | `HermesKanbanClient.swift`, `Kanban/` | `HermesKanbanClient.ets`, `KanbanViewModel.ets`, `Index.ets` (运维弹窗-看板Tab) | ✅ 已实现 | ✅ 本地回归通过 (测试 23, 27) | ⚪ 待真机操作 | `/api/plugins/kanban` 可用性探测、看板列表、泳道卡片快照、新建任务卡片、卡片状态流转 |
-| F12 | Legacy WebUI 兼容 | `Endpoints.swift`, `SSEClient.swift` | `LegacySSEClient.ets`, `ConnectionViewModel.ets` | ✅ 已实现 | ✅ 本地回归通过 (测试 17) | ⚪ 待真机操作 | 对齐 `UPSTREAM_TESTED_SHA: c67fd2dd`，`/health` 探针降级探测与 SSE 事件分包解析 |
+| F10 | 平台特性集成 | `HermesLiveActivityWidget/`, `HermesNotificationService/`, `HermesDeepLink.swift` | `NotificationUtils.ets`, `VoiceUtils.ets`, `ShareUtils.ets`, `DeepLinkUtils.ets`, `Index.ets` | ✅ 已实现 | ✅ 30 项回归通过 (测试 28, 30) | 🟡 模拟器通过 | 封装 `@ohos.notificationManager` 通知；真实 `@ohos.multimedia.media` (AVRecorder AAC/M4A 录音落盘校验 + AVPlayer 播放状态机)；`@hms.collaboration.systemShare` 系统分享与 Want 解析；`hermex://` 深链解析与冷/热启动派发；`appScenePhase` 前后台切换恢复 |
+| F11 | 看板与高级特性 | `HermesKanbanClient.swift`, `Kanban/` | `HermesKanbanClient.ets`, `KanbanViewModel.ets`, `Index.ets` (运维弹窗-看板Tab) | ✅ 已实现 | ✅ 30 项回归通过 (测试 23, 27) | ⚪ 待真机操作 | 使用 `@kit.RemoteCommunicationKit` (`rcp`) 发送真实原生 HTTP `PATCH` 状态流转；严格解析 boards 响应包装 `{ boards, current, readOnly }`、驼峰 `latestEventId` 游标、只读看板保护 |
+| F12 | Legacy WebUI 兼容 | `Endpoints.swift`, `SSEClient.swift`, `APIClient+Chat.swift` | `LegacySSEClient.ets`, `SessionListViewModel.ets`, `ChatViewModel.ets`, `ConnectionViewModel.ets` | ✅ 已实现 | ✅ 30 项回归通过 (测试 17, 29) | ⚪ 待真机操作 | 对齐 `UPSTREAM_TESTED_SHA: c67fd2dd`；`cancelChatTurn` 严格使用 GET；单例持续 TextDecoder 流式拼包防中文乱码；处理 401/403/5xx 状态；主流程已接入会话拉取与聊天生成中断 |
 | F13 | 国内直连与远程通道 | `docs/agents/hermes-server.md` | `Index.ets` (连接设置) | ✅ 已实现 | ⚪ 待网络验证 | ⚪ 待真机操作 | 无硬编码 127.0.0.1，支持任意公网 HTTPS/WSS 域名直连，待手机蜂窝网络真实连接验证 |
 | F14 | 跨 Agent 调度验证 | `MIGRATION_PLAN.md` 74 节 | 独立隔离任务调度协议 | 🟡 联调中 | ⚪ 待验证 | ⚪ 待验证 | 需通过 Hermes 向隔离测试会话分发小型任务并收回产物 |
 | F15 | 真机安装与升级 | `MIGRATION_PLAN.md` 75 节 | `harmonyos/entry/build/default/outputs/default/entry-default-signed.hap` | ✅ 已实现 | ✅ hvigor 编译 0 | 🟡 部分通过 | 监督者已在真机成功安装启动最新 signed HAP；覆盖升级后的数据持久性与会话保留仍待独立验证 |

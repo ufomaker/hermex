@@ -17,7 +17,7 @@ import { SkillSummary } from '../network/HermesSkillsClient';
 import { ModelUsageItem } from '../network/HermesInsightsClient';
 import { GitBranchInfo } from '../network/HermesProjectClient';
 import { KanbanViewModel } from '../viewmodel/KanbanViewModel';
-import { KanbanBoardSnapshot, KanbanColumnItem, KanbanCardItem } from '../network/HermesKanbanClient';
+import { KanbanBoardSnapshot, KanbanColumnItem, KanbanCardItem, KanbanBoardItem } from '../network/HermesKanbanClient';
 import { NotificationUtils } from '../utils/NotificationUtils';
 import { AuthStore } from '../storage/AuthStore';
 import { MarkdownView } from '../components/MarkdownView';
@@ -28,6 +28,9 @@ import fs from '@ohos.file.fs';
 import util from '@ohos.util';
 import common from '@ohos.app.ability.common';
 import Want from '@ohos.app.ability.Want';
+import { DeepLinkUtils, AppDeepLinkRouter, DeepLinkRoute, InboundShareData } from '../utils/DeepLinkUtils';
+import { ShareUtils } from '../utils/ShareUtils';
+import { VoiceUtils } from '../utils/VoiceUtils';
 
 @Entry
 @Component
@@ -37,6 +40,7 @@ struct Index {
   @State passwordInput: string = '';
   @State statusProbeText: string = '';
   @State inputText: string = '';
+  @State isRecordingVoice: boolean = false;
   @State currentSessionTitle: string = '未选择会话';
   @State currentSessionId: string = '';
   @State showServerDialog: boolean = false;
@@ -59,10 +63,17 @@ struct Index {
   private kanbanVm: KanbanViewModel = new KanbanViewModel();
 
   // Kanban States
-  @State kanbanBoards: string[] = [];
-  @State selectedKanbanBoard: string = '';
+  @State kanbanBoards: KanbanBoardItem[] = [];
+  @State selectedKanbanSlug: string = '';
+  @State selectedKanbanName: string = '';
+  @State isKanbanReadOnly: boolean = false;
   @State kanbanSnapshot: KanbanBoardSnapshot | null = null;
   @State newCardTitleInput: string = '';
+
+  // App Lifecycle & Platform Listeners
+  @StorageProp('appScenePhase') @Watch('onScenePhaseChanged') scenePhase: string = 'active';
+  private routeListener: ((route: DeepLinkRoute) => void) | null = null;
+  private shareListener: ((share: InboundShareData) => void) | null = null;
 
   // Observable UI States
   @State isConnected: boolean = false;
@@ -128,7 +139,9 @@ struct Index {
     this.kanbanVm.setListener({
       onStateChanged: () => {
         this.kanbanBoards = this.kanbanVm.boards.slice();
-        this.selectedKanbanBoard = this.kanbanVm.selectedBoard;
+        this.selectedKanbanSlug = this.kanbanVm.selectedBoardSlug;
+        this.selectedKanbanName = this.kanbanVm.selectedBoardName;
+        this.isKanbanReadOnly = this.kanbanVm.isReadOnly;
         this.kanbanSnapshot = this.kanbanVm.currentSnapshot;
       }
     });
@@ -136,10 +149,193 @@ struct Index {
     // 严格等待 AuthStore 完成平台安全存储初始化与冷启动数据还原
     await AuthStore.getInstance().waitUntilReady();
     this.initDefaultConnection();
+
+    // 检查并消费外部启动深层链接与系统分享
+    this.drainPendingDeepLinkAndShare();
+    this.routeListener = (route: DeepLinkRoute) => {
+      this.handleDeepLinkRoute(route);
+    };
+    this.shareListener = (share: InboundShareData) => {
+      this.handleInboundShare(share);
+    };
+    AppDeepLinkRouter.getInstance().addRouteListener(this.routeListener);
+    AppDeepLinkRouter.getInstance().addShareListener(this.shareListener);
+  }
+
+  private onScenePhaseChanged(): void {
+    if (this.scenePhase === 'active') {
+      const cur = this.connVm.getCurrentConnection();
+      if (cur && this.currentSessionId) {
+        if (!this.chatVm.isConnected) {
+          this.showToast('应用回到前台，正在恢复会话连接...');
+          this.chatVm.attachSession(cur, this.currentSessionId).catch((_e: Object) => {});
+        }
+      }
+    }
+  }
+
+  private drainPendingDeepLinkAndShare(): void {
+    const route = AppDeepLinkRouter.getInstance().consumePendingRoute();
+    if (route) {
+      this.handleDeepLinkRoute(route);
+    }
+    const share = AppDeepLinkRouter.getInstance().consumePendingShare();
+    if (share) {
+      this.handleInboundShare(share);
+    }
+  }
+
+  private handleInboundShare(share: InboundShareData): void {
+    if (!share) return;
+    if (share.text) {
+      this.inputText = this.inputText ? `${this.inputText}\n${share.text}` : share.text;
+      this.showToast('已载入外部应用分享的文本');
+    }
+    if (share.uri) {
+      const uriStr = share.uri;
+      const lastSlash = Math.max(uriStr.lastIndexOf('/'), uriStr.lastIndexOf('\\'));
+      const rawName = lastSlash >= 0 ? uriStr.substring(lastSlash + 1) : uriStr;
+      const cleanName = rawName.split('?')[0] || `share_${Date.now()}`;
+      const lower = cleanName.toLowerCase();
+      const isImg = lower.endsWith('.png') || lower.endsWith('.jpg') || lower.endsWith('.jpeg') || lower.endsWith('.webp') || lower.endsWith('.gif');
+
+      if (isImg) {
+        const refTag = `![${cleanName}](${uriStr})\n`;
+        this.inputText = this.inputText ? `${this.inputText}\n${refTag}` : refTag;
+        this.showToast(`已导入外部分享图片: ${cleanName}`);
+      } else {
+        const refTag = `[📎 分享文件: ${cleanName}](${uriStr})\n`;
+        this.inputText = this.inputText ? `${this.inputText}\n${refTag}` : refTag;
+        this.showToast(`已导入外部分享文件: ${cleanName}`);
+      }
+    }
+  }
+
+  private async handleDeepLinkRoute(route: DeepLinkRoute): Promise<void> {
+    if (route.type === 'session') {
+      let targetConn: BotConnection | null = null;
+      if (route.server) {
+        const allConns = this.connVm.getSavedConnections();
+        const matched = allConns.find((c) =>
+          c.id === route.server ||
+          c.name.toLowerCase() === route.server!.toLowerCase() ||
+          c.url.toLowerCase().includes(route.server!.toLowerCase())
+        );
+        if (!matched) {
+          this.showToast(`深层链接指定的服务器未配置: ${route.server}`);
+          return;
+        }
+        targetConn = matched;
+        await this.connVm.selectConnection(targetConn.id);
+      } else {
+        targetConn = this.connVm.getCurrentConnection();
+      }
+
+      if (!targetConn) {
+        this.showToast('请先配置并连接 Hermes 服务器');
+        return;
+      }
+
+      if (route.profile) {
+        targetConn.activeProfile = route.profile;
+      }
+
+      this.currentSessionId = route.sessionId;
+      this.currentSessionTitle = `会话: ${route.sessionId.substring(0, 8)}...`;
+      this.chatVm.messages = [];
+      this.syncVmState();
+      await this.chatVm.attachSession(targetConn, route.sessionId);
+      this.showToast(`已通过深层链接切入会话: ${route.sessionId}`);
+    } else if (route.type === 'new_chat') {
+      const sessId = await this.createNewSession();
+      if (sessId) {
+        if (route.autoStartsVoice) {
+          this.showToast('已创建新会话，正在启动语音输入...');
+          await this.toggleVoiceRecording();
+        } else {
+          this.showToast('已通过深层链接创建新会话');
+        }
+      }
+    } else if (route.type === 'new_chat_profile') {
+      const sessId = await this.createNewSession(route.profile);
+      if (sessId) {
+        this.showToast(`已在配置 Profile【${route.profile}】下创建新会话`);
+      }
+    } else if (route.type === 'bot') {
+      const allConns = this.connVm.getSavedConnections();
+      const matched = allConns.find((c) =>
+        (route.server && (c.id === route.server || c.name.toLowerCase() === route.server.toLowerCase() || c.url.includes(route.server))) ||
+        (route.connection && (c.id === route.connection || c.name.toLowerCase() === route.connection.toLowerCase()))
+      );
+      if (matched) {
+        if (route.profile) {
+          matched.activeProfile = route.profile;
+        }
+        await this.connVm.selectConnection(matched.id);
+        const sessId = await this.createNewSession(route.profile);
+        if (sessId) {
+          this.showToast(`已切换至 Bot【${matched.name}】并创建新会话`);
+        }
+      } else {
+        this.showToast(`深链指定的 Bot 未配置: server=${route.server || '无'}, conn=${route.connection || '无'}`);
+      }
+    }
   }
 
   aboutToDisappear() {
+    if (this.routeListener) {
+      AppDeepLinkRouter.getInstance().removeRouteListener(this.routeListener);
+      this.routeListener = null;
+    }
+    if (this.shareListener) {
+      AppDeepLinkRouter.getInstance().removeShareListener(this.shareListener);
+      this.shareListener = null;
+    }
     this.chatVm.disconnect();
+  }
+
+  private async toggleVoiceRecording(): Promise<void> {
+    const ctx = getContext(this) as common.UIAbilityContext;
+    if (!this.isRecordingVoice) {
+      const hasPerm = await VoiceUtils.checkMicrophonePermission(ctx);
+      if (!hasPerm) {
+        this.showToast('需要麦克风权限才能录制语音');
+        return;
+      }
+      const outPath = `${ctx.filesDir}/voice_${Date.now()}.m4a`;
+      const started = await VoiceUtils.startRecording(outPath);
+      if (started) {
+        this.isRecordingVoice = true;
+        this.showToast('正在录音...再次点击停止');
+      } else {
+        this.showToast('启动录音失败');
+      }
+    } else {
+      const recordedPath = await VoiceUtils.stopRecording();
+      this.isRecordingVoice = false;
+      if (recordedPath) {
+        const filename = sanitizeFilename(recordedPath);
+        const tag = `[🎤 语音消息: ${filename}](${recordedPath})\n`;
+        this.inputText = this.inputText ? `${this.inputText}\n${tag}` : tag;
+        this.showToast('录音完成并已附加');
+      } else {
+        this.showToast('未录制到有效音频');
+      }
+    }
+  }
+
+  private async shareCurrentSession(): Promise<void> {
+    const ctx = getContext(this) as common.UIAbilityContext;
+    if (this.messages.length === 0) {
+      this.showToast('当前会话暂无消息可分享');
+      return;
+    }
+    const lines = this.messages.map((m: ChatMessage) => `${m.role === 'user' ? '用户' : 'Hermes'}: ${m.content}`);
+    const textToShare = lines.join('\n\n');
+    const ok = await ShareUtils.shareText(ctx, textToShare, this.currentSessionTitle);
+    if (!ok) {
+      this.showToast('调起系统分享失败');
+    }
   }
 
   private showToast(message: string): void {
@@ -245,10 +441,16 @@ struct Index {
     }
   }
 
-  private async createNewSession() {
+  private async createNewSession(profile?: string): Promise<string | null> {
     const cur = this.connVm.getCurrentConnection();
-    if (!cur) return;
+    if (!cur) {
+      this.showToast('请先配置并连接 Hermes 服务器');
+      return null;
+    }
     try {
+      if (profile) {
+        cur.activeProfile = profile;
+      }
       if (!this.chatVm.isConnected) {
         await this.chatVm.attachSession(cur, '');
       }
@@ -257,8 +459,10 @@ struct Index {
       this.currentSessionTitle = '新对话';
       this.showSessionListDialog = false;
       this.refreshSessions();
+      return realSessionId;
     } catch (e) {
       this.showToast(`创建会话失败: ${e}`);
+      return null;
     }
   }
 
@@ -628,6 +832,16 @@ struct Index {
             this.showToolsDialog = true;
           })
 
+        Button('分享')
+          .fontSize(11)
+          .height(32)
+          .backgroundColor('#E5E5EA')
+          .fontColor('#000000')
+          .margin({ right: 4 })
+          .onClick(async () => {
+            await this.shareCurrentSession();
+          })
+
         Button('设置')
           .fontSize(11)
           .height(32)
@@ -902,7 +1116,7 @@ struct Index {
         .padding({ left: 16, right: 16, top: 12, bottom: 12 })
       }
 
-      // 5. 底部输入栏与控制 (支持原生附件调起)
+      // 5. 底部输入栏与控制 (支持原生附件与语音录制)
       Row() {
         Button('📎')
           .fontSize(18)
@@ -912,6 +1126,17 @@ struct Index {
           .margin({ right: 6 })
           .onClick(() => {
             this.showAttachmentDialog = true;
+          })
+
+        Button(this.isRecordingVoice ? '⏹' : '🎤')
+          .fontSize(16)
+          .height(40)
+          .width(40)
+          .backgroundColor(this.isRecordingVoice ? '#FF3B30' : '#F2F2F7')
+          .fontColor(this.isRecordingVoice ? '#FFFFFF' : '#000000')
+          .margin({ right: 6 })
+          .onClick(async () => {
+            await this.toggleVoiceRecording();
           })
 
         TextInput({ text: this.inputText, placeholder: '发送消息给 Hermes...' })
@@ -1922,10 +2147,20 @@ struct Index {
             if (this.selectedToolsTab === 5) {
               Column() {
                 Row() {
-                  Text(this.selectedKanbanBoard ? `看板: ${this.selectedKanbanBoard}` : '项目看板')
+                  Text(this.selectedKanbanName ? `看板: ${this.selectedKanbanName}` : '项目看板')
                     .fontSize(13)
                     .fontWeight(FontWeight.Bold)
                     .layoutWeight(1)
+
+                  if (this.isKanbanReadOnly) {
+                    Text('只读模式')
+                      .fontSize(10)
+                      .fontColor('#D97706')
+                      .backgroundColor('#FEF3C7')
+                      .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+                      .borderRadius(4)
+                      .margin({ right: 6 })
+                  }
 
                   Button('刷新')
                     .fontSize(11)
@@ -1944,13 +2179,10 @@ struct Index {
 
                 if (!this.kanbanVm.isAvailable) {
                   Column() {
-                    Text('服务端未安装或未启用看板插件')
+                    Text(this.kanbanVm.statusMessage || '服务端未启用看板插件')
                       .fontSize(12)
                       .fontColor('#EF4444')
                       .margin({ top: 12, bottom: 4 })
-                    Text('接口 /api/plugins/kanban/config 返回 404')
-                      .fontSize(11)
-                      .fontColor('#6B7280')
                   }
                   .width('100%')
                   .padding(12)
@@ -1965,17 +2197,17 @@ struct Index {
                   // 看板选择器
                   if (this.kanbanBoards.length > 1) {
                     Row() {
-                      ForEach(this.kanbanBoards, (bName: string) => {
-                        Button(bName)
+                      ForEach(this.kanbanBoards, (b: KanbanBoardItem) => {
+                        Button(b.name)
                           .fontSize(10)
                           .height(24)
-                          .backgroundColor(this.selectedKanbanBoard === bName ? '#007AFF' : '#E5E5EA')
-                          .fontColor(this.selectedKanbanBoard === bName ? '#FFFFFF' : '#374151')
+                          .backgroundColor(this.selectedKanbanSlug === b.slug ? '#007AFF' : '#E5E5EA')
+                          .fontColor(this.selectedKanbanSlug === b.slug ? '#FFFFFF' : '#374151')
                           .margin({ right: 4 })
                           .onClick(async () => {
                             const cur = this.connVm.getCurrentConnection();
                             if (cur) {
-                              await this.kanbanVm.loadBoardSnapshot(cur, bName);
+                              await this.kanbanVm.loadBoardSnapshot(cur, b.slug);
                             }
                           })
                       })
@@ -1984,38 +2216,45 @@ struct Index {
                     .margin({ bottom: 8 })
                   }
 
-                  // 快速创建卡片
-                  Row() {
-                    TextInput({ placeholder: '输入新任务/卡片标题...', text: this.newCardTitleInput })
-                      .height(30)
-                      .fontSize(11)
-                      .layoutWeight(1)
-                      .margin({ right: 6 })
-                      .onChange((val: string) => {
-                        this.newCardTitleInput = val;
-                      })
+                  // 快速创建卡片 (只读模式下展示提示)
+                  if (!this.isKanbanReadOnly) {
+                    Row() {
+                      TextInput({ placeholder: '输入新任务/卡片标题...', text: this.newCardTitleInput })
+                        .height(30)
+                        .fontSize(11)
+                        .layoutWeight(1)
+                        .margin({ right: 6 })
+                        .onChange((val: string) => {
+                          this.newCardTitleInput = val;
+                        })
 
-                    Button('新建卡片')
-                      .fontSize(11)
-                      .height(30)
-                      .backgroundColor('#007AFF')
-                      .fontColor('#FFFFFF')
-                      .onClick(async () => {
-                        const cur = this.connVm.getCurrentConnection();
-                        const title = this.newCardTitleInput.trim();
-                        if (cur && title) {
-                          const ok = await this.kanbanVm.createCard(cur, title);
-                          if (ok) {
-                            this.newCardTitleInput = '';
-                            this.showToast('卡片创建成功');
-                          } else {
-                            this.showToast(this.kanbanVm.statusMessage);
+                      Button('新建卡片')
+                        .fontSize(11)
+                        .height(30)
+                        .backgroundColor('#007AFF')
+                        .fontColor('#FFFFFF')
+                        .onClick(async () => {
+                          const cur = this.connVm.getCurrentConnection();
+                          const title = this.newCardTitleInput.trim();
+                          if (cur && title) {
+                            const ok = await this.kanbanVm.createCard(cur, title);
+                            if (ok) {
+                              this.newCardTitleInput = '';
+                              this.showToast('卡片创建成功');
+                            } else {
+                              this.showToast(this.kanbanVm.statusMessage);
+                            }
                           }
-                        }
-                      })
+                        })
+                    }
+                    .width('100%')
+                    .margin({ bottom: 8 })
+                  } else {
+                    Text('当前看板处于只读模式，不支持创建新卡片与流转')
+                      .fontSize(11)
+                      .fontColor('#9CA3AF')
+                      .margin({ bottom: 8 })
                   }
-                  .width('100%')
-                  .margin({ bottom: 8 })
 
                   // 看板泳道与卡片列表
                   if (this.kanbanSnapshot && this.kanbanSnapshot.columns.length > 0) {
@@ -2078,18 +2317,20 @@ struct Index {
                                       .fontColor('#9CA3AF')
                                       .layoutWeight(1)
 
-                                    Button('流转')
-                                      .fontSize(10)
-                                      .height(20)
-                                      .backgroundColor('#E5E5EA')
-                                      .fontColor('#007AFF')
-                                      .onClick(async () => {
-                                        const cur = this.connVm.getCurrentConnection();
-                                        if (cur) {
-                                          const nextStatus = col.name.toLowerCase().includes('done') ? 'todo' : 'done';
-                                          await this.kanbanVm.updateCardStatus(cur, card.id, nextStatus);
-                                        }
-                                      })
+                                    if (!this.isKanbanReadOnly) {
+                                      Button('流转')
+                                        .fontSize(10)
+                                        .height(20)
+                                        .backgroundColor('#E5E5EA')
+                                        .fontColor('#007AFF')
+                                        .onClick(async () => {
+                                          const cur = this.connVm.getCurrentConnection();
+                                          if (cur) {
+                                            const nextStatus = col.name.toLowerCase().includes('done') ? 'todo' : 'done';
+                                            await this.kanbanVm.updateCardStatus(cur, card.id, nextStatus);
+                                          }
+                                        })
+                                    }
                                   }
                                   .width('100%')
                                   .margin({ top: 4 })

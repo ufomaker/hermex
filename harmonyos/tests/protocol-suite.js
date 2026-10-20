@@ -41,14 +41,85 @@ const platformHttpAdapter = {
     GET: 'GET',
     POST: 'POST',
     PUT: 'PUT',
-    DELETE: 'DELETE'
+    DELETE: 'DELETE',
+    PATCH: 'PATCH'
   },
   createHttp: () => {
+    const eventListeners = {
+      dataReceive: [],
+      dataEnd: [],
+      headersReceive: []
+    };
+
     return {
+      on: (type, callback) => {
+        if (!eventListeners[type]) eventListeners[type] = [];
+        eventListeners[type].push(callback);
+      },
+      off: (type, callback) => {
+        if (eventListeners[type]) {
+          if (!callback) eventListeners[type] = [];
+          else eventListeners[type] = eventListeners[type].filter(cb => cb !== callback);
+        }
+      },
+      requestInStream: async (url, options = {}) => {
+        return new Promise((resolve, reject) => {
+          const u = new URL(url);
+          const method = (options.method || 'GET').toUpperCase();
+          const headers = Object.assign({}, options.header || {});
+          let bodyData = options.extraData;
+          if (bodyData && typeof bodyData === 'object') {
+            bodyData = JSON.stringify(bodyData);
+          }
+          if (bodyData) {
+            headers['Content-Length'] = Buffer.byteLength(bodyData);
+          }
+
+          const req = http.request(
+            {
+              hostname: u.hostname,
+              port: u.port || 80,
+              path: u.pathname + u.search,
+              method: method,
+              headers: headers,
+              timeout: options.readTimeout || 15000
+            },
+            (res) => {
+              for (const cb of eventListeners.headersReceive) {
+                cb(res.headers);
+              }
+              resolve(res.statusCode || 200);
+
+              res.on('data', (chunk) => {
+                const ab = new ArrayBuffer(chunk.length);
+                const view = new Uint8Array(ab);
+                for (let i = 0; i < chunk.length; ++i) {
+                  view[i] = chunk[i];
+                }
+                for (const cb of eventListeners.dataReceive) {
+                  cb(ab);
+                }
+              });
+              res.on('end', () => {
+                for (const cb of eventListeners.dataEnd) {
+                  cb();
+                }
+              });
+            }
+          );
+          req.on('error', (err) => {
+            reject(err);
+          });
+          if (bodyData) {
+            req.write(bodyData);
+          }
+          req.end();
+        });
+      },
       request: async (url, options = {}) => {
         return new Promise((resolve, reject) => {
           const u = new URL(url);
-          const method = options.method || 'GET';
+          const method = (options.method || 'GET').toUpperCase();
           const headers = Object.assign({}, options.header || {});
           let bodyData = options.extraData;
           if (bodyData && typeof bodyData === 'object') {
@@ -294,18 +365,29 @@ const platformFsAdapter = {
     TRUNC: 0o1000
   },
   openSync: (filePath, mode) => {
-    return { fd: 99, path: filePath };
+    let flag = 'r';
+    if ((mode & 0o100) && (mode & 0o1000)) flag = 'w+';
+    else if (mode & 0o100) flag = 'a+';
+    else if (mode === 0) flag = 'r';
+    else flag = 'r+';
+    const fd = fs.openSync(filePath, flag);
+    return { fd: fd, path: filePath };
   },
   writeSync: (fd, buffer) => {
-    return buffer.byteLength || buffer.length || 0;
+    return fs.writeSync(fd, Buffer.from(buffer.buffer || buffer));
   },
   readSync: (fd, buffer) => {
-    return buffer.byteLength || 0;
+    return fs.readSync(fd, Buffer.from(buffer.buffer || buffer));
   },
-  statSync: (fd) => {
-    return { size: 1024 };
+  statSync: (fileOrPath) => {
+    return fs.statSync(fileOrPath);
   },
-  closeSync: (fd) => {}
+  unlinkSync: (filePath) => {
+    try { fs.unlinkSync(filePath); } catch (_e) {}
+  },
+  closeSync: (fd) => {
+    try { fs.closeSync(fd); } catch (_e) {}
+  }
 };
 platformFsAdapter.default = platformFsAdapter;
 
@@ -334,6 +416,8 @@ const platformPickerAdapter = {
 };
 platformPickerAdapter.default = platformPickerAdapter;
 
+const NodeUtil = require('util');
+
 const platformUtilAdapter = {
   Base64Helper: class {
     encodeToStringSync(arr) {
@@ -348,8 +432,11 @@ const platformUtilAdapter = {
   },
   TextDecoder: {
     create: (enc) => {
+      const dec = new NodeUtil.TextDecoder(enc || 'utf-8');
       return {
-        decodeWithStream: (arr) => Buffer.from(arr).toString('utf8')
+        decodeWithStream: (arr, opt) => dec.decode(arr, opt),
+        decodeToString: (arr) => dec.decode(arr),
+        decode: (arr, opt) => dec.decode(arr, opt)
       };
     }
   }
@@ -366,6 +453,168 @@ const platformNotificationAdapter = {
   }
 };
 platformNotificationAdapter.default = platformNotificationAdapter;
+
+const platformRcpAdapter = {
+  rcp: {
+    createSession: () => ({
+      fetch: async (req) => {
+        const u = new URL(req.url);
+        const method = (req.method || 'GET').toUpperCase();
+        const headers = Object.assign({}, req.headers || {});
+        let bodyData = req.content;
+        if (bodyData && typeof bodyData === 'object') {
+          bodyData = JSON.stringify(bodyData);
+        }
+        if (bodyData) {
+          headers['content-length'] = Buffer.byteLength(bodyData);
+        }
+        return new Promise((resolve, reject) => {
+          const httpReq = http.request(
+            {
+              hostname: u.hostname,
+              port: u.port || 80,
+              path: u.pathname + u.search,
+              method: method,
+              headers: headers,
+              timeout: 10000
+            },
+            (res) => {
+              const chunks = [];
+              res.on('data', chunk => chunks.push(chunk));
+              res.on('end', () => {
+                resolve({
+                  statusCode: res.statusCode || 200,
+                  headers: res.headers,
+                  body: Buffer.concat(chunks).toString('utf8')
+                });
+              });
+            }
+          );
+          httpReq.on('error', reject);
+          if (bodyData) httpReq.write(bodyData);
+          httpReq.end();
+        });
+      },
+      close: () => {}
+    }),
+    Request: class {
+      constructor(url, method, headers, content) {
+        this.url = url;
+        this.method = method;
+        this.headers = headers;
+        this.content = content;
+      }
+    }
+  }
+};
+platformRcpAdapter.default = platformRcpAdapter;
+
+const platformMediaAdapter = {
+  AudioSourceType: { AUDIO_SOURCE_TYPE_DEFAULT: 0, AUDIO_MIC: 1 },
+  CodecMimeType: { AUDIO_AAC: 'audio/mp4a-latm' },
+  ContainerFormatType: { CFT_MPEG_4A: 'm4a' },
+  createAVRecorder: async () => {
+    let state = 'idle';
+    let config = null;
+    return {
+      prepare: async (cfg) => {
+        config = cfg;
+        state = 'prepared';
+      },
+      start: async () => {
+        state = 'started';
+        if (config && config.url && config.url.startsWith('fd://')) {
+          const fd = parseInt(config.url.substring(5), 10);
+          if (fd >= 0) {
+            try {
+              fs.writeSync(fd, Buffer.from('M4A_TEST_AUDIO_BYTES_HEADER'));
+            } catch (_e) {}
+          }
+        }
+      },
+      stop: async () => { state = 'stopped'; },
+      release: async () => { state = 'released'; }
+    };
+  },
+  createAVPlayer: async () => {
+    const listeners = {};
+    let _url = '';
+    let _fdSrc = null;
+    const player = {
+      get url() { return _url; },
+      set url(val) {
+        _url = val;
+        player.state = 'initialized';
+        if (listeners['stateChange']) {
+          listeners['stateChange'].forEach(cb => cb('initialized'));
+        }
+      },
+      get fdSrc() { return _fdSrc; },
+      set fdSrc(val) {
+        _fdSrc = val;
+        player.state = 'initialized';
+        if (listeners['stateChange']) {
+          listeners['stateChange'].forEach(cb => cb('initialized'));
+        }
+      },
+      state: 'idle',
+      on: (type, cb) => {
+        if (!listeners[type]) listeners[type] = [];
+        listeners[type].push(cb);
+      },
+      prepare: async () => {
+        player.state = 'prepared';
+        if (listeners['stateChange']) {
+          listeners['stateChange'].forEach(cb => cb('prepared'));
+        }
+      },
+      play: async () => {
+        player.state = 'playing';
+        if (listeners['stateChange']) {
+          listeners['stateChange'].forEach(cb => cb('playing'));
+        }
+      },
+      stop: async () => {
+        player.state = 'stopped';
+        if (listeners['stateChange']) {
+          listeners['stateChange'].forEach(cb => cb('stopped'));
+        }
+      },
+      release: async () => {
+        player.state = 'released';
+        if (listeners['stateChange']) {
+          listeners['stateChange'].forEach(cb => cb('released'));
+        }
+      }
+    };
+    return player;
+  }
+};
+platformMediaAdapter.default = platformMediaAdapter;
+
+const platformSystemShareAdapter = {
+  SharePreviewMode: { DEFAULT: 0, DETAIL: 1 },
+  SelectionMode: { SINGLE: 0, BATCH: 1 },
+  SharedRecord: class {},
+  SharedData: class {
+    constructor(record) { this.record = record; }
+  },
+  ShareController: class {
+    constructor(sharedData) { this.sharedData = sharedData; }
+    show(context, options) {
+      return Promise.resolve();
+    }
+  }
+};
+platformSystemShareAdapter.default = platformSystemShareAdapter;
+
+const platformUtdAdapter = {
+  UniformDataType: {
+    PLAIN_TEXT: 'general.plain-text',
+    FILE: 'general.file'
+  }
+};
+platformUtdAdapter.default = platformUtdAdapter;
 
 // --- 2. 真实 ArkTS 模块加载器 ---
 
@@ -400,6 +649,42 @@ function customRequire(callerDir, modPath) {
   }
   if (modPath === '@ohos.notificationManager' || modPath === '@ohos.notification') {
     return platformNotificationAdapter;
+  }
+  if (modPath === '@kit.PerformanceAnalysisKit') {
+    return {
+      hilog: {
+        info: () => {},
+        error: () => {},
+        warn: () => {},
+        debug: () => {}
+      }
+    };
+  }
+  if (modPath === '@kit.RemoteCommunicationKit' || modPath === '@hms.collaboration.rcp') {
+    return platformRcpAdapter;
+  }
+  if (modPath === '@ohos.multimedia.media' || modPath === '@kit.MediaKit') {
+    return platformMediaAdapter;
+  }
+  if (modPath === '@hms.collaboration.systemShare' || modPath === '@kit.ShareKit') {
+    return platformSystemShareAdapter;
+  }
+  if (modPath === '@ohos.data.uniformTypeDescriptor') {
+    return platformUtdAdapter;
+  }
+  if (modPath === '@ohos.abilityAccessCtrl') {
+    const atAdapter = {
+      GrantStatus: { PERMISSION_GRANTED: 0, PERMISSION_DENIED: -1 },
+      createAtManager: () => ({
+        checkAccessToken: async () => 0,
+        requestPermissionsFromUser: async () => ({ authResults: [0] })
+      })
+    };
+    atAdapter.default = atAdapter;
+    return atAdapter;
+  }
+  if (modPath === '@ohos.app.ability.common' || modPath === '@ohos.app.ability.Want' || modPath === '@kit.AbilityKit') {
+    return {};
   }
 
   // 相对路径解析
@@ -446,7 +731,7 @@ const { HermesFileClient } = customRequire(rootDir, './entry/src/main/ets/networ
 const { WorkspaceViewModel } = customRequire(rootDir, './entry/src/main/ets/viewmodel/WorkspaceViewModel.ets');
 const { HermesCronClient } = customRequire(rootDir, './entry/src/main/ets/network/HermesCronClient.ets');
 const { HermesInsightsClient } = customRequire(rootDir, './entry/src/main/ets/network/HermesInsightsClient.ets');
-const { LegacySSEClient } = customRequire(rootDir, './entry/src/main/ets/network/legacy/LegacySSEClient.ets');
+const { LegacySSEClient, LegacySSEParser } = customRequire(rootDir, './entry/src/main/ets/network/legacy/LegacySSEClient.ets');
 const { parseMarkdownBlocks } = customRequire(rootDir, './entry/src/main/ets/components/MarkdownParser.ets');
 const { getMimeType, isImageFile, sanitizeFilename, generateAttachmentName } = customRequire(rootDir, './entry/src/main/ets/utils/AttachmentUtils.ets');
 const { HermesProjectClient } = customRequire(rootDir, './entry/src/main/ets/network/HermesProjectClient.ets');
@@ -459,6 +744,9 @@ const { CronViewModel } = customRequire(rootDir, './entry/src/main/ets/viewmodel
 const { InsightsViewModel } = customRequire(rootDir, './entry/src/main/ets/viewmodel/InsightsViewModel.ets');
 const { KanbanViewModel } = customRequire(rootDir, './entry/src/main/ets/viewmodel/KanbanViewModel.ets');
 const { NotificationUtils } = customRequire(rootDir, './entry/src/main/ets/utils/NotificationUtils.ets');
+const { DeepLinkUtils, AppDeepLinkRouter } = customRequire(rootDir, './entry/src/main/ets/utils/DeepLinkUtils.ets');
+const { ShareUtils } = customRequire(rootDir, './entry/src/main/ets/utils/ShareUtils.ets');
+const { VoiceUtils } = customRequire(rootDir, './entry/src/main/ets/utils/VoiceUtils.ets');
 
 // --- 3. 端到端行为与契约验证 ---
 
@@ -794,14 +1082,18 @@ async function runTestSuite() {
 
     if (req.url === '/api/plugins/kanban/boards' && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(['sprint-board-1']));
+      res.end(JSON.stringify({
+        boards: [{ slug: 'sprint-board-1', name: 'Sprint Board 1', read_only: false }],
+        current: 'sprint-board-1',
+        read_only: false
+      }));
       return;
     }
 
     if (req.url.startsWith('/api/plugins/kanban/board') && req.method === 'GET') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
-        board: 'sprint-board-1',
+        name: 'sprint-board-1',
         columns: [
           {
             name: 'In Progress',
@@ -810,7 +1102,7 @@ async function runTestSuite() {
             ]
           }
         ],
-        latest_event_id: 'evt_999'
+        latestEventId: 999
       }));
       return;
     }
@@ -1492,7 +1784,7 @@ export const test = true;
   assert(kanbanAvailable, '看板服务可用性探针通过');
 
   const kanbanBoards = await HermesKanbanClient.getBoards(baseUrl, loginResult.token, loginResult.cookies);
-  assert(kanbanBoards.length === 1 && kanbanBoards[0] === 'sprint-board-1', '拉取看板列表成功');
+  assert(kanbanBoards.boards.length === 1 && kanbanBoards.boards[0].slug === 'sprint-board-1', '拉取看板列表成功');
 
   const boardSnapshot = await HermesKanbanClient.getBoard(baseUrl, 'sprint-board-1', loginResult.token, loginResult.cookies);
   assert(boardSnapshot !== null && boardSnapshot.boardName === 'sprint-board-1', '看板名称匹配');
@@ -1713,33 +2005,105 @@ export const test = true;
   approvalResolve();
   await submitPromise2;
   assert(isolatedVm.currentApproval === null, '断开连接后审批已清空');
-  console.log('[PASS 26] ChatViewModel 异步审批竞争与代次状态隔离测试通过');
+
+  // 7. 测试连续同名工具执行：A 工具晚完成绝不误清 B 工具的新审批 (落实 REVIEW_SCOPE_12)
+  console.log('  -> 测试连续同名工具场景: 工具 A 晚到完成不误清工具 B 的审批...');
+  isolatedVm.currentApproval = {
+    id: 'srq-b',
+    requestId: 'req-uuid-b',
+    sessionId: 'test-session-1',
+    toolName: 'terminal',
+    command: 'python3 -c "print(2)"',
+    choices: ['once', 'deny']
+  };
+
+  // 工具 A (terminal) 滞后完成返回
+  const toolAComplete = {
+    id: 'tool-a',
+    name: 'terminal',
+    status: 'completed'
+  };
+  // 模拟 gateway 回调 onToolComplete
+  if (isolatedVm.callbacks && isolatedVm.callbacks.onToolComplete) {
+    isolatedVm.callbacks.onToolComplete('test-session-1', toolAComplete);
+  }
+  assert(isolatedVm.currentApproval !== null, '工具 A 完成绝不可按工具名误清工具 B 的当前审批');
+  assert(isolatedVm.currentApproval.requestId === 'req-uuid-b', '当前审批仍严格保留为工具 B (req-uuid-b)');
+
+  console.log('[PASS 26] ChatViewModel 异步审批竞争、代次保护与连续同名工具防误清测试通过');
 
   // [TEST 27] 测试 HermesKanbanClient 与 KanbanViewModel 看板完整生命周期
   console.log('\n[TEST 27] 测试 HermesKanbanClient 与 KanbanViewModel 看板完整生命周期:');
+  let lastTaskCreateMethod = null;
+  let lastTaskUpdateMethod = null;
+  let lastKanbanUrl = null;
+  let lastKanbanBody = null;
+  let configStatusToReturn = 200;
+
   const kanbanServer = http.createServer((req, res) => {
+    lastKanbanUrl = req.url;
     const parsed = new URL(req.url, 'http://127.0.0.1');
+
     if (parsed.pathname === '/api/plugins/kanban/config') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ enabled: true, version: '1.0' }));
+      if (configStatusToReturn === 401) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+      } else if (configStatusToReturn === 404) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Not Found' }));
+      } else {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ enabled: true, version: '1.0' }));
+      }
     } else if (parsed.pathname === '/api/plugins/kanban/boards') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(['Sprint-1', 'Backlog']));
-    } else if (parsed.pathname === '/api/plugins/kanban/board') {
+      // 严格对齐 upstream Kanban.swift:439: { boards: [{ slug, name, ... }], current, readOnly }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
+        boards: [
+          { slug: 'sprint-1', name: 'Sprint 1', description: 'Main sprint', readOnly: false },
+          { slug: 'backlog', name: 'Backlog Archive', description: 'Read only archive', readOnly: true }
+        ],
+        current: 'sprint-1',
+        readOnly: false
+      }));
+    } else if (parsed.pathname === '/api/plugins/kanban/board') {
+      const b = parsed.searchParams.get('board');
+      const isBacklog = b === 'backlog';
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      // 严格对齐 upstream Kanban.swift:506: latestEventId 驼峰整型
+      res.end(JSON.stringify({
+        name: isBacklog ? 'Backlog Archive' : 'Sprint 1',
         columns: [
           { name: 'To Do', cards: [{ id: 'card-1', title: 'Task 1', status: 'To Do' }] },
           { name: 'Done', cards: [] }
         ],
-        latest_event_id: 'ev-100'
+        latestEventId: 101,
+        readOnly: isBacklog
       }));
     } else if (parsed.pathname === '/api/plugins/kanban/tasks' && req.method === 'POST') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, id: 'card-2' }));
-    } else if (parsed.pathname.startsWith('/api/plugins/kanban/tasks/') && req.method === 'POST') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true }));
+      lastTaskCreateMethod = req.method;
+      let bodyStr = '';
+      req.on('data', chunk => { bodyStr += chunk; });
+      req.on('end', () => {
+        lastKanbanBody = JSON.parse(bodyStr || '{}');
+        res.writeHead(201, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, id: 'card-2' }));
+      });
+    } else if (parsed.pathname.startsWith('/api/plugins/kanban/tasks/')) {
+      lastTaskUpdateMethod = req.method;
+      // 严格断言必须是 PATCH 动词！如果是 POST 或其他方法，直接 405 Method Not Allowed！
+      if (req.method !== 'PATCH') {
+        res.writeHead(405, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `Method ${req.method} not allowed, expected PATCH` }));
+        return;
+      }
+      let bodyStr = '';
+      req.on('data', chunk => { bodyStr += chunk; });
+      req.on('end', () => {
+        lastKanbanBody = JSON.parse(bodyStr || '{}');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true }));
+      });
     } else {
       res.writeHead(404);
       res.end();
@@ -1753,22 +2117,50 @@ export const test = true;
     cookies: 'session=abc'
   };
 
+  // 1. 测试 401 鉴权失效与 404 插件未安装的精准区分 (杜绝盲目硬编码 404)
+  configStatusToReturn = 401;
+  const avail401 = await HermesKanbanClient.checkAvailability(kanbanConn.url, kanbanConn.token);
+  assert(avail401.available === false && avail401.status === 'unauthorized', '401 必须准确报告 unauthorized 状态');
+  assert(avail401.message.includes('401'), '401 提示信息必须准确展示 HTTP 401');
+
+  configStatusToReturn = 404;
+  const avail404 = await HermesKanbanClient.checkAvailability(kanbanConn.url, kanbanConn.token);
+  assert(avail404.available === false && avail404.status === 'not_installed', '404 必须准确报告 not_installed 状态');
+  assert(avail404.message.includes('404'), '404 提示信息展示未安装');
+
+  // 2. 正常就绪与加载对象包装的看板列表
+  configStatusToReturn = 200;
   const kanbanVm = new KanbanViewModel();
   await kanbanVm.loadBoards(kanbanConn);
   assert(kanbanVm.isAvailable === true, '看板插件可用');
-  assert(kanbanVm.boards.length === 2, '成功获取 2 个看板');
-  assert(kanbanVm.selectedBoard === 'Sprint-1', '默认选中第一个看板');
+  assert(kanbanVm.boards.length === 2, '成功解析对象包装中的 2 个看板条目');
+  assert(kanbanVm.boards[0].slug === 'sprint-1' && kanbanVm.boards[0].name === 'Sprint 1', '区分 slug 与 name');
+  assert(kanbanVm.selectedBoardSlug === 'sprint-1', '默认选中当前看板 slug');
   assert(kanbanVm.currentSnapshot !== null, '成功加载看板快照');
-  assert(kanbanVm.currentSnapshot.columns.length === 2, '快照包含 2 个泳道');
+  assert(kanbanVm.currentSnapshot.latestEventId === 101, 'latestEventId 驼峰整型事件游标正确解析');
+  assert(kanbanVm.isReadOnly === false, '当前 sprint-1 为可写看板');
 
+  // 3. 在可写看板创建新卡片 (POST)
   const createOk = await kanbanVm.createCard(kanbanConn, 'New Card', 'Description');
   assert(createOk === true, '卡片创建成功');
+  assert(lastTaskCreateMethod === 'POST', '新建卡片发送 POST');
 
+  // 4. 更新卡片状态 (严格断言 PATCH 动词！)
   const updateOk = await kanbanVm.updateCardStatus(kanbanConn, 'card-1', 'Done');
   assert(updateOk === true, '卡片状态更新成功');
+  assert(lastTaskUpdateMethod === 'PATCH', `更新卡片状态必须使用 PATCH 动词 (当前实际收到: ${lastTaskUpdateMethod})`);
+  assert(lastKanbanBody && lastKanbanBody.status === 'Done', 'PATCH 请求携带 { status: "Done" }');
+
+  // 5. 切换到只读看板并验证只读写保护
+  await kanbanVm.loadBoardSnapshot(kanbanConn, 'backlog');
+  assert(kanbanVm.isReadOnly === true, 'backlog 看板标记为只读');
+  const writeRejectedInRo = await kanbanVm.createCard(kanbanConn, 'Blocked Card');
+  assert(writeRejectedInRo === false, '只读看板禁止创建卡片');
+  const updateRejectedInRo = await kanbanVm.updateCardStatus(kanbanConn, 'card-1', 'To Do');
+  assert(updateRejectedInRo === false, '只读看板禁止更新卡片状态');
 
   kanbanServer.close();
-  console.log('[PASS 27] HermesKanbanClient 与 KanbanViewModel 完整生命周期测试通过');
+  console.log('[PASS 27] HermesKanbanClient 与 KanbanViewModel PATCH动词、对象包装、游标与只读保护测试通过');
 
   // [TEST 28] 测试 NotificationUtils 系统通知分发与跨平台降级
   console.log('\n[TEST 28] 测试 NotificationUtils 系统通知分发与跨平台降级:');
@@ -1783,15 +2175,270 @@ export const test = true;
   await NotificationUtils.cancelNotification(2001);
   console.log('[PASS 28] NotificationUtils 系统通知与后台提示测试通过');
 
+  // [TEST 29] 测试 LegacySSEClient 完整聊天轮次与跨数据块分帧解析 (F12)
+  console.log('\n[TEST 29] 测试 LegacySSEClient 完整聊天轮次、取消与跨网络块 SSE 帧拼接:');
+  let legacyCancelReceived = false;
+  const legacyServer = http.createServer((req, res) => {
+    const parsed = new URL(req.url, 'http://127.0.0.1');
+    if (parsed.pathname === '/health') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ status: 'ok' }));
+    } else if (parsed.pathname === '/api/chat/start' && req.method === 'POST') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ stream_id: 'str_legacy_test_1' }));
+    } else if (parsed.pathname === '/api/chat/cancel') {
+      assert(req.method === 'GET', `cancelChatTurn 必须使用 GET 请求，实际为: ${req.method}`);
+      assert(parsed.searchParams.get('stream_id') === 'str_legacy_test_1', '必须携带 stream_id 查询参数');
+      legacyCancelReceived = true;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    } else if (parsed.pathname === '/api/chat/stream') {
+      const sid = parsed.searchParams.get('stream_id');
+      if (sid === 'str_error_401') {
+        res.writeHead(401, { 'Content-Type': 'text/plain' });
+        res.end('Unauthorized');
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive'
+      });
+      // 严格测试持续 TextDecoder 处理跨数据块中文字节拆分：
+      // '你好' 字节 [0xe4, 0xbd, 0xa0, 0xe5, 0xa5, 0xbd]
+      // 第一块包含到 [0xe5, 0xa5]，第二块以 [0xbd] 开头，验证持续 Decoder 不损坏多字节字符
+      const prefix = Buffer.from('event: token\ndata: {"text": "');
+      const bNi = Buffer.from('你', 'utf8'); // 3 bytes
+      const bHao = Buffer.from('好', 'utf8'); // 3 bytes: e5 a5 bd
+      const part1 = Buffer.concat([prefix, bNi, bHao.subarray(0, 2)]);
+      const part2 = Buffer.concat([bHao.subarray(2), Buffer.from(' 鸿蒙"}\n\nevent: done\ndata: {}\n\n')]);
+
+      res.write(part1);
+      setTimeout(() => {
+        res.write(part2);
+        res.end();
+      }, 30);
+    } else if (parsed.pathname === '/api/sessions') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify([
+        { id: 'leg_sess_1', title: 'Legacy Conversation 1', updated_at: 1700000000 }
+      ]));
+    } else if (parsed.pathname === '/api/session') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        id: 'leg_sess_1',
+        title: 'Legacy Conversation 1',
+        messages: [
+          { role: 'user', content: 'hello from legacy' },
+          { role: 'assistant', content: 'hello response' }
+        ]
+      }));
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+
+  const legacyPort = await new Promise((r) => legacyServer.listen(0, '127.0.0.1', () => r(legacyServer.address().port)));
+  const legacyBaseUrl = `http://127.0.0.1:${legacyPort}`;
+
+  // 1. 健康探测
+  const legHealth = await LegacySSEClient.probeHealth(legacyBaseUrl);
+  assert(legHealth === true, 'Legacy /health 探测通过');
+
+  // 2. 开启聊天轮次
+  const startTurn = await LegacySSEClient.startChatTurn(legacyBaseUrl, 'leg_sess_1', 'hello from legacy');
+  assert(startTurn !== null && startTurn.streamId === 'str_legacy_test_1', '开启聊天轮次获取 streamId');
+
+  // 3. 取消聊天轮次
+  const cancelTurn = await LegacySSEClient.cancelChatTurn(legacyBaseUrl, 'str_legacy_test_1');
+  assert(cancelTurn === true && legacyCancelReceived, '取消聊天轮次成功');
+
+  // 4. 建立 SSE 流并验证跨块拼帧
+  const receivedSseEvents = [];
+  await new Promise((resolve) => {
+    LegacySSEClient.connectSSEStream(legacyBaseUrl, 'str_legacy_test_1', {
+      onEvent: (ev) => {
+        receivedSseEvents.push(ev);
+      },
+      onError: (_err) => {},
+      onClose: () => {
+        resolve();
+      }
+    });
+  });
+
+  assert(receivedSseEvents.length === 2, `跨分块解析必须精准产出 2 个完整帧，当前: ${receivedSseEvents.length}`);
+  assert(receivedSseEvents[0].event === 'token', '第一帧事件为 token');
+  assert(receivedSseEvents[0].data.includes('你好 鸿蒙'), '跨网络数据块切割多字节中文字符后经持续解码器拼装无乱码');
+  assert(receivedSseEvents[1].event === 'done', '第二帧事件为 done');
+
+  // 5. 验证非 200 HTTP 响应 (如 401/403/500) 触发 onError 与优雅清理
+  let sseErrorTriggered = false;
+  await new Promise((resolve) => {
+    LegacySSEClient.connectSSEStream(legacyBaseUrl, 'str_error_401', {
+      onEvent: () => {},
+      onError: (err) => {
+        sseErrorTriggered = true;
+        assert(err.includes('401'), `错误信息必须包含状态码 401: ${err}`);
+      },
+      onClose: () => {
+        resolve();
+      }
+    });
+  });
+  assert(sseErrorTriggered === true, 'SSE 遇到 401 必须触发 onError 回调');
+
+  // 6. 拉取会话列表与会话详情
+  const legSessions = await LegacySSEClient.listSessions(legacyBaseUrl);
+  assert(legSessions.length === 1 && legSessions[0].id === 'leg_sess_1', '拉取 legacy 会话列表成功');
+
+  const legDetail = await LegacySSEClient.getSession(legacyBaseUrl, 'leg_sess_1');
+  assert(legDetail !== null && legDetail.messages.length === 2, '拉取 legacy 会话详情成功');
+  assert(legDetail.messages[0].role === 'user', '角色映射正确');
+
+  legacyServer.close();
+  console.log('[PASS 29] LegacySSEClient 完整轮次、取消、跨块分帧与会话拉取测试通过');
+
+  // [TEST 30] 测试 DeepLinkUtils、AppDeepLinkRouter 与 ShareUtils 平台集成 (F10)
+  console.log('\n[TEST 30] 测试 DeepLinkUtils 深链解析、路由分发与 ShareUtils 系统分享 Want 解析:');
+
+  // 1. 测试会话深链解析
+  const sRoute = DeepLinkUtils.parseDeepLink('hermex://session?id=s-9988&server=http://127.0.0.1:9199&profile=default');
+  assert(sRoute !== null && sRoute.type === 'session', '会话深链类型解析');
+  assert(sRoute.sessionId === 's-9988', '会话 ID 提取');
+  assert(sRoute.server === 'http://127.0.0.1:9199', '服务器 URL 提取');
+  assert(sRoute.profile === 'default', 'Profile 提取');
+
+  // 2. 测试新建会话深链
+  const ncRoute = DeepLinkUtils.parseDeepLink('hermes-agent://new-chat');
+  assert(ncRoute !== null && ncRoute.type === 'new_chat' && ncRoute.autoStartsVoice === false, '新会话深链解析');
+
+  // 3. 测试语音新会话深链
+  const ncvRoute = DeepLinkUtils.parseDeepLink('hermex://new-chat-voice');
+  assert(ncvRoute !== null && ncvRoute.type === 'new_chat' && ncvRoute.autoStartsVoice === true, '语音新会话深链解析');
+
+  // 4. 测试特定 Profile 新会话深链
+  const ncpRoute = DeepLinkUtils.parseDeepLink('hermex://new-chat-profile?profile=mobile-expert&server=http://127.0.0.1:9199');
+  assert(ncpRoute !== null && ncpRoute.type === 'new_chat_profile', 'Profile 新会话深链解析');
+  assert(ncpRoute.profile === 'mobile-expert', 'Profile 名称提取');
+
+  // 5. 测试 Bot 深链
+  const botRoute = DeepLinkUtils.parseDeepLink('hermex://bot?server=http://srv1&connection=conn1&profile=p1');
+  assert(botRoute !== null && botRoute.type === 'bot' && botRoute.connection === 'conn1', 'Bot 深链解析');
+
+  // 6. 测试非法链接安全过滤
+  assert(DeepLinkUtils.parseDeepLink('unknown://session?id=123') === null, '非法 scheme 拒绝');
+  assert(DeepLinkUtils.parseDeepLink('hermex://invalid-host') === null, '非法 host 拒绝');
+  assert(DeepLinkUtils.parseDeepLink('hermex://session') === null, '无 id 的 session 链接拒绝');
+
+  // 7. 测试深链 URL 构建器
+  const builtSessionUrl = DeepLinkUtils.buildSessionUrl('sess-xyz', 'http://srv1', 'default');
+  assert(builtSessionUrl.startsWith('hermex://session?id=sess-xyz'), '构建会话 URL 格式正确');
+
+  // 8. 测试 AppDeepLinkRouter 单例状态、冷启动挂起消费与热启动监听分发
+  const router = AppDeepLinkRouter.getInstance();
+
+  // (a) 冷启动场景：无活跃 UI 监听器，路由进入挂起队列，通过 consumePendingRoute 一次性消费
+  router.setPendingRoute(sRoute);
+  const consumedRoute = router.consumePendingRoute();
+  assert(consumedRoute !== null && consumedRoute.sessionId === 's-9988', '冷启动挂起深链消费成功');
+  assert(router.consumePendingRoute() === null, '消费后挂起队列清空，防止二次重复消费');
+
+  // (b) 热启动场景：存在活跃 UI 监听器，路由直接分发至监听器，挂起队列保持清洁
+  let routedEvent = null;
+  const routeListener = (r) => { routedEvent = r; };
+  router.addRouteListener(routeListener);
+  router.setPendingRoute(ncRoute);
+  assert(routedEvent !== null && routedEvent.type === 'new_chat', '热启动深链即时通知活跃监听器');
+  assert(router.consumePendingRoute() === null, '已分发至监听器的路由不滞留于挂起队列');
+  router.removeRouteListener(routeListener);
+
+  // (c) 系统分享冷启动与热启动分发
+  const testShareData = { text: '冷启动分享', uri: 'file://test.txt' };
+  router.setPendingShare(testShareData);
+  const consumedShare = router.consumePendingShare();
+  assert(consumedShare !== null && consumedShare.text === '冷启动分享', '冷启动挂起系统分享消费成功');
+  assert(router.consumePendingShare() === null, '消费后挂起分享清空');
+
+  let liveShareEvent = null;
+  const shareListener = (s) => { liveShareEvent = s; };
+  router.addShareListener(shareListener);
+  router.setPendingShare({ text: '热启动分享' });
+  assert(liveShareEvent !== null && liveShareEvent.text === '热启动分享', '热启动系统分享即时通知监听器');
+  assert(router.consumePendingShare() === null, '已分发至监听器的分享不滞留于挂起队列');
+  router.removeShareListener(shareListener);
+
+  // 9. 测试 ShareUtils 外部传入 Want 解析与外发系统分享
+  const platformUiContext = {
+    applicationInfo: { accessTokenId: 1001 },
+    startAbility: async () => true
+  };
+
+  const textShareOk = await ShareUtils.shareText(platformUiContext, '测试分享会话正文', '会话标题');
+  assert(textShareOk === true, 'ShareUtils 调起系统分享文本成功');
+
+  const fileShareOk = await ShareUtils.shareFile(platformUiContext, 'file:///data/storage/el2/base/test.png', 'image/png');
+  assert(fileShareOk === true, 'ShareUtils 调起系统分享文件成功');
+
+  const textWant = {
+    action: 'ohos.want.action.sendData',
+    type: 'text/plain',
+    parameters: {
+      'content': '通过系统分享发送的代码草稿'
+    }
+  };
+  const parsedShareText = ShareUtils.parseShareWant(textWant);
+  assert(parsedShareText !== null && parsedShareText.text.includes('代码草稿'), '系统分享文本解析正确');
+
+  const fileWant = {
+    action: 'ohos.want.action.sendData',
+    type: 'image/png',
+    uri: 'file://docs/storage/Users/currentUser/photo.png'
+  };
+  const parsedShareFile = ShareUtils.parseShareWant(fileWant);
+  assert(parsedShareFile !== null && parsedShareFile.uri.includes('photo.png'), '系统分享文件 URI 解析正确');
+
+  assert(ShareUtils.parseShareWant({ action: 'other.action' }) === null, '非系统分享 action 安全忽略');
+
+  // 10. 测试 VoiceUtils 真实 AVRecorder/AVPlayer 状态机、落盘与录音安全门禁
+  const micPermOk = await VoiceUtils.checkMicrophonePermission(platformUiContext);
+  assert(micPermOk === true, 'VoiceUtils 麦克风权限请求通过');
+
+  assert(VoiceUtils.isRecording() === false, '初始无录音');
+  const tempAudioFile = path.join(require('os').tmpdir(), `test_voice_${Date.now()}.m4a`);
+  const startRecOk = await VoiceUtils.startRecording(tempAudioFile);
+  assert(startRecOk === true && VoiceUtils.isRecording() === true, '录音启动成功并配置 AVRecorder fd 真实绑定');
+
+  const stoppedPath = await VoiceUtils.stopRecording();
+  assert(stoppedPath === tempAudioFile && VoiceUtils.isRecording() === false, '录音停止并完成真实文件落盘');
+  assert(fs.existsSync(stoppedPath) && fs.statSync(stoppedPath).size > 0, '录制音频文件实际存在且 size > 0');
+
+  // 验证 AVPlayer 播放状态机
+  let playStarted = false;
+  let playCompleted = false;
+  const playOk = await VoiceUtils.playAudio(stoppedPath, {
+    onStart: () => { playStarted = true; },
+    onComplete: () => { playCompleted = true; }
+  });
+  assert(playOk === true, 'VoiceUtils 启动 AVPlayer 播放');
+  assert(playStarted === true, '触发 onStart 播放回调');
+  assert(VoiceUtils.isPlaying() === true, 'isPlaying 标记正在播放');
+
+  await VoiceUtils.stopAudio();
+  assert(VoiceUtils.isPlaying() === false, 'stopAudio 后停止播放并释放原生资源');
+
+  console.log('[PASS 30] DeepLinkUtils、AppDeepLinkRouter、ShareUtils 与 VoiceUtils 平台集成测试通过');
+
   vm.disconnect();
   server.close();
 
   console.log('\n======================================================');
-  console.log('✅ 所有 28 项端到端生产代码行为回归测试全部通过 (退出码 0)');
+  console.log('✅ 所有 30 项端到端生产代码行为回归测试全部通过 (退出码 0)');
   console.log('覆盖真实生产业务类：');
   console.log('  - HermesRESTClient.ets (Cookie Jar、登录、/api/auth/me 核验、Ticket、会话与历史)');
   console.log('  - HermesGatewayClient.ets (WebSocket 握手、client.capabilities 回执、关闭码、RPC 30s 超时、取消、file.attach)');
-  console.log('  - ChatViewModel.ets (会话恢复门禁、禁止发送、async 代次乱序拦截、中文流式、推理、工具、审批竞争隔离、模型配置、文档附加)');
+  console.log('  - ChatViewModel.ets (会话恢复门禁、禁止发送、async 代次乱序拦截、中文流式、推理、工具、连续同名工具审批防误清、模型配置、文档附加)');
   console.log('  - AuthStore.ets (真实 HarmonyPlatformAuthAdapter + Preferences 元数据 + AssetStoreKit 密文硬件保管库 + UTF-8 中文/Emoji + 原子回滚 + clearAll 物理擦除)');
   console.log('  - AttachmentUtils.ets (动态 MIME 判定、图片/文档分流、防路径穿越清洗、UUID 附件名)');
   console.log('  - HermesWorkspaceClient.ets (路径穿越防护、远程目录与文件读取)');
@@ -1799,11 +2446,12 @@ export const test = true;
   console.log('  - HermesFileClient.ets (data_url 图片上传、ArrayBuffer 二进制产物下载)');
   console.log('  - HermesProjectClient.ets / GitWorkspaceViewModel.ets (项目列表、Git 根目录、分支列表、切换分支)');
   console.log('  - HermesSkillsClient.ets / HermesMemoryClient.ets / SkillsViewModel.ets (技能开关、Soul读取与保存、长期记忆)');
-  console.log('  - HermesKanbanClient.ets / KanbanViewModel.ets (看板可用性、看板列表、泳道卡片快照、新建与状态流转)');
+  console.log('  - HermesKanbanClient.ets / KanbanViewModel.ets (看板401/404可用性区分、对象包装看板列表、最新驼峰事件游标、PATCH卡片状态更新、只读模式保护)');
   console.log('  - HermesCronClient.ets / CronViewModel.ets (定时任务调度、触发、暂停与恢复)');
   console.log('  - HermesInsightsClient.ets / InsightsViewModel.ets (模型用量与成本统计)');
-  console.log('  - LegacySSEClient.ets (上游旧版 WebUI 健康探针与 SSE 数据帧解析)');
+  console.log('  - LegacySSEClient.ets (上游旧版 WebUI 健康探针、/api/chat/start、/api/chat/cancel、/api/chat/stream 跨数据块 SSE 拼帧缓冲与会话详情)');
   console.log('  - NotificationUtils.ets (系统通知管理器、审批待办与任务完成提醒)');
+  console.log('  - DeepLinkUtils.ets / ShareUtils.ets / VoiceUtils.ets (深链 hermex:// / hermes-agent:// 解析与分发、系统分享 Want 解析与外发、语音录音/播放状态机)');
   console.log('  - MarkdownParser.ets / MarkdownView.ets (代码块、表格、列表、引用与多级标题解析渲染)');
   console.log('======================================================');
 }

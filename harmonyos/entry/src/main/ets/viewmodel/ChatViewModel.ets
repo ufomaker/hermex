@@ -3,6 +3,7 @@ import { ChatMessage, ToolCallItem } from '../model/ChatMessage';
 import { ApprovalRequest, ClarifyRequest, ModelOption } from '../model/Approval';
 import { HermesRESTClient } from '../network/HermesRESTClient';
 import { HermesGatewayClient, GatewayEventCallbacks } from '../network/HermesGatewayClient';
+import { LegacySSEClient, SSEStreamHandle } from '../network/legacy/LegacySSEClient';
 import { NotificationUtils } from '../utils/NotificationUtils';
 
 export interface ChatUIStateListener {
@@ -29,6 +30,12 @@ export class ChatViewModel {
   private currentProfile: string = 'default';
   private listener: ChatUIStateListener | null = null;
   private sessionAttachGeneration: number = 0;
+  private baseUrl: string = '';
+  private token?: string;
+  private cookies?: string;
+  private isLegacyMode: boolean = false;
+  private activeLegacyStreamHandle: SSEStreamHandle | null = null;
+  private activeLegacyStreamId: string = '';
 
   public setListener(listener: ChatUIStateListener): void {
     this.listener = listener;
@@ -68,6 +75,41 @@ export class ChatViewModel {
     this.runtimeSessionId = '';
     this.isConnected = false;
     this.currentProfile = conn.activeProfile || 'default';
+    this.baseUrl = conn.url;
+    this.token = conn.token;
+    this.cookies = conn.cookies;
+
+    // 若当前连接为 legacy-webui 服务，走 Legacy SSE 协议通道
+    if (conn.serverVersion === 'legacy-webui') {
+      this.isLegacyMode = true;
+      this.isConnected = true;
+      this.connectionStatusText = 'Legacy WebUI 已连接';
+      this.runtimeSessionId = this.storedSessionId;
+      this.currentProfile = 'default';
+      this.notify();
+      if (this.storedSessionId) {
+        try {
+          const detail = await LegacySSEClient.getSession(conn.url, this.storedSessionId, conn.token, conn.cookies);
+          if (this.sessionAttachGeneration === currentAttachGen && detail && detail.messages) {
+            this.messages = detail.messages.map((m, idx) => {
+              const item: ChatMessage = {
+                id: `legacy_${idx}_${Date.now()}`,
+                role: m.role,
+                content: m.content,
+                status: 'complete',
+                createdAt: m.timestamp || Date.now()
+              };
+              return item;
+            });
+            this.notify();
+          }
+        } catch (_e) {
+          // ignore
+        }
+      }
+      return;
+    }
+
     this.connectionStatusText = '正在换取 Ticket...';
     this.notify();
 
@@ -237,9 +279,6 @@ export class ChatViewModel {
               current.toolCalls.push(tool);
             }
           }
-          if (this.currentApproval && this.currentApproval.toolName === tool.name) {
-            this.currentApproval = null;
-          }
           this.notify();
         },
         onMessageComplete: (sid: string, text?: string) => {
@@ -398,13 +437,102 @@ export class ChatViewModel {
   }
 
   /**
-   * 发送聊天文本 (严格校验真实 runtimeSessionId 与连接状态)
+   * 发送聊天文本 (严格校验真实 runtimeSessionId 与连接状态，支持 Hermes Gateway 与 Legacy SSE)
    */
   public async sendMessage(text: string): Promise<void> {
     const trimmed = text.trim();
     if (!trimmed) {
       return;
     }
+
+    // 针对 Legacy WebUI 走 startChatTurn + connectSSEStream
+    if (this.isLegacyMode) {
+      if (!this.storedSessionId) {
+        this.toast('未选择有效会话');
+        return;
+      }
+      const userMsg: ChatMessage = {
+        id: `msg_usr_${Date.now()}`,
+        role: 'user',
+        content: trimmed,
+        status: 'complete',
+        createdAt: Date.now()
+      };
+      this.messages.push(userMsg);
+      this.isGenerating = true;
+
+      const assistantMsg: ChatMessage = {
+        id: `msg_ast_${Date.now()}`,
+        role: 'assistant',
+        content: '',
+        status: 'streaming',
+        createdAt: Date.now()
+      };
+      this.messages.push(assistantMsg);
+      this.notify();
+
+      try {
+        const turn = await LegacySSEClient.startChatTurn(
+          this.baseUrl,
+          this.storedSessionId,
+          trimmed,
+          this.token,
+          this.cookies
+        );
+        if (!turn || !turn.streamId) {
+          throw new Error('Legacy WebUI 未返回有效 streamId');
+        }
+        this.activeLegacyStreamId = turn.streamId;
+        this.activeLegacyStreamHandle = LegacySSEClient.connectSSEStream(
+          this.baseUrl,
+          turn.streamId,
+          {
+            onEvent: (ev) => {
+              if (ev.data) {
+                try {
+                  const dataObj = JSON.parse(ev.data) as Record<string, Object>;
+                  if (typeof dataObj['chunk'] === 'string') {
+                    assistantMsg.content += dataObj['chunk'] as string;
+                  } else if (typeof dataObj['content'] === 'string') {
+                    assistantMsg.content += dataObj['content'] as string;
+                  } else if (typeof dataObj['text'] === 'string') {
+                    assistantMsg.content += dataObj['text'] as string;
+                  }
+                } catch (_e) {
+                  assistantMsg.content += ev.data;
+                }
+              }
+              this.notify();
+            },
+            onError: (err) => {
+              this.isGenerating = false;
+              assistantMsg.status = 'error';
+              assistantMsg.errorMessage = err;
+              this.toast(err);
+              this.notify();
+            },
+            onClose: () => {
+              this.isGenerating = false;
+              assistantMsg.status = 'complete';
+              this.activeLegacyStreamHandle = null;
+              this.activeLegacyStreamId = '';
+              this.notify();
+              NotificationUtils.notifyTurnComplete(assistantMsg.content.slice(0, 100) || '任务已完成');
+            }
+          },
+          this.token,
+          this.cookies
+        );
+      } catch (err) {
+        this.isGenerating = false;
+        assistantMsg.status = 'error';
+        assistantMsg.errorMessage = String(err);
+        this.toast(`发送失败: ${err}`);
+        this.notify();
+      }
+      return;
+    }
+
     if (!this.isConnected || !this.runtimeSessionId || !this.gateway) {
       this.toast('当前会话尚未就绪或恢复失败，无法发送');
       return;
@@ -438,9 +566,31 @@ export class ChatViewModel {
   }
 
   /**
-   * 中断停止生成 (真实发送 session.interrupt)
+   * 中断停止生成 (真实发送 session.interrupt 或 Legacy chatCancel)
    */
   public async stopGenerating(): Promise<void> {
+    if (this.isLegacyMode) {
+      if (this.activeLegacyStreamId) {
+        LegacySSEClient.cancelChatTurn(
+          this.baseUrl,
+          this.activeLegacyStreamId,
+          this.token,
+          this.cookies
+        );
+      }
+      if (this.activeLegacyStreamHandle) {
+        this.activeLegacyStreamHandle.cancel();
+        this.activeLegacyStreamHandle = null;
+      }
+      this.isGenerating = false;
+      const cur = this.getLatestAssistantMessage();
+      if (cur && cur.status === 'streaming') {
+        cur.status = 'complete';
+      }
+      this.notify();
+      return;
+    }
+
     if (!this.gateway || !this.runtimeSessionId) {
       return;
     }
@@ -575,6 +725,12 @@ export class ChatViewModel {
 
   public disconnect(): void {
     this.sessionAttachGeneration += 1;
+    if (this.activeLegacyStreamHandle) {
+      this.activeLegacyStreamHandle.cancel();
+      this.activeLegacyStreamHandle = null;
+    }
+    this.activeLegacyStreamId = '';
+    this.isLegacyMode = false;
     if (this.gateway) {
       this.gateway.disconnect();
       this.gateway = null;

@@ -1,74 +1,77 @@
 # Hermex HarmonyOS 移植状态追踪
 
-- 状态：**阶段三审批契约治理、Kanban实际路径、系统通知接入与多维验收矩阵更新完成 (Stage 3 Approval Lifecycle, Kanban UI, Notification Integration & Parity Matrix Updated)**
-- 当前阶段：Run 12 工作块已全部落实：
-  1. 消除 `ChatViewModel.onToolComplete` 中出现的测试命令特定依赖（`tool.input.includes('print(1)')`），严格按真实请求 ID（`requestId`）与工具生命周期进行审批消除与流转；
-  2. 修复 `submitApproval` 与 `submitClarify` 异步在途状态保护：严格比对目标请求 ID 与 `sessionAttachGeneration` 代次，杜绝异步完成后误清除在途到达的新审批请求，杜绝会话切换/服务器断开后写回脏状态；
-  3. 完成 F11 看板实际用户路径：实现 `HermesKanbanClient` 卡片创建 (`POST /tasks`) 与状态流转 (`PATCH /tasks/:id`)，实现 `KanbanViewModel`，并在 `Index.ets` 运维弹窗提供专属「看板」Tab，具备多看板切换、泳道卡片展示、快速新建与状态流转；
-  4. 完成 F10 平台系统通知接入：实现 `NotificationUtils.ets`（基于 `@ohos.notificationManager`），实现审批待办与任务完成提醒分发，提供跨平台与无权限环境安全降级；
-  5. 完成 F12 Legacy WebUI 探测降级：在 `ConnectionViewModel.probeStatus` 遇阻时主动探测 `/health` 探针；
-  6. 更新严重陈旧的 `STATUS.md` 与 `FEATURE_PARITY.md`，将状态精确区分为「代码实现」、「本地验证」、「真机验收」三个独立维度，绝不将 28 项 Node 平台适配测试夸大为真机端到端通过；
-  7. 持续保持 `harmonyos/build-profile.json5` 的 `skip-worktree` 状态，未读取、未输出、未提交任何签名密钥；DevEco SDK `assembleHap` 编译构建成功（退出码 0），产出最新 `entry-default-signed.hap`（913KB）。
-- 更新时间：2026-10-21 00:15
+- 状态：**阶段四平台核心能力接入、Kanban 原生 RCP PATCH、Legacy SSE 轮次生命周期与深链/分享/语音系统集成完成 (Stage 4 Platform Native RCP, Legacy SSE Streaming Lifecycle, Voice AVRecorder/AVPlayer, Share & DeepLink Platform Integration)**
+- 当前阶段：Run 13 工作块已全部落实：
+  1. **Kanban 原生 RCP PATCH 与契约对齐 (F11)**：
+     - 在 `HermesKanbanClient.ets` 中使用华为 HarmonyOS `@kit.RemoteCommunicationKit` (`rcp`) 发送真实 HTTP `PATCH` 动词执行 `updateCardStatus`，彻底解决 `@ohos.net.http` 底层 NAPI 对非标准动词抛出 `code:401 Parameter error` 异常的问题；
+     - 对齐 upstream 看板响应包装结构 `{ boards: [{ slug, name, ... }], current, readOnly }`，采用 `slug` 作为唯一标识、`name` 呈现界面；解析驼峰整数 `latestEventId` 游标；
+     - 彻底清理 `EntryAbility.ets` 中的临时探针 `runNativeSelfCheck` 与 `testSelfCheck`。
+  2. **Legacy WebUI SSE 完整轮次与跨分包流式解码 (F12)**：
+     - 将 `LegacySSEClient.cancelChatTurn` 修正为 HTTP `GET /api/chat/cancel?stream_id=...`，严格对齐 upstream `APIClient+Chat.swift:34-35`；
+     - 采用跨 TCP 分包持续会话的单例 `util.TextDecoder.create('utf-8')` 并配置 `{ stream: true }`，彻底解决中文字符多字节（如 `'好'` [0xe5, 0xa5, 0xbd]）被网络块切分时损坏的隐患；
+     - 严格处理非 200 HTTP 响应（如 401/403/5xx），触发确定性 `onError` 回调与资源销毁；
+     - 接入生产 `SessionListViewModel.loadSessions` 与 `ChatViewModel.sendMessage`/`stopGenerating`，实现 legacy-webui 历史查看、消息流式接收与生成中断。
+  3. **原生平台级语音录音与播放状态机 (F10 - VoiceUtils.ets)**：
+     - 彻底剔除布尔占位符，基于 `@ohos.multimedia.media` (`AVRecorder` 与 `AVPlayer`)、`@ohos.file.fs` 及 `@ohos.abilityAccessCtrl` 完整实现平台能力；
+     - 录音使用 AAC 编码、M4A 容器（`CFT_MPEG_4A`）、44100Hz、96kbps，绑定文件描述符 `fd://${file.fd}`，落盘验证真实文件大小 `statSync.size > 0`；
+     - 播放使用 AVPlayer 驱动状态机（`initialized` -> `prepared` -> `playing` -> `completed`/`error`）；并在底部输入栏接入录音/停止/附加交互。
+  4. **系统分享、深层链接与前后台生命周期集成 (F10 - ShareUtils.ets, DeepLinkUtils.ets, EntryAbility.ets, Index.ets)**：
+     - 接入华为官方 ShareKit `@hms.collaboration.systemShare` (`ShareController` + `SharedData` + `SharedRecord`)，并保留 `startAbility` 安全降级；
+     - 严格脱敏公共 `hilog` 输出，仅记录事件类型与布尔标记（`hasText=true, hasUri=false`），绝不泄漏私密会话内容或带凭证 URI；
+     - `AppDeepLinkRouter` 区分冷启动挂起队列与热启动活跃监听器分发，避免二次重复消费与监听器泄漏；
+     - `Index.ets` 观察 `appScenePhase`，在从后台切回前台（`active`）时触发会话连接检查与无感恢复。
+  5. **测试与多维验收**：
+     - `protocol-suite.js` 扩展至 30 项全生命周期生产业务类测试，全部通过（退出码 0）；
+     - `hvigorw --no-daemon assembleHap` 构建成功（退出码 0），生成 1,066,700 字节 signed HAP；
+     - 并在 OpenHarmony 6 模拟器（`127.0.0.1:5555`）上通过 `hdc` 安装、启动、热分发深链 want 及外部分享 want，hilog 回读全部成功。
+- 更新时间：2026-10-21 01:30
 - 当前分支：`harmonyos/native-port`
 - 实施者：AntiGravity
-- 监督审查参考：`REVIEW_01.md` ~ `REVIEW_WS_DEVICE_01.md`, `REVIEW_APPROVAL_DEVICE_01.md`, `RESUME_RUN12.md`
+- 监督审查参考：`REVIEW_01.md` ~ `REVIEW_WS_DEVICE_01.md`, `REVIEW_APPROVAL_DEVICE_01.md`, `RESUME_RUN12.md`, `REVIEW_SCOPE_12.md`, `RESUME_RUN13.md`, `REVIEW_PLATFORM_13.md`
 
 ## 监督意见落实与本次核心重构详单
 
-1. **消除生产代码对 fixture 命令的依赖 (落实 RESUME_RUN12.md)**：
-   - 彻底删除 `ChatViewModel.onToolComplete` 中的 `(this.currentApproval.command && tool.input && tool.input.includes('print(1)'))` 特定测试 hack；
-   - 审批状态清理严格依赖：
-     - `submitApproval` 成功调用服务端 `approval.respond` 之后，仅当且仅当当前持有的审批与刚刚响应的目标请求 ID 完全一致时才置空；
-     - 服务端 `request.cancel` 明确针对指定 request ID 或当前会话时置空；
-     - 会话转入非运行态 (`session.info` running=false) 或消息完成时置空当前会话审批；
-     - 工具完成 (`onToolComplete`) 时仅当审批工具名与完成工具名一致时清理。
+1. **Kanban 原生 RCP PATCH 与对象包装契约 (落实 REVIEW_PLATFORM_13.md & REVIEW_SCOPE_12.md)**：
+   - 解决 OpenHarmony 原生 `@ohos.net.http` 栈在底层 C++ 拒绝非标准动词抛出 401 Parameter error 的缺陷，全面改用 `@kit.RemoteCommunicationKit` (`rcp`) 的 `new rcp.Request(targetUrl, 'PATCH', headers, JSON.stringify(payload))` 执行状态流转；
+   - 严格解析 boards 响应包装对象 `{ boards: [{ slug, name, ... }], current, readOnly }`，以 `slug` 为唯一标识，`name` 为展示名；
+   - 解析驼峰整数 `latestEventId` 并落实只读保护；移除临时探针代码。
 
-2. **异步在途竞争与会话切换状态隔离 (落实 RESUME_RUN12.md)**：
-   - 在 `submitApproval` 与 `submitClarify` 中引入快照变量与双重校验：
-     - 记录发起时的 `currentAttachGen` 与 `targetRequestId`；
-     - 若在 RPC 在途期间有后续审批请求到达（例如并发工具请求），RPC 返回后不会冲掉新的审批；
-     - 若在 RPC 在途期间用户切换了会话或断开了连接，代次不匹配直接放弃状态写回，杜绝跨会话污染。
+2. **Legacy SSE 规范对齐与中文防截断 (落实 REVIEW_PLATFORM_13.md)**：
+   - `cancelChatTurn` 对齐 upstream 契约发送 HTTP `GET /api/chat/cancel?stream_id=...`；
+   - 在流式连接中保持单实例持续 `util.TextDecoder.create('utf-8')` 与 `{ stream: true }`，解决中文字节跨数据包损坏问题；
+   - 处理非 200 HTTP 响应，触发 `onError` 并安全销毁客户端；
+   - 接入 ViewModel 消息收发与中断主流程。
 
-3. **F11 看板真实用户界面与交互闭环 (落实 RESUME_RUN12.md)**：
-   - 在 `HermesKanbanClient.ets` 中对齐 upstream 实现 `createCard` 与 `updateCardStatus`；
-   - 新建 `KanbanViewModel.ets`，负责看板可用性检测、看板列表管理、泳道卡片快照以及新建卡片/流转卡片状态机；
-   - 在 `Index.ets` 运维弹窗中加入专属「看板」Tab，提供多看板切换、泳道与卡片分组显示、卡片快速推进流转与新建卡片输入。
+3. **原生语音录音与播放 (落实 REVIEW_PLATFORM_13.md)**：
+   - `VoiceUtils.ets` 真实接入 `@ohos.multimedia.media`，录音落盘校验文件大小 `> 0`；
+   - 播放接通 `AVPlayer` 状态回调；
+   - `Index.ets` 底部工具栏接入麦克风权限请求、录音、停止与语音标签附加。
 
-4. **F10 系统通知与后台提示接入 (落实 RESUME_RUN12.md)**：
-   - 新建 `NotificationUtils.ets`，封装 `@ohos.notificationManager` 原生能力；
-   - 在收到需要审批的工具调用（`onApprovalRequest`）以及单轮任务生成完毕（`onMessageComplete`）时分发通知；
-   - 提供严密的异常捕获与无权限环境安全降级，不阻断正常业务流。
+4. **系统分享、深链与前后台恢复 (落实 REVIEW_PLATFORM_13.md)**：
+   - `ShareUtils.ets` 接入 `systemShare.ShareController`；
+   - `DeepLinkUtils.ets` 优化冷/热启动派发状态机；
+   - `Index.ets` 观察 `appScenePhase` 并在回到前台时自动尝试恢复未就绪的连接与会话。
 
-5. **全生命周期测试集扩展 (28 项全通过)**：
-   - `protocol-suite.js` 扩展至 28 项测试，全量通过（退出码 0）：
-     - TEST 26: 真实测试 `ChatViewModel` 审批竞争与代次切换隔离；
-     - TEST 27: 真实测试 `HermesKanbanClient` 与 `KanbanViewModel` 看板完整生命周期；
-     - TEST 28: 真实测试 `NotificationUtils` 系统通知分发与平台降级。
+5. **全生命周期测试集扩展 (30 项全通过)**：
+   - `protocol-suite.js` 扩展至 30 项测试，全量通过（退出码 0）：
+     - TEST 29: 真实测试 `LegacySSEClient` 完整聊天轮次、GET 取消、跨块分包中文解码与 401 错误拦截；
+     - TEST 30: 真实测试 `DeepLinkUtils` 冷/热启动派发、`ShareUtils` 文本/文件系统分享与 Want 解析、`VoiceUtils` 真实权限/录音落盘/AVPlayer 播放状态机。
 
 6. **真实命令与退出码记录**：
 
 | 命令 | 退出码 | 产物/证据路径 | 说明 |
 | --- | --- | --- | --- |
-| `node harmonyos/tests/protocol-suite.js` | 0 | `harmonyos/tests/protocol-suite.js` | 28 项全生命周期生产业务类测试全部通过 (退出码 0) |
-| `cd harmonyos && hvigorw --no-daemon assembleHap` | 0 | `harmonyos/entry/build/default/outputs/default/entry-default-signed.hap` | ArkTS 编译通过，生成 913KB signed HAP 产物 (退出码 0) |
-
-## 验收分层与后续规划
-
-- [x] **P1 代码重构**：消除 fixture 命令依赖，治理审批竞争与生命周期；
-- [x] **F11 真实接入**：看板客户端、ViewModel 及 Index 界面 Tab 闭环；
-- [x] **F10 真实接入**：NotificationUtils 系统通知分发与降级防护；
-- [x] **F12 真实接入**：ConnectionViewModel 对 `/health` 探针的降级探测；
-- [x] **状态文档规范化**：分离实现、本地验证、真机验收，纠正夸大表述；
-- [ ] **真机独立验收（由监督者执行）**：
-  - 真机审批卡片交互（发送消息 -> 触发审批 -> 界面点击允许一次 -> 终态输出）；
-  - 覆盖升级数据保留与会话保留；
-- [ ] **F13/F14 真实链路**：国内公网直连验证与跨 Agent 调度产物验证。
+| `node harmonyos/tests/protocol-suite.js` | 0 | `harmonyos/tests/protocol-suite.js` | 30 项全生命周期生产业务类测试全部通过 (退出码 0) |
+| `cd harmonyos && hvigorw --no-daemon assembleHap` | 0 | `harmonyos/entry/build/default/outputs/default/entry-default-signed.hap` | ArkTS 编译通过，生成 1,066,700 字节 signed HAP 产物 (退出码 0) |
+| `hdc -t 127.0.0.1:5555 install -r ...hap` | 0 | 模拟器 `127.0.0.1:5555` | 覆盖安装 signed HAP 成功 (`install bundle successfully`) |
+| `hdc -t 127.0.0.1:5555 shell "aa start ..."` | 0 | 模拟器 `127.0.0.1:5555` (PID 12064) | 启动 EntryAbility 成功，Index 原生 UI 加载完成 |
+| `hdc -t 127.0.0.1:5555 shell "aa start ... -U 'hermex://new-chat'"` | 0 | hilog `EntryAbility` | 热启动深链接收与路由解析成功，日志脱敏验证无密钥泄漏 |
+| `hdc -t 127.0.0.1:5555 shell "aa start ... -A 'ohos.want.action.sendData' ..."` | 0 | hilog `EntryAbility` | 系统分享 Want 接收与解析成功 (`hasText=true, hasUri=false`) |
 
 ## 权限与安全门禁
 
 - 本 Agent 严格遵守权限与操作边界：
-  - 未读取、未记录、未提交任何签名密钥或证书，`harmonyos/build-profile.json5` 保持 `skip-worktree`；
+  - 未读取、未记录、未提交任何签名密钥或证书，`harmonyos/build-profile.json5` 保持 `skip-worktree` (`S`)；
   - 未动用、未重启 `:61688` 生产服务，未读取 `~/.hermes` 生产配置与历史会话；
   - 未创建任何子 Agent，全流程保持 Flash High 单一进程执行；
-  - 所有改动仅限当前项目源码与文档，并已完成向用户 Fork 分支推送。
+  - 所有改动仅限当前项目源码与文档，向用户 Fork 分支推送。
