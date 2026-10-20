@@ -865,10 +865,13 @@ async function runTestSuite() {
         ws.send(JSON.stringify({ id: frame.id, result: { ok: true } }));
       } else if (frame.method === 'approval.respond') {
         serverStats.approvalResponded = true;
+        assert(frame.params.session_id, 'approval.respond 必须包含 session_id');
+        assert(frame.params.request_id, 'approval.respond 必须包含 request_id');
+        assert(['once', 'session', 'always', 'deny'].includes(frame.params.choice), `choice 必须是 once/session/always/deny，实际为: ${frame.params.choice}`);
         if (frame.params.request_id === 'app_fail_once') {
           ws.send(JSON.stringify({ id: frame.id, error: { message: 'Approval rejected due to lock conflict' } }));
         } else {
-          ws.send(JSON.stringify({ id: frame.id, result: { ok: true } }));
+          ws.send(JSON.stringify({ id: frame.id, result: { resolved: 1 } }));
         }
       } else if (frame.method === 'file.attach') {
         assert(frame.params.session_id, 'file.attach 必须包含 session_id');
@@ -1083,28 +1086,33 @@ async function runTestSuite() {
   assert(latestAssistant.toolCalls[0].status === 'completed', '工具调用状态必须为 completed');
   console.log('[PASS 8] 多会话隔离、中文流式与推理工具流聚合通过');
 
-  // --- 测试用例 9: 生产 ChatViewModel 审批失败恢复与澄清交互 ---
+  // --- 测试用例 9: 生产 ChatViewModel 审批失败恢复与澄清交互 (严格区分 outer JSONRPC id 与 inner request_id) ---
   console.log('\n[TEST 9] 测试真实 ChatViewModel 审批交互、失败保留与重试闭环:');
   connectedClientWs.send(JSON.stringify({
-    id: 'app_fail_once',
-    method: 'approval.request',
+    jsonrpc: '2.0',
+    id: 'srq-mock-fail-001',
+    method: 'approval',
     params: {
       session_id: activeRuntime,
+      request_id: 'app_fail_once',
       tool_name: 'terminal',
       command: 'git push origin harmonyos/native-port',
-      choices: ['approve', 'reject']
+      choices: ['once', 'session', 'always', 'deny']
     }
   }));
   await new Promise((r) => setTimeout(r, 100));
 
   assert(vm.currentApproval !== null, '当前会话的审批请求必须被挂载到 currentApproval');
+  assert(vm.currentApproval.id === 'srq-mock-fail-001', '外层 JSON-RPC id 匹配');
+  assert(vm.currentApproval.requestId === 'app_fail_once', '内层 params.request_id 匹配');
   assert(vm.currentApproval.command.includes('git push'), '审批命令匹配');
+  assert(vm.currentApproval.choices.includes('once'), 'choices 必须包含 once');
 
-  await vm.submitApproval('approve');
+  await vm.submitApproval('once');
   assert(vm.currentApproval !== null, '审批请求在服务端返回错误时必须保留在界面供用户重试，杜绝静默吞错！');
 
-  vm.currentApproval.id = 'app_success_now';
-  await vm.submitApproval('approve');
+  vm.currentApproval.requestId = 'app_success_now';
+  await vm.submitApproval('once');
   assert(vm.currentApproval === null, '审批成功后才彻底清除待审批状态');
   assert(serverStats.approvalResponded, '服务端已收到审批 respond 回执');
   console.log('[PASS 9] 审批失败保留重试与成功清理闭环通过');
@@ -1476,8 +1484,8 @@ export const test = true;
   assert(boardSnapshot.columns[0].cards.length === 1 && boardSnapshot.columns[0].cards[0].title.includes('HarmonyOS 原生移植'), '卡片标题匹配');
   console.log('[PASS 23] 真实 HermesKanbanClient 看板服务契约通过');
 
-  // --- 测试用例 24: 真实隔离 Hermes 0.21.5 实例 (127.0.0.1:9199) 全链路联调 ---
-  console.log('\n[TEST 24] 测试真实隔离 Hermes 0.21.5 实例 (127.0.0.1:9199) HTTP/WebSocket 全链路:');
+  // --- 测试用例 24: 真实隔离 Hermes 0.21.5 实例 (127.0.0.1:9199) 全链路联调与审批往返闭环 ---
+  console.log('\n[TEST 24] 测试真实隔离 Hermes 0.21.5 实例 (127.0.0.1:9199) 生产 ChatViewModel 中文消息→工具审批→执行→终态回复→历史回填:');
   const realUrl = 'http://127.0.0.1:9199';
   try {
     const status = await HermesRESTClient.getStatus(realUrl);
@@ -1487,39 +1495,157 @@ export const test = true;
     const realLogin = await HermesRESTClient.login(realUrl, 'hermex', 'hermex-local');
     assert(realLogin.cookies && realLogin.cookies.includes('hermes_session_at'), '真实登录成功并提取 Cookie');
 
-    const realTicket = await HermesRESTClient.getWsTicket(realUrl, undefined, realLogin.cookies);
-    assert(realTicket && realTicket.length > 10, '真实 Ticket 获取成功');
+    const realConn = {
+      id: 'real_conn_9199',
+      name: 'Isolated 9199',
+      url: realUrl,
+      username: 'hermex',
+      password: 'hermex-local',
+      token: realLogin.token,
+      cookies: realLogin.cookies,
+      activeProfile: 'default'
+    };
 
-    let realReadyReceived = false;
-    const realGw = new HermesGatewayClient({
-      onConnected: () => {
-        realReadyReceived = true;
+    const realVm = new ChatViewModel();
+    let stateChangedCount = 0;
+    realVm.setListener({
+      onStateChanged: () => {
+        stateChangedCount++;
       }
     });
 
-    await realGw.connect(realUrl, realTicket);
-    assert(realReadyReceived, '真实 WebSocket 握手成功并完成 client.capabilities 自动协商');
-    assert(realGw.isGatewayConnected(), '真实网关状态为已连接');
+    // 1. 初始化并新建真实会话
+    await realVm.attachSession(realConn, '');
+    assert(realVm.isConnected, '网关握手与认证就绪');
 
-    const realSessionRes = await realGw.createSession('default');
-    assert(realSessionRes && realSessionRes.session_id, `真实服务端会话创建成功: ${realSessionRes.session_id}`);
+    const createdSessionId = await realVm.createAndAttachNewSession(realConn, '/tmp');
+    assert(createdSessionId && createdSessionId.length > 5, `真实服务端会话创建成功: ${createdSessionId}`);
+    assert(realVm.getRuntimeSessionId() && realVm.getRuntimeSessionId().length > 0, `运行时 runtime ID 就绪: ${realVm.getRuntimeSessionId()}`);
 
-    const promptSubmitRes = await realGw.submitPrompt(realSessionRes.session_id, 'print(1)');
-    assert(promptSubmitRes && promptSubmitRes.status === 'streaming', '真实 Prompt 提交成功并进入流式状态');
+    // 2. 发送中文测试消息触发 terminal 工具调用
+    await realVm.sendMessage('手机验收：请执行固定测试检查');
+    assert(realVm.isGenerating === true, '发送后进入生成状态');
 
-    await realGw.interruptSession(realSessionRes.session_id);
-    realGw.disconnect();
-    console.log('[PASS 24] 真实隔离 Hermes 0.21.5 (127.0.0.1:9199) 全链路集成测试通过');
+    // 3. 等待服务端推流与审批请求
+    const approvalStart = Date.now();
+    while (!realVm.currentApproval && Date.now() - approvalStart < 15000) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert(realVm.currentApproval !== null, '必须收到服务端 approval 请求');
+    assert(realVm.currentApproval.command && realVm.currentApproval.command.includes('print(1)'), `审批命令匹配: ${realVm.currentApproval.command}`);
+    assert(realVm.currentApproval.choices && realVm.currentApproval.choices.includes('once'), '审批选项必须包含 once');
+    assert(realVm.currentApproval.requestId && realVm.currentApproval.requestId.length > 0, '审批请求必须包含内部 requestId');
+
+    // 4. 提交允许一次 ('once')
+    await realVm.submitApproval('once');
+    assert(realVm.currentApproval === null, '审批提交后清除当前审批弹窗');
+
+    // 5. 等待生成完成与工具输出落地
+    const completeStart = Date.now();
+    while (realVm.isGenerating && Date.now() - completeStart < 15000) {
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    assert(!realVm.isGenerating, '工具执行完成后会话状态恢复空闲 (!isGenerating)');
+
+    const astMsg = realVm.messages.find((m) => m.role === 'assistant');
+    assert(astMsg !== undefined, '必须产生 assistant 消息');
+    assert(astMsg.content.includes('1'), `终态内容必须包含命令输出结果，当前为: ${astMsg.content}`);
+    assert(astMsg.toolCalls && astMsg.toolCalls.length > 0, '必须包含 terminal 工具调用记录');
+    assert(astMsg.toolCalls[0].status === 'completed', '工具执行状态必须为 completed');
+
+    // 6. 验证重连历史回填一致性
+    realVm.disconnect();
+    const reconnectVm = new ChatViewModel();
+    await reconnectVm.attachSession(realConn, createdSessionId);
+    assert(reconnectVm.isConnected, '重连会话成功');
+    assert(reconnectVm.messages.length >= 2, `重连历史回填消息条数一致，当前: ${reconnectVm.messages.length}`);
+    assert(reconnectVm.messages.some((m) => m.role === 'user' && m.content.includes('手机验收')), '历史消息包含用户输入');
+    reconnectVm.disconnect();
+
+    console.log('[PASS 24] 真实隔离 Hermes 0.21.5 (127.0.0.1:9199) 全链路端到端审批交互与历史重连通过');
   } catch (err) {
     console.error('[FAIL 24] 真实隔离 Hermes 0.21.5 联调失败:', err);
     throw err;
   }
 
+  // --- 测试用例 25: 严格在上游标准录制 Fixture (turn-tool-approval-frames.json) 上验证审批与正文流式状态机 ---
+  console.log('\n[TEST 25] 严格在 turn-tool-approval-frames.json 录制帧上验证审批与正文流式状态机:');
+  const fixturePath = path.resolve(rootDir, '../HermesMobileTests/Fixtures/HermesAgent/turn-tool-approval-frames.json');
+  const fixtureData = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
+  const frames = fixtureData.frames;
+
+  let fixtureApprovalSent = null;
+  const fixtureGwCallbacks = {
+    onConnected: () => {},
+    onDisconnected: () => {}
+  };
+  const fixtureGw = new HermesGatewayClient(fixtureGwCallbacks);
+  fixtureGw.ws = {
+    send: (dataStr, cb) => {
+      const parsed = JSON.parse(dataStr);
+      if (parsed.method === 'approval.respond') {
+        fixtureApprovalSent = parsed;
+        setTimeout(() => {
+          fixtureGw.handleFrame({ jsonrpc: '2.0', id: parsed.id, result: { resolved: 1 } }, () => {});
+        }, 10);
+      }
+      if (cb) cb(null, true);
+    }
+  };
+  fixtureGw.isConnected = true;
+  fixtureGw.activeRuntimeId = '7dd4dff2';
+
+  let approvalReceivedByVm = null;
+  let interimReceivedByVm = null;
+  let toolCompleteReceivedByVm = false;
+  let messageCompleteReceivedByVm = false;
+
+  fixtureGw.callbacks = {
+    onApprovalRequest: (req) => {
+      approvalReceivedByVm = req;
+    },
+    onMessageInterim: (sid, text) => {
+      interimReceivedByVm = text;
+    },
+    onToolComplete: (sid, tool) => {
+      toolCompleteReceivedByVm = true;
+    },
+    onMessageComplete: (sid, text) => {
+      messageCompleteReceivedByVm = true;
+    }
+  };
+
+  for (const frame of frames) {
+    if (frame.method === 'event') {
+      const type = frame.params.type;
+      const payload = frame.params.payload || {};
+      fixtureGw.dispatchRuntimeEvent(type, frame.params, payload);
+    } else if (frame.method === 'approval') {
+      fixtureGw.handleServerRequest(frame.id, frame.method, frame.params);
+    }
+  }
+
+  assert(approvalReceivedByVm !== null, '必须解析 fixture 中的 approval 帧');
+  assert(approvalReceivedByVm.id === 'srq-627297cd2bb0', '外层 JSON-RPC id 匹配');
+  assert(approvalReceivedByVm.requestId === '850a0a9d32c448c2b4b9bc34503f5812', '内层 params.request_id 匹配');
+  assert(approvalReceivedByVm.command === 'python3 -c "print(1)"', 'command 匹配');
+  assert(approvalReceivedByVm.choices.includes('once'), 'choices 包含 once');
+
+  await fixtureGw.respondApproval('7dd4dff2', approvalReceivedByVm.requestId, 'once');
+  assert(fixtureApprovalSent !== null, '已发出 approval.respond 帧');
+  assert(fixtureApprovalSent.params.session_id === '7dd4dff2', 'session_id 匹配');
+  assert(fixtureApprovalSent.params.request_id === '850a0a9d32c448c2b4b9bc34503f5812', 'request_id 匹配');
+  assert(fixtureApprovalSent.params.choice === 'once', 'choice 匹配 once');
+  assert(interimReceivedByVm !== null, 'interim 必须接收正文');
+  assert(toolCompleteReceivedByVm, 'tool.complete 必须接收');
+  assert(messageCompleteReceivedByVm, 'message.complete 必须接收');
+  console.log('[PASS 25] 严格 turn-tool-approval-frames.json 录制帧状态机验证通过');
+
   vm.disconnect();
   server.close();
 
   console.log('\n======================================================');
-  console.log('✅ 所有 24 项端到端生产代码行为回归测试全部通过 (退出码 0)');
+  console.log('✅ 所有 25 项端到端生产代码行为回归测试全部通过 (退出码 0)');
   console.log('覆盖真实生产业务类：');
   console.log('  - HermesRESTClient.ets (Cookie Jar、登录、/api/auth/me 核验、Ticket、会话与历史)');
   console.log('  - HermesGatewayClient.ets (WebSocket 握手、client.capabilities 回执、关闭码、RPC 30s 超时、取消、file.attach)');

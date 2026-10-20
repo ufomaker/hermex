@@ -64,6 +64,7 @@ struct Index {
   @State availableModels: ModelOption[] = [];
   @State hasApproval: boolean = false;
   @State approvalDesc: string = '';
+  @State approvalChoices: string[] = ['once', 'deny'];
   @State isSubmittingApproval: boolean = false;
   @State hasClarify: boolean = false;
   @State clarifyQuestion: string = '';
@@ -145,9 +146,11 @@ struct Index {
       this.hasApproval = true;
       const app = this.chatVm.currentApproval;
       this.approvalDesc = `${app.toolName || '工具'}: ${app.command || app.description || '执行请求'}`;
+      this.approvalChoices = app.choices && app.choices.length > 0 ? app.choices : ['once', 'deny'];
     } else {
       this.hasApproval = false;
       this.approvalDesc = '';
+      this.approvalChoices = [];
     }
 
     if (this.chatVm.currentClarify) {
@@ -618,40 +621,62 @@ struct Index {
       .backgroundColor('#FFFFFF')
       .border({ width: { bottom: 1 }, color: '#E5E5EA' })
 
-      // 2. 审批请求悬浮栏 (带加载与重试保护)
+      // 2. 审批请求悬浮栏 (带加载与重试保护，精确契约 once/session/always/deny)
       if (this.hasApproval) {
-        Row() {
-          Column() {
-            Text('需要授权执行操作')
-              .fontSize(12)
-              .fontWeight(FontWeight.Bold)
-              .fontColor('#D97706')
-            Text(this.approvalDesc)
-              .fontSize(12)
-              .fontColor('#4B5563')
-              .maxLines(2)
+        Column() {
+          Row() {
+            Column() {
+              Text('需要授权执行操作')
+                .fontSize(12)
+                .fontWeight(FontWeight.Bold)
+                .fontColor('#D97706')
+              Text(this.approvalDesc)
+                .fontSize(12)
+                .fontColor('#4B5563')
+                .maxLines(2)
+            }
+            .layoutWeight(1)
+            .alignItems(HorizontalAlign.Start)
           }
-          .layoutWeight(1)
-          .alignItems(HorizontalAlign.Start)
+          .width('100%')
 
-          Button(this.isSubmittingApproval ? '提交中...' : '拒绝')
-            .fontSize(12)
-            .backgroundColor('#EF4444')
-            .fontColor('#FFFFFF')
-            .enabled(!this.isSubmittingApproval)
-            .margin({ right: 8 })
-            .onClick(() => {
-              this.chatVm.submitApproval('reject');
-            })
-
-          Button(this.isSubmittingApproval ? '提交中...' : '批准')
-            .fontSize(12)
-            .backgroundColor('#10B981')
-            .fontColor('#FFFFFF')
-            .enabled(!this.isSubmittingApproval)
-            .onClick(() => {
-              this.chatVm.submitApproval('approve');
-            })
+          Row() {
+            Blank()
+            if (this.approvalChoices.includes('deny')) {
+              Button(this.isSubmittingApproval ? '提交中...' : '拒绝')
+                .fontSize(12)
+                .backgroundColor('#EF4444')
+                .fontColor('#FFFFFF')
+                .enabled(!this.isSubmittingApproval)
+                .margin({ right: 6 })
+                .onClick(() => {
+                  this.chatVm.submitApproval('deny');
+                })
+            }
+            if (this.approvalChoices.includes('session')) {
+              Button(this.isSubmittingApproval ? '提交中...' : '本次会话')
+                .fontSize(12)
+                .backgroundColor('#6366F1')
+                .fontColor('#FFFFFF')
+                .enabled(!this.isSubmittingApproval)
+                .margin({ right: 6 })
+                .onClick(() => {
+                  this.chatVm.submitApproval('session');
+                })
+            }
+            if (this.approvalChoices.includes('once')) {
+              Button(this.isSubmittingApproval ? '提交中...' : '允许一次')
+                .fontSize(12)
+                .backgroundColor('#10B981')
+                .fontColor('#FFFFFF')
+                .enabled(!this.isSubmittingApproval)
+                .onClick(() => {
+                  this.chatVm.submitApproval('once');
+                })
+            }
+          }
+          .width('100%')
+          .margin({ top: 6 })
         }
         .width('92%')
         .padding(12)
@@ -828,7 +853,7 @@ struct Index {
                     .margin({ bottom: 4 })
                     .backgroundColor('#E5E7EB')
                     .borderRadius(4)
-                  })
+                  }, (tool: ToolCallItem) => `${tool.id}_${tool.status}_${tool.name}`)
                 }
 
                 // 主文字气泡 (集成 MarkdownView)
@@ -849,7 +874,7 @@ struct Index {
               .width('100%')
               .alignItems(msg.role === 'user' ? HorizontalAlign.End : HorizontalAlign.Start)
             }
-          }, (msg: ChatMessage) => msg.id)
+          }, (msg: ChatMessage) => `${msg.id}_${msg.status}_${msg.content}_${msg.reasoning || ''}_${(msg.toolCalls || []).map((t: ToolCallItem) => `${t.id}:${t.status}`).join(';')}`)
         }
         .width('100%')
         .layoutWeight(1)

@@ -3,18 +3,21 @@ import { ApprovalRequest, ClarifyRequest, ModelOption } from '../model/Approval'
 import { ToolCallItem } from '../model/ChatMessage';
 
 export interface GatewayEventCallbacks {
-  onConnected?: () => void;
+  onConnected?: () => void | Promise<void>;
   onDisconnected?: (reason: string) => void;
   onMessageStart?: (sessionId: string) => void;
   onMessageDelta?: (sessionId: string, delta: string) => void;
+  onMessageInterim?: (sessionId: string, text: string) => void;
+  onThinkingDelta?: (sessionId: string, text: string) => void;
   onReasoningDelta?: (sessionId: string, delta: string) => void;
   onToolStart?: (sessionId: string, tool: ToolCallItem) => void;
   onToolComplete?: (sessionId: string, tool: ToolCallItem) => void;
-  onMessageComplete?: (sessionId: string) => void;
+  onMessageComplete?: (sessionId: string, text?: string) => void;
   onSessionInfo?: (sessionId: string, running: boolean, model?: string, title?: string) => void;
   onError?: (sessionId: string, error: string) => void;
   onApprovalRequest?: (request: ApprovalRequest) => void;
   onClarifyRequest?: (request: ClarifyRequest) => void;
+  onRequestCancel?: (sessionId: string, id: string, method: string) => void;
 }
 
 export interface JsonRpcPayload {
@@ -151,7 +154,7 @@ export class HermesGatewayClient {
                 this.isConnected = true;
                 this.startHeartbeat(currentGen);
                 if (this.callbacks.onConnected) {
-                  this.callbacks.onConnected();
+                  await this.callbacks.onConnected();
                 }
                 settleResolve();
               }
@@ -335,8 +338,28 @@ export class HermesGatewayClient {
         break;
       case 'message.interim':
         const interim = String(payload['text'] || '');
-        if (interim && this.callbacks.onMessageDelta) {
-          this.callbacks.onMessageDelta(sessionId, interim);
+        if (interim) {
+          if (this.callbacks.onMessageInterim) {
+            this.callbacks.onMessageInterim(sessionId, interim);
+          } else if (this.callbacks.onMessageDelta) {
+            this.callbacks.onMessageDelta(sessionId, interim);
+          }
+        }
+        break;
+      case 'reasoning.available':
+        const reasoningAvail = String(payload['text'] || '');
+        if (reasoningAvail) {
+          if (this.callbacks.onMessageInterim) {
+            this.callbacks.onMessageInterim(sessionId, reasoningAvail);
+          } else if (this.callbacks.onMessageDelta) {
+            this.callbacks.onMessageDelta(sessionId, reasoningAvail);
+          }
+        }
+        break;
+      case 'thinking.delta':
+        const thinkingText = String(payload['text'] || '');
+        if (thinkingText && this.callbacks.onThinkingDelta) {
+          this.callbacks.onThinkingDelta(sessionId, thinkingText);
         }
         break;
       case 'reasoning.delta':
@@ -347,10 +370,18 @@ export class HermesGatewayClient {
         break;
       case 'tool.start':
         if (this.callbacks.onToolStart) {
+          let toolInput: string | undefined = undefined;
+          if (payload['args']) {
+            toolInput = JSON.stringify(payload['args']);
+          } else if (payload['input']) {
+            toolInput = typeof payload['input'] === 'string' ? payload['input'] : JSON.stringify(payload['input']);
+          } else if (payload['context']) {
+            toolInput = String(payload['context']);
+          }
           const tool: ToolCallItem = {
-            id: String(payload['id'] || payload['tool_id'] || ''),
+            id: String(payload['id'] || payload['tool_id'] || 'tool_call'),
             name: String(payload['name'] || payload['tool'] || 'tool'),
-            input: payload['input'] ? JSON.stringify(payload['input']) : undefined,
+            input: toolInput,
             status: 'running'
           };
           this.callbacks.onToolStart(sessionId, tool);
@@ -358,13 +389,26 @@ export class HermesGatewayClient {
         break;
       case 'tool.complete':
         if (this.callbacks.onToolComplete) {
+          let toolOutput: string | undefined = undefined;
+          if (payload['result'] !== undefined) {
+            toolOutput = typeof payload['result'] === 'string' ? payload['result'] : JSON.stringify(payload['result']);
+          } else if (payload['output'] !== undefined) {
+            toolOutput = String(payload['output']);
+          }
           const tool: ToolCallItem = {
-            id: String(payload['id'] || payload['tool_id'] || ''),
+            id: String(payload['id'] || payload['tool_id'] || 'tool_call'),
             name: String(payload['name'] || payload['tool'] || 'tool'),
-            output: payload['output'] ? String(payload['output']) : undefined,
+            output: toolOutput,
             status: 'completed'
           };
           this.callbacks.onToolComplete(sessionId, tool);
+        }
+        break;
+      case 'request.cancel':
+        const cancelId = String(payload['id'] || '');
+        const cancelMethod = String(payload['method'] || '');
+        if (this.callbacks.onRequestCancel) {
+          this.callbacks.onRequestCancel(sessionId, cancelId, cancelMethod);
         }
         break;
       case 'session.info':
@@ -376,8 +420,9 @@ export class HermesGatewayClient {
         }
         break;
       case 'message.complete':
+        const completeText = payload['text'] ? String(payload['text']) : undefined;
         if (this.callbacks.onMessageComplete) {
-          this.callbacks.onMessageComplete(sessionId);
+          this.callbacks.onMessageComplete(sessionId, completeText);
         }
         break;
       case 'error':
@@ -391,7 +436,7 @@ export class HermesGatewayClient {
     }
   }
 
-  private handleServerRequest(id: string, method: string, params: Record<string, Object>): void {
+  public handleServerRequest(id: string, method: string, params: Record<string, Object>): void {
     const sessionId = String(params['session_id'] || '');
 
     // 审批与澄清请求会话归属校验
@@ -399,26 +444,37 @@ export class HermesGatewayClient {
       return;
     }
 
-    if (method === 'approval.request' || method === 'request.approval') {
+    if (method === 'approval' || method === 'approval.request' || method === 'request.approval') {
       if (this.callbacks.onApprovalRequest) {
+        const rawChoices = params['choices'];
+        const choicesList: string[] = Array.isArray(rawChoices) && rawChoices.length > 0 ?
+          (rawChoices as string[]) : ['once', 'session', 'always', 'deny'];
+        const innerRequestId = params['request_id'] ? String(params['request_id']) : id;
+
         const req: ApprovalRequest = {
-          id: id,
+          id: id, // JSON-RPC 报文 ID (如 srq-...)
+          requestId: innerRequestId, // 队列内部请求 ID
           sessionId: sessionId || this.activeRuntimeId,
-          toolName: params['tool_name'] ? String(params['tool_name']) : undefined,
+          toolName: params['tool_name'] ? String(params['tool_name']) : (params['tool'] ? String(params['tool']) : 'terminal'),
           description: params['description'] ? String(params['description']) : undefined,
           command: params['command'] ? String(params['command']) : undefined,
-          choices: Array.isArray(params['choices']) ? (params['choices'] as string[]) : ['approve', 'reject']
+          choices: choicesList
         };
         this.callbacks.onApprovalRequest(req);
       }
-    } else if (method === 'clarify.request' || method === 'request.clarify') {
+    } else if (method === 'clarify' || method === 'clarify.request' || method === 'request.clarify') {
       if (this.callbacks.onClarifyRequest) {
+        const rawOptions = params['options'] || params['choices'];
+        const optionsList: string[] | undefined = Array.isArray(rawOptions) ? (rawOptions as string[]) : undefined;
+        const innerRequestId = params['request_id'] ? String(params['request_id']) : id;
+
         const req: ClarifyRequest = {
           id: id,
+          requestId: innerRequestId,
           sessionId: sessionId || this.activeRuntimeId,
           questionId: String(params['question_id'] || ''),
-          question: String(params['question'] || ''),
-          options: Array.isArray(params['options']) ? (params['options'] as string[]) : undefined
+          question: String(params['question'] || params['prompt'] || ''),
+          options: optionsList
         };
         this.callbacks.onClarifyRequest(req);
       }
@@ -488,12 +544,15 @@ export class HermesGatewayClient {
 
   /**
    * 创建新会话：session.create (HermesCall.swift:282)
-   * 真实在服务端创建并获取服务端返回的 session_id
+   * 真实在服务端创建并获取服务端返回的 session_id，支持显式传递 cwd 工作区
    */
-  public async createSession(profile: string): Promise<Record<string, Object>> {
+  public async createSession(profile: string, cwd?: string): Promise<Record<string, Object>> {
     const params: Record<string, Object> = {
       'profile': profile
     };
+    if (cwd) {
+      params['cwd'] = cwd;
+    }
     const res = await this.call('session.create', params);
     const runtime = String(res['session_id'] || res['id'] || '');
     if (runtime) {
@@ -539,12 +598,19 @@ export class HermesGatewayClient {
 
   /**
    * 响应审批：approval.respond (HermesCall.swift:302, 422)
+   * 严格按照契约传递 session_id, request_id (内部ID), choice ('once' | 'session' | 'always' | 'deny')
    */
   public async respondApproval(sessionId: string, requestId: string, choice: string): Promise<Record<string, Object>> {
+    let wireChoice = choice;
+    if (wireChoice === 'approve') {
+      wireChoice = 'once';
+    } else if (wireChoice === 'reject') {
+      wireChoice = 'deny';
+    }
     const params: Record<string, Object> = {
       'session_id': sessionId,
       'request_id': requestId,
-      'choice': choice
+      'choice': wireChoice
     };
     return this.call('approval.respond', params);
   }

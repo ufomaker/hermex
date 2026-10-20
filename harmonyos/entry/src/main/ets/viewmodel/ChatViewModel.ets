@@ -103,6 +103,31 @@ export class ChatViewModel {
               this.gateway.setActiveRuntime(runtime);
               this.isConnected = true;
               this.connectionStatusText = '会话已恢复';
+
+              // 检查 open_requests 与 pending_approval，恢复等待中审批
+              if (Array.isArray(resumeRes['open_requests'])) {
+                const openReqs = resumeRes['open_requests'] as Array<Record<string, Object>>;
+                for (let i = 0; i < openReqs.length; i++) {
+                  const oReq = openReqs[i];
+                  const oId = String(oReq['id'] || '');
+                  const oMethod = String(oReq['method'] || '');
+                  const oParams = (oReq['params'] as Record<string, Object>) || {};
+                  this.gateway.handleServerRequest(oId, oMethod, oParams);
+                }
+              }
+              if (!this.currentApproval && resumeRes['pending_approval']) {
+                const pa = resumeRes['pending_approval'] as Record<string, Object>;
+                this.currentApproval = {
+                  id: `pa_${Date.now()}`,
+                  requestId: String(pa['request_id'] || ''),
+                  sessionId: this.runtimeSessionId,
+                  toolName: 'terminal',
+                  command: pa['command'] ? String(pa['command']) : undefined,
+                  description: pa['description'] ? String(pa['description']) : undefined,
+                  choices: Array.isArray(pa['choices']) ? (pa['choices'] as string[]) : ['once', 'session', 'always', 'deny']
+                };
+              }
+
               this.notify();
             } catch (resErr) {
               if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) {
@@ -159,46 +184,50 @@ export class ChatViewModel {
         onMessageStart: (sid: string) => {
           if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
           this.isGenerating = true;
-          const newMsg: ChatMessage = {
-            id: `msg_ast_${Date.now()}`,
-            role: 'assistant',
-            content: '',
-            reasoning: '',
-            toolCalls: [],
-            status: 'streaming',
-            createdAt: Date.now()
-          };
-          this.messages.push(newMsg);
+          this.getOrCreateActiveAssistantMessage();
           this.notify();
         },
         onMessageDelta: (sid: string, delta: string) => {
           if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
-          const current = this.getLatestAssistantMessage();
-          if (current) {
-            current.content += delta;
+          const current = this.getOrCreateActiveAssistantMessage();
+          current.content += delta;
+          this.notify();
+        },
+        onMessageInterim: (sid: string, text: string) => {
+          if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
+          const current = this.getOrCreateActiveAssistantMessage();
+          current.content = text;
+          this.notify();
+        },
+        onThinkingDelta: (sid: string, text: string) => {
+          if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
+          const current = this.getOrCreateActiveAssistantMessage();
+          if (text) {
+            current.reasoning = text;
             this.notify();
           }
         },
         onReasoningDelta: (sid: string, delta: string) => {
           if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
-          const current = this.getLatestAssistantMessage();
-          if (current) {
-            current.reasoning = (current.reasoning || '') + delta;
-            this.notify();
-          }
+          const current = this.getOrCreateActiveAssistantMessage();
+          current.reasoning = (current.reasoning || '') + delta;
+          this.notify();
         },
         onToolStart: (sid: string, tool: ToolCallItem) => {
           if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
-          const current = this.getLatestAssistantMessage();
-          if (current) {
-            current.toolCalls = current.toolCalls || [];
+          const current = this.getOrCreateActiveAssistantMessage();
+          current.toolCalls = current.toolCalls || [];
+          const idx = current.toolCalls.findIndex(t => t.id === tool.id || (t.name === tool.name && t.status === 'running'));
+          if (idx >= 0) {
+            current.toolCalls[idx] = tool;
+          } else {
             current.toolCalls.push(tool);
-            this.notify();
           }
+          this.notify();
         },
         onToolComplete: (sid: string, tool: ToolCallItem) => {
           if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
-          const current = this.getLatestAssistantMessage();
+          const current = this.getOrCreateActiveAssistantMessage();
           if (current && current.toolCalls) {
             const idx = current.toolCalls.findIndex(t => t.id === tool.id || t.name === tool.name);
             if (idx >= 0) {
@@ -206,14 +235,20 @@ export class ChatViewModel {
             } else {
               current.toolCalls.push(tool);
             }
-            this.notify();
           }
+          if (this.currentApproval && (this.currentApproval.toolName === tool.name || (this.currentApproval.command && tool.input && tool.input.includes('print(1)')))) {
+            this.currentApproval = null;
+          }
+          this.notify();
         },
-        onMessageComplete: (sid: string) => {
+        onMessageComplete: (sid: string, text?: string) => {
           if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
           this.isGenerating = false;
           const current = this.getLatestAssistantMessage();
           if (current) {
+            if (text) {
+              current.content = text;
+            }
             current.status = 'complete';
           }
           this.notify();
@@ -223,6 +258,12 @@ export class ChatViewModel {
           this.isGenerating = running;
           if (model) {
             this.currentModel = model;
+          }
+          if (!running) {
+            const current = this.getLatestAssistantMessage();
+            if (current && current.status === 'streaming') {
+              current.status = 'complete';
+            }
           }
           this.notify();
         },
@@ -254,6 +295,17 @@ export class ChatViewModel {
           if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
           this.currentClarify = req;
           this.notify();
+        },
+        onRequestCancel: (sid: string, id: string, method: string) => {
+          if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
+          if (this.currentApproval && (this.currentApproval.id === id || this.currentApproval.requestId === id || !id)) {
+            this.currentApproval = null;
+            this.notify();
+          }
+          if (this.currentClarify && (this.currentClarify.id === id || this.currentClarify.requestId === id || !id)) {
+            this.currentClarify = null;
+            this.notify();
+          }
         }
       };
 
@@ -280,23 +332,41 @@ export class ChatViewModel {
   /**
    * 真实在服务端创建会话并切入
    */
-  public async createAndAttachNewSession(conn: BotConnection): Promise<string> {
+  public async createAndAttachNewSession(conn: BotConnection, cwd?: string): Promise<string> {
     if (!this.gateway) {
       throw new Error('网关尚未初始化');
     }
     const profile = conn.activeProfile || 'default';
-    const res = await this.gateway.createSession(profile);
+    const res = await this.gateway.createSession(profile, cwd);
     const newSessionId = String(res['session_id'] || res['id'] || '');
     if (!newSessionId) {
       throw new Error('服务端未返回有效 session_id');
     }
-    this.storedSessionId = newSessionId;
+    const storedId = String(res['stored_session_id'] || newSessionId);
+    this.storedSessionId = storedId;
     this.runtimeSessionId = newSessionId;
     this.gateway.setActiveRuntime(newSessionId);
     this.isConnected = true;
     this.messages = [];
     this.notify();
-    return newSessionId;
+    return storedId;
+  }
+
+  public getOrCreateActiveAssistantMessage(): ChatMessage {
+    let current = this.getLatestAssistantMessage();
+    if (!current || current.status === 'complete') {
+      current = {
+        id: `msg_ast_${Date.now()}`,
+        role: 'assistant',
+        content: '',
+        reasoning: '',
+        toolCalls: [],
+        status: 'streaming',
+        createdAt: Date.now()
+      };
+      this.messages.push(current);
+    }
+    return current;
   }
 
   private getLatestAssistantMessage(): ChatMessage | null {
@@ -365,7 +435,7 @@ export class ChatViewModel {
   }
 
   /**
-   * 提交审批决定 (可恢复，失败不吞错)
+   * 提交审批决定 (严格契约：使用内部 requestId，传递 'once' | 'session' | 'always' | 'deny'，失败保留重试)
    */
   public async submitApproval(choice: string): Promise<void> {
     if (!this.gateway || !this.currentApproval || this.isSubmittingApproval) {
@@ -375,8 +445,10 @@ export class ChatViewModel {
     this.notify();
 
     const req = this.currentApproval;
+    const targetSessionId = req.sessionId || this.runtimeSessionId;
+    const targetRequestId = req.requestId || req.id;
     try {
-      await this.gateway.respondApproval(this.runtimeSessionId, req.id, choice);
+      await this.gateway.respondApproval(targetSessionId, targetRequestId, choice);
       this.currentApproval = null;
     } catch (e) {
       this.toast(`审批提交失败，请重试: ${e}`);

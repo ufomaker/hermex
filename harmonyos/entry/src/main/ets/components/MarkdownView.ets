@@ -2,18 +2,14 @@ import { MarkdownBlock, parseMarkdownBlocks } from './MarkdownParser';
 
 @Component
 export struct MarkdownView {
-  @Prop content: string = '';
+  @Prop @Watch('updateBlocks') content: string = '';
   @State blocks: MarkdownBlock[] = [];
 
   aboutToAppear() {
     this.updateBlocks();
   }
 
-  aboutToUpdate() {
-    this.updateBlocks();
-  }
-
-  private updateBlocks() {
+  updateBlocks() {
     this.blocks = parseMarkdownBlocks(this.content);
   }
 
