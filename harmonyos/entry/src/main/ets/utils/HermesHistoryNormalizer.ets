@@ -34,9 +34,13 @@ export class HermesHistoryNormalizer {
     const messages: ChatMessage[] = [];
     // tool_call_id -> DeclaredCallMeta 映射表 (跨轮次与多调用关联)
     const declaredCalls = new Map<string, DeclaredCallMeta>();
-    // 当前轮次积累的工具结果与推理内容
+    // 当前轮次中已声明但尚未返回结果的工具调用 (tool_call_id -> ToolCallItem，初始 status: 'running')
+    const turnDeclaredTools = new Map<string, ToolCallItem>();
+    // 当前轮次积累的已完成/待绑定的工具结果与推理内容
     let pendingTools: ToolCallItem[] = [];
     let pendingReasoning: string[] = [];
+    // 追踪最后一条 user 消息在 messages 数组中的下标，用于严格约束轮次边界
+    let lastUserIndex = -1;
 
     for (let i = 0; i < rawMsgs.length; i++) {
       const row = rawMsgs[i];
@@ -58,25 +62,39 @@ export class HermesHistoryNormalizer {
         const toolCallId = row['tool_call_id'] ? String(row['tool_call_id']) : '';
         const fallbackName = row['tool_name'] ? String(row['tool_name']) : '';
         const rawContent = row['content'];
-
-        const matchedCall = toolCallId ? declaredCalls.get(toolCallId) : undefined;
-        const toolName = matchedCall?.name || fallbackName || 'tool';
-        const toolInput = matchedCall?.arguments;
-
         const parsedResult = HermesHistoryNormalizer.parseToolContent(rawContent);
 
-        const toolItem: ToolCallItem = {
-          id: toolCallId || `tool_call_${row['id'] || i}`,
-          name: toolName,
-          input: toolInput,
-          output: parsedResult.output,
-          status: parsedResult.isFailed ? 'failed' : 'completed'
-        };
+        // 优先匹配已声明的 running 工具调用并就地更新其 output 与 status
+        let matchedToolItem: ToolCallItem | undefined = undefined;
+        if (toolCallId && turnDeclaredTools.has(toolCallId)) {
+          matchedToolItem = turnDeclaredTools.get(toolCallId);
+          turnDeclaredTools.delete(toolCallId);
+        }
 
-        pendingTools.push(toolItem);
+        if (matchedToolItem) {
+          matchedToolItem.output = parsedResult.output;
+          matchedToolItem.status = parsedResult.isFailed ? 'failed' : 'completed';
+          if (fallbackName && (!matchedToolItem.name || matchedToolItem.name === 'tool')) {
+            matchedToolItem.name = fallbackName;
+          }
+          pendingTools.push(matchedToolItem);
+        } else {
+          // 未预先声明但直接返回结果的孤儿工具
+          const matchedCall = toolCallId ? declaredCalls.get(toolCallId) : undefined;
+          const toolName = matchedCall?.name || fallbackName || 'tool';
+          const toolInput = matchedCall?.arguments;
+          const toolItem: ToolCallItem = {
+            id: toolCallId || `tool_call_${row['id'] || i}`,
+            name: toolName,
+            input: toolInput,
+            output: parsedResult.output,
+            status: parsedResult.isFailed ? 'failed' : 'completed'
+          };
+          pendingTools.push(toolItem);
+        }
       } else if (roleStr === 'assistant') {
         // --- ASSISTANT 角色处理 ---
-        // 1. 提取声明的工具调用
+        // 1. 提取声明的工具调用，保留 running 状态，不丢弃运行态调用
         if (Array.isArray(row['tool_calls'])) {
           const calls = row['tool_calls'] as Array<Record<string, Object>>;
           for (let j = 0; j < calls.length; j++) {
@@ -108,6 +126,15 @@ export class HermesHistoryNormalizer {
               arguments: cargs
             };
             declaredCalls.set(cid, meta);
+
+            const toolItem: ToolCallItem = {
+              id: cid,
+              name: cname,
+              input: cargs,
+              output: undefined,
+              status: 'running' // 初始状态为 running，保留在运行态，不丢弃
+            };
+            turnDeclaredTools.set(cid, toolItem);
           }
         }
 
@@ -127,13 +154,14 @@ export class HermesHistoryNormalizer {
 
         if (hasContent || (!isToolDeclarationOnly && (pendingTools.length > 0 || pendingReasoning.length > 0))) {
           // 关联当前积累的工具结果与推理至本助手消息
+          const hasRunning = pendingTools.some(t => t.status === 'running');
           const astMsg: ChatMessage = {
             id: String(row['id'] || `msg_ast_${i}_${Date.now()}`),
             role: 'assistant',
             content: textContent,
             reasoning: pendingReasoning.length > 0 ? pendingReasoning.join('\n\n') : undefined,
             toolCalls: pendingTools.length > 0 ? pendingTools.slice() : undefined,
-            status: 'complete',
+            status: hasRunning ? 'streaming' : 'complete',
             createdAt: HermesHistoryNormalizer.parseTimestamp(row['timestamp'])
           };
           messages.push(astMsg);
@@ -143,8 +171,13 @@ export class HermesHistoryNormalizer {
         }
       } else if (roleStr === 'user') {
         // --- USER 角色处理 ---
-        // 先冲洗未落地的工具与推理（若前一轮未附着）
-        HermesHistoryNormalizer.flushPendingToLastAssistant(messages, pendingTools, pendingReasoning);
+        // 严格在当前轮次冲洗未落地的工具（包含未完成的 running 声明）与推理，绝不跨越 user 边界向前污染
+        const unfulfilledTools: ToolCallItem[] = [];
+        turnDeclaredTools.forEach((val) => { unfulfilledTools.push(val); });
+        turnDeclaredTools.clear();
+        const allPendingTools = pendingTools.concat(unfulfilledTools);
+
+        HermesHistoryNormalizer.flushPendingToCurrentTurn(messages, allPendingTools, pendingReasoning, lastUserIndex);
         pendingTools = [];
         pendingReasoning = [];
 
@@ -157,6 +190,7 @@ export class HermesHistoryNormalizer {
           createdAt: HermesHistoryNormalizer.parseTimestamp(row['timestamp'])
         };
         messages.push(userMsg);
+        lastUserIndex = messages.length - 1;
       } else {
         // --- 其他/未知角色处理 (system, custom) ---
         // 兼容未知字段，不静默丢弃
@@ -175,50 +209,61 @@ export class HermesHistoryNormalizer {
       }
     }
 
-    // 循环结束后若仍有未落地的工具调用或推理，补齐附着
-    HermesHistoryNormalizer.flushPendingToLastAssistant(messages, pendingTools, pendingReasoning);
+    // 循环结束后若仍有未落地的工具调用（包含尚未返回结果的 running 声明）或推理，补齐附着在当前轮次
+    const remainingTools: ToolCallItem[] = [];
+    turnDeclaredTools.forEach((val) => { remainingTools.push(val); });
+    turnDeclaredTools.clear();
+    const finalPendingTools = pendingTools.concat(remainingTools);
+
+    HermesHistoryNormalizer.flushPendingToCurrentTurn(messages, finalPendingTools, pendingReasoning, lastUserIndex);
 
     return messages;
   }
 
   /**
-   * 将剩余未落地的工具调用或推理挂载至最后一条助手消息，或新建纯工具承载消息
+   * 将当前轮次未落地的工具调用或推理挂载至当前轮次的助手消息，或新建当前轮次独立的容器消息
+   * 严格受限于 lastUserIndex 边界，绝不跨轮污染更早的轮次
    */
-  private static flushPendingToLastAssistant(
+  private static flushPendingToCurrentTurn(
     messages: ChatMessage[],
     pendingTools: ToolCallItem[],
-    pendingReasoning: string[]
+    pendingReasoning: string[],
+    lastUserIndex: number
   ): void {
     if (pendingTools.length === 0 && pendingReasoning.length === 0) {
       return;
     }
 
-    // 尝试寻找最后一条助手消息进行挂载
-    let lastAssistant: ChatMessage | null = null;
-    for (let k = messages.length - 1; k >= 0; k--) {
+    // 严格限制在当前轮次（即下标在 lastUserIndex 之后）寻找助手消息进行挂载
+    let currentTurnAssistant: ChatMessage | null = null;
+    for (let k = messages.length - 1; k > lastUserIndex; k--) {
       if (messages[k].role === 'assistant') {
-        lastAssistant = messages[k];
+        currentTurnAssistant = messages[k];
         break;
       }
     }
 
-    if (lastAssistant) {
+    if (currentTurnAssistant) {
       if (pendingTools.length > 0) {
-        lastAssistant.toolCalls = (lastAssistant.toolCalls || []).concat(pendingTools);
+        currentTurnAssistant.toolCalls = (currentTurnAssistant.toolCalls || []).concat(pendingTools);
       }
       if (pendingReasoning.length > 0) {
-        const prevR = lastAssistant.reasoning ? [lastAssistant.reasoning] : [];
-        lastAssistant.reasoning = prevR.concat(pendingReasoning).join('\n\n');
+        const prevR = currentTurnAssistant.reasoning ? [currentTurnAssistant.reasoning] : [];
+        currentTurnAssistant.reasoning = prevR.concat(pendingReasoning).join('\n\n');
+      }
+      if (pendingTools.some(t => t.status === 'running')) {
+        currentTurnAssistant.status = 'streaming';
       }
     } else {
-      // 若此前无助手消息，创建单独助手消息承载
+      // 当前轮次无助手消息，创建属于当前轮次的独立助手容器消息承载孤儿工具/推理
+      const hasRunning = pendingTools.some(t => t.status === 'running');
       const pendingMsg: ChatMessage = {
-        id: `msg_ast_pending_${Date.now()}`,
+        id: `msg_ast_pending_${Date.now()}_${messages.length}`,
         role: 'assistant',
         content: '',
         reasoning: pendingReasoning.length > 0 ? pendingReasoning.join('\n\n') : undefined,
         toolCalls: pendingTools.slice(),
-        status: 'complete',
+        status: hasRunning ? 'streaming' : 'complete',
         createdAt: Date.now()
       };
       messages.push(pendingMsg);

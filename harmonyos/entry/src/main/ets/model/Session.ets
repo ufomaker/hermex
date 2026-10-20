@@ -12,6 +12,7 @@ export interface HermesSession {
   model?: string;
   is_pinned?: boolean;
   is_archived?: boolean;
+  preview?: string;
 }
 
 export function cloneSession(s: HermesSession): HermesSession {
@@ -25,7 +26,8 @@ export function cloneSession(s: HermesSession): HermesSession {
     running: s.running,
     model: s.model,
     is_pinned: s.is_pinned,
-    is_archived: s.is_archived
+    is_archived: s.is_archived,
+    preview: s.preview
   };
   return result;
 }

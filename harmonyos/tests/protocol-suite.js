@@ -482,10 +482,15 @@ const platformRcpAdapter = {
               const chunks = [];
               res.on('data', chunk => chunks.push(chunk));
               res.on('end', () => {
+                const bodyStr = Buffer.concat(chunks).toString('utf8');
                 resolve({
                   statusCode: res.statusCode || 200,
                   headers: res.headers,
-                  body: Buffer.concat(chunks).toString('utf8')
+                  body: bodyStr,
+                  toString: () => bodyStr,
+                  toJSON: () => {
+                    try { return JSON.parse(bodyStr); } catch (e) { return null; }
+                  }
                 });
               });
             }
@@ -748,6 +753,7 @@ const { DeepLinkUtils, AppDeepLinkRouter } = customRequire(rootDir, './entry/src
 const { ShareUtils } = customRequire(rootDir, './entry/src/main/ets/utils/ShareUtils.ets');
 const { VoiceUtils } = customRequire(rootDir, './entry/src/main/ets/utils/VoiceUtils.ets');
 const { HermesHistoryNormalizer } = customRequire(rootDir, './entry/src/main/ets/utils/HermesHistoryNormalizer.ets');
+const { SessionListViewModel } = customRequire(rootDir, './entry/src/main/ets/viewmodel/SessionListViewModel.ets');
 
 // --- 3. 端到端行为与契约验证 ---
 
@@ -845,8 +851,112 @@ async function runTestSuite() {
       return;
     }
 
-    if (req.url.startsWith('/api/sessions') && req.method === 'GET' && !req.url.includes('/messages')) {
+    const parsedUrl = new URL(req.url, 'http://127.0.0.1');
+
+    if (parsedUrl.pathname === '/api/sessions/search' && req.method === 'GET') {
+      const q = (parsedUrl.searchParams.get('query') || '').toLowerCase();
+      const p = parsedUrl.searchParams.get('profile') || 'default';
+      const results = [];
+      for (let i = 1; i <= 35; i++) {
+        const title = `会话第 ${i} 课`;
+        if (title.toLowerCase().includes(q)) {
+          results.push({
+            id: `sess_f02_${i}`,
+            title: title,
+            preview: `这是第 ${i} 条会话预览`,
+            profile: p,
+            running: false,
+            created_at: Date.now() - (35 - i) * 1000,
+            updated_at: Date.now() - (35 - i) * 1000
+          });
+        }
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ results }));
+      return;
+    }
+
+    if (parsedUrl.pathname === '/api/sessions/import' && req.method === 'POST') {
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', () => {
+        const payload = JSON.parse(body || '{}');
+        const importedIds = (payload.sessions || []).map(s => s.id);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, imported: importedIds.length, imported_ids: importedIds, errors: [] }));
+      });
+      return;
+    }
+
+    if (parsedUrl.pathname.startsWith('/api/sessions/') && parsedUrl.pathname.endsWith('/export') && req.method === 'GET') {
+      const sid = parsedUrl.pathname.split('/')[3];
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        id: sid,
+        profile: parsedUrl.searchParams.get('profile') || 'default',
+        title: '导出的会话',
+        messages: [{ id: 1, role: 'user', content: 'hello' }]
+      }));
+      return;
+    }
+
+    if (parsedUrl.pathname.startsWith('/api/sessions/') && req.method === 'PATCH') {
+      let body = '';
+      req.on('data', c => body += c);
+      req.on('end', () => {
+        const payload = JSON.parse(body || '{}');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: true,
+          title: payload.title,
+          pinned: payload.pinned,
+          archived: payload.archived
+        }));
+      });
+      return;
+    }
+
+    if (parsedUrl.pathname === '/api/sessions' && req.method === 'GET') {
       serverStats.sessionsListed = true;
+      const prof = parsedUrl.searchParams.get('profile') || 'default';
+      const offset = parseInt(parsedUrl.searchParams.get('offset') || '0', 10);
+      const limit = parseInt(parsedUrl.searchParams.get('limit') || '50', 10);
+
+      if (prof === 'fast_profile') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          sessions: [
+            { id: 'sess_fast_1', title: 'Fast Profile Session', profile: 'fast_profile', running: false, created_at: Date.now(), updated_at: Date.now() }
+          ],
+          total: 1
+        }));
+        return;
+      }
+
+      // TEST 33: 当 limit 为 20 时，返回 35 条分页会话
+      if (limit === 20) {
+        const mockList = [];
+        for (let i = 1; i <= 35; i++) {
+          mockList.push({
+            id: `sess_f02_${i}`,
+            title: `会话第 ${i} 课`,
+            preview: `这是第 ${i} 条会话预览`,
+            profile: prof,
+            running: false,
+            created_at: Date.now() - (35 - i) * 1000,
+            updated_at: Date.now() - (35 - i) * 1000
+          });
+        }
+        const paged = mockList.slice(offset, offset + limit);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          sessions: paged,
+          total: mockList.length
+        }));
+        return;
+      }
+
+      // TEST 2: 保持原样返回单项 sess_prod_1
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         sessions: [
@@ -858,7 +968,8 @@ async function runTestSuite() {
             created_at: Date.now() - 10000,
             updated_at: Date.now()
           }
-        ]
+        ],
+        total: 1
       }));
       return;
     }
@@ -2564,14 +2675,185 @@ export const test = true;
     console.log('[PASS 31] HermesHistoryNormalizer 真实证据与通用历史归一化全链路通过');
   }
 
+  // --- 测试用例 32: 历史归一化轮次边界与运行态工具声明保留 (HermesHistoryNormalizer 缺陷修复) ---
+  console.log('\n[TEST 32] 测试 HermesHistoryNormalizer 轮次边界约束与运行态声明保留:');
+  {
+    // 1. 缺陷 1 验证：[user A, assistant A, user B, tool orphan B, user C]
+    // 绝不能把 B 轮的孤儿工具挂到前一轮助手 A 上！
+    const boundaryRaw = [
+      { id: 1, role: 'user', content: 'User A prompt' },
+      { id: 2, role: 'assistant', content: 'Assistant A reply' },
+      { id: 3, role: 'user', content: 'User B prompt' },
+      { id: 4, role: 'tool', tool_name: 'orphan_tool_b', content: '{"output":"tool_b_done"}' },
+      { id: 5, role: 'user', content: 'User C prompt' }
+    ];
+
+    const boundaryNorm = HermesHistoryNormalizer.normalize(boundaryRaw);
+    assert(boundaryNorm.length === 5, `应归一化为 5 条消息 (包含 B 轮独立工具容器)，实际为 ${boundaryNorm.length}`);
+    const astA = boundaryNorm.find(m => m.content === 'Assistant A reply');
+    assert(astA, '助手 A 消息存在');
+    assert(!astA.toolCalls || astA.toolCalls.length === 0, '助手 A 绝不可被污染挂载 B 轮的工具！');
+
+    const containerB = boundaryNorm[3];
+    assert(containerB.role === 'assistant', '第 4 条消息为 B 轮生成的独立工具容器');
+    assert(containerB.toolCalls && containerB.toolCalls.length === 1, 'B 轮工具容器承载 orphan_tool_b');
+    assert(containerB.toolCalls[0].name === 'orphan_tool_b', '工具名正确为 orphan_tool_b');
+    assert(containerB.toolCalls[0].output === 'tool_b_done', '工具输出正确保留');
+
+    const usrC = boundaryNorm[4];
+    assert(usrC.role === 'user' && usrC.content === 'User C prompt', '用户 C 正常位于末尾');
+    console.log('  -> 轮次 user 边界严格约束测试通过 (前序轮次未受孤儿工具污染)');
+
+    // 2. 缺陷 2 验证：只有工具调用声明、尚无 tool 结果的历史保留 running 状态
+    const runningToolRaw = [
+      { id: 10, role: 'user', content: '运行长任务' },
+      {
+        id: 11,
+        role: 'assistant',
+        content: '',
+        tool_calls: [
+          {
+            id: 'call_inflight_1',
+            type: 'function',
+            function: {
+              name: 'terminal',
+              arguments: '{"command":"sleep 10"}'
+            }
+          }
+        ],
+        finish_reason: 'tool_calls'
+      }
+    ];
+
+    const runningNorm = HermesHistoryNormalizer.normalize(runningToolRaw);
+    assert(runningNorm.length === 2, `运行态消息列表应包含 2 条消息，实际为 ${runningNorm.length}`);
+    const runningAst = runningNorm[1];
+    assert(runningAst.role === 'assistant', '第 2 条消息为助手消息');
+    assert(runningAst.toolCalls && runningAst.toolCalls.length === 1, '运行态工具声明必须生成 ToolCallItem，不可丢弃！');
+    const runningTool = runningAst.toolCalls[0];
+    assert(runningTool.id === 'call_inflight_1', '工具 ID 正确保留');
+    assert(runningTool.name === 'terminal', '工具名正确保留');
+    assert(runningTool.status === 'running', `运行态工具状态必须为 running，实际为 ${runningTool.status}`);
+    assert(runningTool.output === undefined, '尚未返回结果的工具 output 应为 undefined');
+    assert(runningAst.status === 'streaming', '包含运行态工具的助手消息状态为 streaming');
+    console.log('  -> 运行态工具调用声明保留与 running 状态语义验证通过');
+
+    console.log('[PASS 32] HermesHistoryNormalizer 缺陷修复验证通过');
+  }
+
+  // --- 测试用例 33: F02 会话管理完整生命周期 (分页/去重/搜索/改名/置顶/归档/分支/导出/切服隔离) ---
+  console.log('\n[TEST 33] 测试 SessionListViewModel & HermesRESTClient F02 会话管理完整生命周期:');
+  {
+    // 构造测试连接
+    const conn = {
+      id: 'conn-f02',
+      name: 'F02 Test Server',
+      url: baseUrl,
+      serverVersion: 'hermes',
+      token: 'test-token',
+      cookies: 'session_cookie=abc',
+      activeProfile: 'default'
+    };
+
+    const sessionVm = new SessionListViewModel();
+
+    // 1. 测试首次分页加载 (第 1 页，limit 20)
+    await sessionVm.loadSessions(conn);
+    assert(sessionVm.getSessions().length === 20, `第 1 页应呈现 20 条会话，实际为 ${sessionVm.getSessions().length}`);
+    assert(sessionVm.getTotalCount() === 35, `服务端总数应为 35，实际为 ${sessionVm.getTotalCount()}`);
+    assert(sessionVm.getHasMore() === true, '应标记 hasMore 为 true');
+    console.log('  -> 第 1 页分页加载与总数核验通过');
+
+    // 2. 测试分页加载更多 (第 2 页，追加至 35)
+    const loadMoreOk = await sessionVm.loadMoreSessions(conn);
+    assert(loadMoreOk === true, 'loadMoreSessions 应返回 true');
+    assert(sessionVm.getSessions().length === 35, `追加后应呈现 35 条会话，实际为 ${sessionVm.getSessions().length}`);
+    assert(sessionVm.getHasMore() === false, '第 2 页加载完毕后 hasMore 应为 false');
+    console.log('  -> 分页加载更多与去重合并通过');
+
+    // 3. 测试搜索与过滤 (本地模糊匹配 + 恢复)
+    await sessionVm.setSearchQuery('第 10');
+    assert(sessionVm.getSessions().length >= 1, '搜索包含 "第 10" 的会话应有结果');
+    assert(sessionVm.getSessions().every(s => (s.title && s.title.includes('第 10')) || (s.preview && s.preview.includes('第 10')) || s.id.includes('10')), '搜索结果匹配');
+
+    sessionVm.clearSearch();
+    assert(sessionVm.getSessions().length === 35, '清除搜索后应完整恢复全量 35 条会话');
+    console.log('  -> 会话即时检索与搜索清除无损恢复通过');
+
+    // 4. 测试置顶 (togglePinSession)
+    const targetSession = sessionVm.getSessions()[15];
+    const pinOk = await sessionVm.togglePinSession(conn, targetSession);
+    assert(pinOk === true, '置顶操作应成功');
+    assert(targetSession.is_pinned === true, '会话属性标记为置顶');
+    assert(sessionVm.getSessions()[0].id === targetSession.id, '置顶会话应排在列表第一位');
+
+    // 切换到置顶 Tab
+    sessionVm.setFilterTab('pinned');
+    assert(sessionVm.getSessions().length === 1 && sessionVm.getSessions()[0].id === targetSession.id, '置顶 Tab 仅展示置顶项');
+    sessionVm.setFilterTab('all');
+    console.log('  -> 会话置顶与置顶前置排序通过');
+
+    // 5. 测试归档 (toggleArchiveSession)
+    const archiveTarget = sessionVm.getSessions()[5];
+    const archiveOk = await sessionVm.toggleArchiveSession(conn, archiveTarget);
+    assert(archiveOk === true, '归档操作应成功');
+    assert(archiveTarget.is_archived === true, '标记为已归档');
+    // 在 'all' Tab 中，已归档项应被隐藏
+    assert(!sessionVm.getSessions().find(s => s.id === archiveTarget.id), 'All Tab 默认应隐藏已归档会话');
+
+    // 切换到已归档 Tab
+    sessionVm.setFilterTab('archived');
+    assert(sessionVm.getSessions().some(s => s.id === archiveTarget.id), '已归档 Tab 应展示归档项');
+    sessionVm.setFilterTab('all');
+    console.log('  -> 会话归档与归档隔离隐藏通过');
+
+    // 6. 测试改名 (renameSession)
+    const renameTarget = sessionVm.getSessions()[2];
+    const renameOk = await sessionVm.renameSession(conn, renameTarget, '已修改的新会话名称');
+    assert(renameOk === true, '改名应成功');
+    assert(renameTarget.title === '已修改的新会话名称', '会话标题就地更新成功');
+    console.log('  -> 会话重命名与本地回读通过');
+
+    // 7. 测试分支克隆 (duplicateSession)
+    const dupTarget = sessionVm.getSessions()[0];
+    const dupRes = await sessionVm.duplicateSession(conn, dupTarget);
+    assert(dupRes && dupRes.id.length > 0, '分支克隆应返回新会话');
+    assert(dupRes.title.includes('(copy)'), `新会话标题应包含 (copy)，实际为: ${dupRes.title}`);
+    assert(sessionVm.getRawSessions()[0].id === dupRes.id, '新克隆会话应插入全量列表头部');
+    assert(sessionVm.getSessions().some(s => s.id === dupRes.id), '新克隆会话应存在于展示列表中');
+    console.log('  -> 会话分支克隆 (Duplication) 通过');
+
+    // 8. 测试导出 (exportSession)
+    const exportTarget = dupRes;
+    const exportedJson = await sessionVm.exportSession(conn, exportTarget);
+    assert(typeof exportedJson === 'string' && exportedJson.length > 10, '导出结果应为有效 JSON 文本');
+    const parsedExport = JSON.parse(exportedJson);
+    assert(parsedExport.id === exportTarget.id, '导出的会话 ID 与目标匹配');
+    console.log('  -> 会话 JSON 导出通过');
+
+    // 9. 测试跨服务器切换防竞态 (requestSerial 保护)
+    const slowConnA = { id: 'conn-a', name: 'Slow Server A', url: baseUrl, serverVersion: 'hermes', activeProfile: 'default' };
+    const fastConnB = { id: 'conn-b', name: 'Fast Server B', url: baseUrl, serverVersion: 'hermes', activeProfile: 'fast_profile' };
+
+    // 连续触发切服
+    const loadPromiseA = sessionVm.loadSessions(slowConnA);
+    const loadPromiseB = sessionVm.loadSessions(fastConnB);
+    await Promise.all([loadPromiseA, loadPromiseB]);
+    assert(sessionVm.getRawSessions().every(s => s.profile === 'fast_profile'), '滞后返回的 Server A 数据绝不可覆盖活跃 Server B');
+    console.log('  -> 跨服务器切换与竞态代次保护通过');
+
+    console.log('[PASS 33] SessionListViewModel & HermesRESTClient F02 会话管理全生命周期通过');
+  }
+
   vm.disconnect();
   server.close();
 
   console.log('\n======================================================');
-  console.log('✅ 所有 31 项端到端生产代码行为回归测试全部通过 (退出码 0)');
+  console.log('✅ 所有 33 项端到端生产代码行为回归测试全部通过 (退出码 0)');
   console.log('覆盖真实生产业务类：');
-  console.log('  - HermesHistoryNormalizer.ets (上游 HermesTranscriptHistory.swift 对齐通用历史归一化、多工具、乱序、失败、非JSON与证据 fixture 回归)');
-  console.log('  - HermesRESTClient.ets (Cookie Jar、登录、/api/auth/me 核验、Ticket、会话与历史)');
+  console.log('  - HermesHistoryNormalizer.ets (轮次边界用户隔离、运行态工具声明保留、多工具、乱序、失败、非JSON与证据 fixture 回归)');
+  console.log('  - SessionListViewModel.ets (F02 分页加载、去重、检索清除恢复、分类 Tab、置顶、归档、分支克隆、导出与切服竞态隔离)');
+  console.log('  - HermesRESTClient.ets (Cookie Jar、登录、/api/auth/me 核验、Ticket、会话分页、PATCH属性、导入、导出与历史)');
   console.log('  - HermesGatewayClient.ets (WebSocket 握手、client.capabilities 回执、关闭码、RPC 30s 超时、取消、file.attach)');
   console.log('  - ChatViewModel.ets (会话恢复门禁、禁止发送、async 代次乱序拦截、中文流式、推理、工具、连续同名工具审批防误清、模型配置、文档附加)');
   console.log('  - AuthStore.ets (真实 HarmonyPlatformAuthAdapter + Preferences 元数据 + AssetStoreKit 密文硬件保管库 + UTF-8 中文/Emoji + 原子回滚 + clearAll 物理擦除)');

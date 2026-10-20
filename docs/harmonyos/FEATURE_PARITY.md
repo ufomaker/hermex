@@ -1,17 +1,17 @@
 # Hermex 鸿蒙功能移植对照表 (Feature Parity Matrix)
 
-最后更新：2026-10-21 05:16 (Run 16 阶段更新)
+最后更新：2026-10-21 06:00 (Run 17 阶段更新)
 
 > **验收标准分层说明**：
 > 1. **代码实现 (Implementation)**：ArkTS 生产代码、网络协议客户端、ViewModel 及原生 ArkUI 入口是否完整实现并接入主界面。
-> 2. **本地与模拟器端到端验证 (Verification)**：DevEco Studio SDK API12 真实编译 (`assembleHap` 退出码 0)、30 项全生命周期行为回归测试、以及在 OpenHarmony 6 官方模拟器（`127.0.0.1:5555`）上运行官方 `ohosTest` Hypium UiTest 走完完整用户旅程。
+> 2. **本地与模拟器端到端验证 (Verification)**：DevEco Studio SDK API12 真实编译 (`assembleHap` 退出码 0)、33 项全生命周期行为回归测试、以及在 OpenHarmony 6 官方模拟器（`127.0.0.1:5555`）上运行官方 `ohosTest` Hypium UiTest 走完完整用户旅程。
 > 3. **真机验收 (Device Verification)**：HarmonyOS 6.1.0 真机由监督者独立执行的安装、交互与回读验证。严禁将本地测试通过夸大为真机验收。
 
 | 编号 | 功能模块 | 上游 iOS 源码位置 | 鸿蒙实现源码与 UI 入口 | 代码实现 | 本地与模拟器验证 | 真机验收 | 现状与证据说明 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| F01 | 连接与认证 | `HermesConnection.swift`, `HermesREST.swift` | `HermesRESTClient.ets`, `AuthStore.ets`, `ConnectionViewModel.ets`, `Index.ets` (服务器弹窗) | ✅ 已实现 | ✅ 30 项回归 + UiTest 通过 | ✅ 真机验证通过 | 支持多服务器、版本探测、Cookie Jar携带与 `/api/auth/me` 核验；Preferences 元数据 + `@ohos.security.asset` 硬件密文保管库；真机与模拟器UiTest均验证通过 |
-| F02 | 会话管理 | `SessionList/`, `HermesSessionActions.swift` | `SessionListViewModel.ets`, `Index.ets` (会话列表抽屉) | ✅ 已实现 | ✅ 本地与UiTest全通过 | ✅ 真机验证通过 | 服务端真实 `session.create` 新建、`session.resume` 恢复、历史消息回填、恢复失败安全门禁拦截；UiTest在模拟器界面点击新建会话并成功接入真实 session |
-| F03 | 原生聊天 | `Chat/`, `ChatTurnCoordinator.swift` | `ChatViewModel.ets`, `HermesHistoryNormalizer.ets`, `MarkdownView.ets`, `Index.ets` | ✅ 已实现 | ✅ 模拟器官方UiTest通过 | 🟡 待真机复验 | 中文流式、推理折叠、Markdown解析；对齐 upstream Universal History Normalization，消除 tool JSON 气泡；模拟器UiTest实机回读终态回复 `"The command returned: 1."`，断线重连历史无损 |
+| F01 | 连接与认证 | `HermesConnection.swift`, `HermesREST.swift` | `HermesRESTClient.ets`, `AuthStore.ets`, `ConnectionViewModel.ets`, `Index.ets` (服务器弹窗) | ✅ 已实现 | ✅ 33 项回归 + UiTest 通过 | ✅ 真机验证通过 | 支持多服务器、版本探测、Cookie Jar携带与 `/api/auth/me` 核验；Preferences 元数据 + `@ohos.security.asset` 硬件密文保管库；真机与模拟器UiTest均验证通过 |
+| F02 | 会话管理 | `SessionList/`, `HermesSessionActions.swift` | `SessionListViewModel.ets`, `Index.ets` (会话列表抽屉) | ✅ 已实现 | ✅ 33 项回归 + 模拟器官方UiTest全流程通过 | 🟡 待真机复验 | 完整对齐上游 `HermesSessionActions.swift` 与 `SessionListViewModel.swift`：分页加载与去重、即时模糊搜索与一键清除恢复、分类Tab（全部/置顶/归档）、改名弹窗、置顶/取消置顶前置排序、归档/恢复、分支克隆 (Duplication)、JSON 导出；切服与竞态代次保护；严格禁止删除（非破坏性）；模拟器 `testSessionManagementUserFlow` 自动化交互全绿 |
+| F03 | 原生聊天 | `Chat/`, `ChatTurnCoordinator.swift` | `ChatViewModel.ets`, `HermesHistoryNormalizer.ets`, `MarkdownView.ets`, `Index.ets` | ✅ 已实现 | ✅ 模拟器官方UiTest通过 | 🟡 待真机复验 | 中文流式、推理折叠、Markdown解析；落实 REVIEW_RUN16 两大历史归一化缺陷（轮次 user 边界严格约束、运行态工具声明保留为 running 状态机卡片）；模拟器UiTest实机回读终态回复 `"The command returned: 1."`，断线重连历史无损 |
 | F04 | 实时控制与审批 | `HermesCall.swift` (`approvalRespond`, `sessionInterrupt`, `clarifyLock`) | `HermesGatewayClient.ets`, `ChatViewModel.ets`, `Index.ets` (审批/澄清卡片) | ✅ 已实现 | ✅ 模拟器官方UiTest通过 | 🟡 待真机复验 | 严格按请求 ID 与 async 代次处理审批生命周期；模拟器UiTest实机检测到审批卡片，点击【允许一次】(`btn_approval_once`)，服务端执行 `python3 -c "print(1)"`，断言卡片彻底销毁、发送恢复与工具卡片正确呈现 |
 | F05 | 模型与参数配置 | `HermesModelCatalog.swift`, `HermesCall.swift` (`modelOptions`, `config.set`) | `ChatViewModel.ets`, `Index.ets` (模型弹窗) | ✅ 已实现 | ✅ 本地与9199通过 (测试 10) | ⚪ 待真机操作 | 真实获取服务端 `model.options`，并通过 `config.set` 写回活跃会话模型配置 |
 | F06 | 项目与工作区 | `HermesProjects.swift`, `HermesWorkspaceFileClient.swift` | `HermesWorkspaceClient.ets`, `WorkspaceViewModel.ets`, `GitWorkspaceViewModel.ets`, `Index.ets` | ✅ 已实现 | ✅ 本地回归通过 (测试 12, 13, 21) | ⚪ 待真机操作 | 路径遍历防线（拒绝 `../`, `/`, `~`, `\0`）、目录层级导航、文本查看、Git 分支切换 |

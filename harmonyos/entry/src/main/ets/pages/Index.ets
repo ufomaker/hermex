@@ -51,6 +51,12 @@ struct Index {
   @State currentSessionId: string = '';
   @State showServerDialog: boolean = false;
   @State showSessionListDialog: boolean = false;
+  @State sessionSearchQuery: string = '';
+  @State sessionFilterTab: 'all' | 'pinned' | 'archived' = 'all';
+  @State showRenameDialog: boolean = false;
+  @State renameInputText: string = '';
+  private renameTargetSession: HermesSession | null = null;
+  @State isOperatingSession: boolean = false;
   @State showModelDialog: boolean = false;
   @State showWorkspaceDialog: boolean = false;
   @State showAttachmentDialog: boolean = false;
@@ -549,6 +555,109 @@ struct Index {
       this.sessions = await this.sessionVm.loadSessions(cur);
     } catch (e) {
       // ignore
+    }
+  }
+
+  private async onSessionSearchChanged(q: string) {
+    this.sessionSearchQuery = q;
+    const cur = this.connVm.getCurrentConnection();
+    await this.sessionVm.setSearchQuery(q, cur || undefined);
+    this.sessions = this.sessionVm.getSessions();
+  }
+
+  private onClearSessionSearch() {
+    this.sessionSearchQuery = '';
+    this.sessionVm.clearSearch();
+    this.sessions = this.sessionVm.getSessions();
+  }
+
+  private onSessionFilterTabChanged(tab: 'all' | 'pinned' | 'archived') {
+    this.sessionFilterTab = tab;
+    this.sessionVm.setFilterTab(tab);
+    this.sessions = this.sessionVm.getSessions();
+  }
+
+  private openRenameSessionDialog(session: HermesSession) {
+    this.renameTargetSession = session;
+    this.renameInputText = session.title || '';
+    this.showRenameDialog = true;
+  }
+
+  private async confirmRenameSession() {
+    if (!this.renameTargetSession) return;
+    const cur = this.connVm.getCurrentConnection();
+    if (!cur) return;
+    this.isOperatingSession = true;
+    try {
+      const ok = await this.sessionVm.renameSession(cur, this.renameTargetSession, this.renameInputText);
+      if (ok) {
+        this.sessions = this.sessionVm.getSessions();
+        if (this.currentSessionId === this.renameTargetSession.id) {
+          this.currentSessionTitle = this.renameInputText.trim();
+        }
+        this.showToast('会话已重命名');
+      } else {
+        this.showToast(this.sessionVm.getActionError() || '重命名失败');
+      }
+    } finally {
+      this.isOperatingSession = false;
+      this.showRenameDialog = false;
+      this.renameTargetSession = null;
+    }
+  }
+
+  private async togglePinSession(session: HermesSession) {
+    const cur = this.connVm.getCurrentConnection();
+    if (!cur) return;
+    const ok = await this.sessionVm.togglePinSession(cur, session);
+    if (ok) {
+      this.sessions = this.sessionVm.getSessions();
+      this.showToast(session.is_pinned ? '已置顶会话' : '已取消置顶');
+    }
+  }
+
+  private async toggleArchiveSession(session: HermesSession) {
+    const cur = this.connVm.getCurrentConnection();
+    if (!cur) return;
+    const ok = await this.sessionVm.toggleArchiveSession(cur, session);
+    if (ok) {
+      this.sessions = this.sessionVm.getSessions();
+      this.showToast(session.is_archived ? '已归档会话' : '已恢复会话');
+    }
+  }
+
+  private async duplicateSession(session: HermesSession) {
+    const cur = this.connVm.getCurrentConnection();
+    if (!cur) return;
+    this.showToast('正在分支克隆会话...');
+    try {
+      const cloned = await this.sessionVm.duplicateSession(cur, session);
+      this.sessions = this.sessionVm.getSessions();
+      this.showToast(`成功分支会话: ${cloned.title}`);
+    } catch (e) {
+      this.showToast(`分支失败: ${(e as Error).message || String(e)}`);
+    }
+  }
+
+  private async exportSession(session: HermesSession) {
+    const cur = this.connVm.getCurrentConnection();
+    if (!cur) return;
+    try {
+      const jsonStr = await this.sessionVm.exportSession(cur, session);
+      const ctx = getContext(this) as common.UIAbilityContext;
+      await ShareUtils.shareText(ctx, jsonStr, `Export_${session.id}.json`);
+      this.showToast('已拉取导出数据并唤起分享');
+    } catch (e) {
+      this.showToast(`导出失败: ${(e as Error).message || String(e)}`);
+    }
+  }
+
+  private async loadMoreSessions() {
+    const cur = this.connVm.getCurrentConnection();
+    if (!cur) return;
+    const ok = await this.sessionVm.loadMoreSessions(cur);
+    if (ok) {
+      this.sessions = this.sessionVm.getSessions();
     }
   }
 
@@ -1451,11 +1560,11 @@ struct Index {
         .position({ x: '5%', y: '15%' })
       }
 
-      // 7. 会话历史列表弹窗
+      // 7. 会话历史列表与管理弹窗 (F02)
       if (this.showSessionListDialog) {
         Column() {
           Row() {
-            Text('会话历史')
+            Text('会话管理')
               .fontSize(18)
               .fontWeight(FontWeight.Bold)
             Blank()
@@ -1469,31 +1578,175 @@ struct Index {
               })
           }
           .width('100%')
-          .margin({ bottom: 12 })
+          .margin({ bottom: 8 })
 
+          // 搜索栏与清除按钮
+          Row() {
+            TextInput({ text: this.sessionSearchQuery, placeholder: '搜索会话标题、预览或ID...' })
+              .id('input_session_search')
+              .fontSize(13)
+              .layoutWeight(1)
+              .height(36)
+              .backgroundColor('#F3F4F6')
+              .borderRadius(8)
+              .onChange((val: string) => {
+                this.onSessionSearchChanged(val);
+              })
+            if (this.sessionSearchQuery.length > 0) {
+              Button('✕')
+                .id('btn_clear_session_search')
+                .fontSize(12)
+                .width(36)
+                .height(36)
+                .backgroundColor('#E5E7EB')
+                .fontColor('#4B5563')
+                .margin({ left: 6 })
+                .onClick(() => {
+                  this.onClearSessionSearch();
+                })
+            }
+          }
+          .width('100%')
+          .margin({ bottom: 8 })
+
+          // 分类过滤 Chips: 全部 / 置顶 / 归档
+          Row({ space: 8 }) {
+            Button('全部')
+              .id('tab_session_all')
+              .fontSize(12)
+              .height(28)
+              .backgroundColor(this.sessionFilterTab === 'all' ? '#007AFF' : '#E5E7EB')
+              .fontColor(this.sessionFilterTab === 'all' ? '#FFFFFF' : '#374151')
+              .onClick(() => {
+                this.onSessionFilterTabChanged('all');
+              })
+
+            Button('置顶 📌')
+              .id('tab_session_pinned')
+              .fontSize(12)
+              .height(28)
+              .backgroundColor(this.sessionFilterTab === 'pinned' ? '#007AFF' : '#E5E7EB')
+              .fontColor(this.sessionFilterTab === 'pinned' ? '#FFFFFF' : '#374151')
+              .onClick(() => {
+                this.onSessionFilterTabChanged('pinned');
+              })
+
+            Button('已归档 📦')
+              .id('tab_session_archived')
+              .fontSize(12)
+              .height(28)
+              .backgroundColor(this.sessionFilterTab === 'archived' ? '#007AFF' : '#E5E7EB')
+              .fontColor(this.sessionFilterTab === 'archived' ? '#FFFFFF' : '#374151')
+              .onClick(() => {
+                this.onSessionFilterTabChanged('archived');
+              })
+          }
+          .width('100%')
+          .margin({ bottom: 10 })
+
+          // 会话列表
           List({ space: 8 }) {
             ForEach(this.sessions, (s: HermesSession) => {
               ListItem() {
-                Row() {
-                  Column() {
+                Column() {
+                  Row() {
+                    if (s.is_pinned) {
+                      Text('📌 ')
+                        .fontSize(13)
+                    }
+                    if (s.is_archived) {
+                      Text('[已归档] ')
+                        .fontSize(11)
+                        .fontColor('#EF4444')
+                    }
                     Text(s.title || '会话')
-                      .fontSize(15)
+                      .id(`txt_session_title_${s.id}`)
+                      .fontSize(14)
                       .fontWeight(FontWeight.Medium)
-                    Text(`Profile: ${s.profile || 'default'} | ID: ${s.id}`)
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      .layoutWeight(1)
+
+                    Button('进入')
+                      .id(`btn_enter_session_${s.id}`)
                       .fontSize(11)
-                      .fontColor('#8E8E93')
+                      .height(24)
+                      .backgroundColor('#E0F2FE')
+                      .fontColor('#0284C7')
+                      .onClick(() => {
+                        this.switchSession(s);
+                      })
+                  }
+                  .width('100%')
+
+                  if (s.preview && s.preview.trim().length > 0) {
+                    Text(s.preview)
+                      .id(`txt_session_preview_${s.id}`)
+                      .fontSize(11)
+                      .fontColor('#4B5563')
+                      .maxLines(1)
+                      .textOverflow({ overflow: TextOverflow.Ellipsis })
                       .margin({ top: 2 })
                   }
-                  .alignItems(HorizontalAlign.Start)
-                  .layoutWeight(1)
 
-                  Button('进入')
-                    .fontSize(12)
-                    .backgroundColor('#E5E5EA')
-                    .fontColor('#007AFF')
-                    .onClick(() => {
-                      this.switchSession(s);
-                    })
+                  Text(`Profile: ${s.profile || 'default'} | ID: ${s.id}`)
+                    .fontSize(10)
+                    .fontColor('#9CA3AF')
+                    .margin({ top: 2 })
+
+                  // 非破坏性操作按钮栏: 置顶、归档、改名、分支、导出 (无删除)
+                  Row({ space: 6 }) {
+                    Button(s.is_pinned ? '取消置顶' : '置顶')
+                      .id(`btn_pin_session_${s.id}`)
+                      .fontSize(10)
+                      .height(22)
+                      .backgroundColor('#F3F4F6')
+                      .fontColor('#374151')
+                      .onClick(() => {
+                        this.togglePinSession(s);
+                      })
+
+                    Button(s.is_archived ? '恢复' : '归档')
+                      .id(`btn_archive_session_${s.id}`)
+                      .fontSize(10)
+                      .height(22)
+                      .backgroundColor('#F3F4F6')
+                      .fontColor('#374151')
+                      .onClick(() => {
+                        this.toggleArchiveSession(s);
+                      })
+
+                    Button('改名')
+                      .id(`btn_rename_session_${s.id}`)
+                      .fontSize(10)
+                      .height(22)
+                      .backgroundColor('#F3F4F6')
+                      .fontColor('#374151')
+                      .onClick(() => {
+                        this.openRenameSessionDialog(s);
+                      })
+
+                    Button('分支')
+                      .id(`btn_duplicate_session_${s.id}`)
+                      .fontSize(10)
+                      .height(22)
+                      .backgroundColor('#F3F4F6')
+                      .fontColor('#374151')
+                      .onClick(() => {
+                        this.duplicateSession(s);
+                      })
+
+                    Button('导出')
+                      .id(`btn_export_session_${s.id}`)
+                      .fontSize(10)
+                      .height(22)
+                      .backgroundColor('#F3F4F6')
+                      .fontColor('#374151')
+                      .onClick(() => {
+                        this.exportSession(s);
+                      })
+                  }
+                  .margin({ top: 6 })
                 }
                 .width('100%')
                 .padding(10)
@@ -1501,25 +1754,95 @@ struct Index {
                 .borderRadius(8)
               }
             })
+
+            // 分页加载更多
+            if (this.sessionVm.getHasMore()) {
+              ListItem() {
+                Button(this.sessionVm.getIsLoadingMore() ? '加载中...' : '加载更多会话...')
+                  .id('btn_load_more_sessions')
+                  .fontSize(12)
+                  .width('100%')
+                  .height(32)
+                  .backgroundColor('#F3F4F6')
+                  .fontColor('#007AFF')
+                  .onClick(() => {
+                    this.loadMoreSessions();
+                  })
+              }
+            }
           }
-          .height(300)
+          .height(320)
           .width('100%')
 
           Button('关闭')
+            .id('btn_close_sessions')
             .fontSize(13)
             .backgroundColor('#E5E5EA')
             .fontColor('#374151')
-            .margin({ top: 12 })
+            .margin({ top: 10 })
             .onClick(() => {
               this.showSessionListDialog = false;
             })
         }
-        .width('90%')
-        .padding(20)
+        .width('92%')
+        .padding(16)
         .backgroundColor('#FFFFFF')
         .borderRadius(16)
         .shadow({ radius: 20, color: '#40000000' })
-        .position({ x: '5%', y: '15%' })
+        .position({ x: '4%', y: '10%' })
+      }
+
+      // 7.1 会话重命名弹窗
+      if (this.showRenameDialog) {
+        Column() {
+          Text('重命名会话')
+            .fontSize(16)
+            .fontWeight(FontWeight.Bold)
+            .margin({ bottom: 12 })
+
+          TextInput({ text: this.renameInputText, placeholder: '请输入新会话标题' })
+            .id('input_rename_session')
+            .fontSize(14)
+            .height(40)
+            .backgroundColor('#F3F4F6')
+            .borderRadius(8)
+            .onChange((val: string) => {
+              this.renameInputText = val;
+            })
+            .margin({ bottom: 16 })
+
+          Row({ space: 12 }) {
+            Button('取消')
+              .id('btn_cancel_rename')
+              .fontSize(13)
+              .layoutWeight(1)
+              .height(36)
+              .backgroundColor('#E5E7EB')
+              .fontColor('#374151')
+              .onClick(() => {
+                this.showRenameDialog = false;
+                this.renameTargetSession = null;
+              })
+
+            Button('保存')
+              .id('btn_confirm_rename')
+              .fontSize(13)
+              .layoutWeight(1)
+              .height(36)
+              .backgroundColor('#007AFF')
+              .fontColor('#FFFFFF')
+              .onClick(() => {
+                this.confirmRenameSession();
+              })
+          }
+          .width('100%')
+        }
+        .width('80%')
+        .padding(16)
+        .backgroundColor('#FFFFFF')
+        .borderRadius(12)
+        .shadow({ radius: 20, color: '#40000000' })
+        .position({ x: '10%', y: '30%' })
       }
 
       // 8. 模型选择列表弹窗

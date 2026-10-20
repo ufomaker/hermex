@@ -1,40 +1,44 @@
 # Hermex HarmonyOS 移植状态追踪
 
-- 状态：**阶段五（Run 16 完善）通用历史归一化、真实服务端工具调用与结果结构化恢复、协调器防竞态与严格断言全线通过 (Stage 5 Universal History Normalization, Tool Association & Robust Coordinator Verified)**
-- 当前阶段：Run 16 工作块已全部落实：
-  1. **生产级历史归一化引擎与工具关联（落实 REVIEW_HISTORY_16.md）**：
-     - 新建生产工具类 `HermesHistoryNormalizer.ets`，严格对齐上游 `HermesTranscriptHistory.swift` 与 `ChatMessage.swift` 规范；
-     - 准确解析 `assistant.tool_calls` 中的嵌套 `function.name` 与 `function.arguments`，维护跨轮次调用映射表；
-     - `role === "tool"` 绝不伪装为助手独立气泡，提取输出结构（解析 JSON `output`/`error`/`exit_code`，或保留纯文本）并正确绑定至对应工具调用声明；
-     - 工具执行状态（`completed` / `failed`）根据退出码与错误字段动态判别；
-     - 彻底消除恢复历史后全段原始 JSON 覆盖助手正文的缺陷，正常保留 assistant 文本；
-     - 兼容未知角色与字段，无丢失数据风险；
-     - 生产 `HermesRESTClient.getSessionMessages` 全面接入 `HermesHistoryNormalizer.normalize`。
-  2. **协议与行为回归套件扩展至 31 项全绿**：
-     - 新增 `TEST 31`，直接驱动真实隔离服务证据 fixture `run15-server-evidence.json`；
-     - 覆盖并发多工具、乱序返回、工具执行失败、非 JSON 纯文本、无 ID 工具兜底关联；
-     - 31/31 测试全量通过（退出码 0）。
-  3. **协调器防竞态与产物有效性增强（落实 REVIEW_UI_15.md）**：
-     - 测试用例与协调器引入阶段同步（`PHASE: CAPTURE_STAGE_...`），预留稳定延迟，杜绝异步抢跑导致截图截入系统桌面过度帧；
-     - 产物目录改为相对路径 `test-artifacts/` 或由 `ARTIFACTS_DIR` 环境变量指定；
-     - `captureArtifacts` 增加严格门禁：截图必须存在且 > 1000 字节，布局树必须为有效 JSON 且子节点非空；
-     - 退出核验增加全量检查：必须 3 个用例全部通过、零失败、零错误、断网与恢复两个阶段齐备、且所有 6 个阶段有效产物全部捕获。
-  4. **UI 测试多重断言闭环（模拟器 127.0.0.1:5555）**：
-     - 带有动态唯一种子 `RUN16_mvh6l6d7` 的 prompt 完整保留；
-     - 工具卡片正确显示 `工具: terminal`（非 `tool`）与 `已完成`；
-     - 工具输出显示为 `1`；
-     - 终态回复 `The command returned: 1.` 完整呈现；
-     - 绝对断言：界面绝无 `"exit_code": 0` 等原始 JSON 气泡；
-     - 记录会话 ID 为真实 `20261021_051410_b8fe7b`，重连确为同一会话。
-  5. **证据分级明确记录**：
-     - **Node 平台回归**：`protocol-suite.js` 31 项业务类单元与契约测试全通过；
-     - **官方隔离服务联调**：Hermes 0.21.5 / ca678285（端口 9199，`hermex/hermex-local`）通过真实握手、会话创建、审批执行与历史回填；
-     - **官方模拟器 UI 自动化**：OpenHarmony 6.0.1.112 API 21（`127.0.0.1:5555`）通过完整 6 阶段自动化测试，产物留档在 `test-artifacts/` 与 Brain 目录；
+- 状态：**阶段六（Run 17 完善）F02 会话管理完整生命周期（非破坏性）、历史归一化轮次边界与运行态声明保留、33 项 Node 协议测试与模拟器官方 4/4 UiTest 全线通过 (Stage 6 Full F02 Session Management Lifecycle, Boundary Constraints & Official UiTest Verified)**
+- 当前阶段：Run 17 工作块已全部落实：
+  1. **历史归一化两大缺陷精准修复（落实 REVIEW_RUN16.md）**：
+     - **缺陷 1（轮次 user 边界严格约束）**：`HermesHistoryNormalizer.flushPendingToCurrentTurn` 增加 `lastUserIndex` 边界限制，孤儿工具或中间轮次工具调用严格保持在自身助手上下文，严禁逆向污染前序已完成轮次；
+     - **缺陷 2（运行态工具声明保留）**：历史中存在助手工具声明 (`assistant.tool_calls`) 但尚未收到对应 `tool` 结果时，生成 `ToolCallItem` 且赋予 `status: 'running'` 状态机语义，消息状态标记为 `'streaming'`，杜绝丢弃声明；
+     - 协议回归测试新增 `TEST 32`，精准断言轮次边界与运行态声明保留。
+  2. **协调器防竞态与安全清理升级（落实 REVIEW_RUN16.md 缺陷 3）**：
+     - 产物目录移除硬编码，使用相对路径或 `ARTIFACTS_DIR` / `BRAIN_DIR`；
+     - `hdcExec` 杜绝吞异常；远端与本地捕获前清理旧文件，防止旧产物残留；
+     - 截图严格校验 JPEG 魔数 `[0xFF, 0xD8, 0xFF]`；
+     - 引入统一的 `ensureCleanup()`，在 `exit`, `SIGINT`, `SIGTERM`, `uncaughtException` 时必定终止子进程并恢复反向端口 `rport tcp:9199 tcp:9199`。
+  3. **F02 会话管理全部非破坏性功能完整实现（严格禁止删除）**：
+     - 严格对齐上游 `HermesSessionActions.swift`、`APIClient+Sessions.swift` 与 `SessionListViewModel.swift`：
+       - **分页与去重**：`listSessionsPage` (offset, limit, total, hasMore) 支持首屏 20 项与追加加载，Set 去重；
+       - **搜索与清空恢复**：输入即时本地模糊匹配 + 联级服务端搜索，一键清除输入框 (`clearSearch`) 瞬间无损恢复全量会话；
+       - **分类 Tab 切换**：全部、置顶 📌、已归档 📦 三态隔离，默认视图隔离已归档会话；
+       - **改名回显**：`renameSession` 接入原生 `@kit.RemoteCommunicationKit` (`rcp`) HTTP `PATCH /api/sessions/{id}` (`{ title }`)，UI 弹窗支持输入并即时就地回读；
+       - **置顶与前置排序**：`togglePinSession` 发送 `PATCH /api/sessions/{id}` (`{ pinned }`)，置顶会话在列表中置顶前置展示；
+       - **归档与恢复**：`toggleArchiveSession` 发送 `PATCH /api/sessions/{id}` (`{ archived }`)，全量视图与归档视图严格过滤；
+       - **分支克隆 (Duplication)**：`duplicateSession` 实现导出完整 JSON -> 清洗血缘标识、parent_session_id 与消息 row id -> 生成 Hermes 标准 ID -> 导入 -> 重命名为 `<原标题> (copy)` -> 插入列表顶部；
+       - **导出**：`exportSession` 对应 `GET /api/sessions/{id}/export?profile={profile}`；
+       - **切服与代次竞态保护**：`requestSerial` 自增保护，拦截切服慢请求覆盖快请求；
+       - **非破坏性承诺**：严格禁止会话物理删除能力。
+  4. **全生命周期测试集扩展至 33 项全绿 (Node)**：
+     - `node harmonyos/tests/protocol-suite.js` 扩展至 33 项全量测试，覆盖 35 条会话分页追加 (20+15)、搜索恢复、置顶排序、归档过滤、改名、分支克隆、JSON导出与切服竞态，退出码 0。
+  5. **官方模拟器端到端 UI 测试 (4/4 全绿)**：
+     - `testCompleteChatAndApprovalFlow`：审批卡片点击允许一次、`python3 -c "print(1)"` 执行、终态回复精确回读、真实生命周期前后台切换、真实端口扰动断线与重连同会话恢复无损；
+     - `testRcpNativePatchEcho`：原生 RCP 发送 HTTP `PATCH` 至宿主机 9198 回显服务验证；
+     - `testSessionManagementUserFlow` (新增 F02 UI 自动化)：模拟器打开会话抽屉、搜索栏输入过滤、一键清空恢复、Tab切换、改名弹窗输入保存回显、置顶操作与关闭抽屉；
+     - 4 个测试全部通过 (`Tests run: 4, Failure: 0, Error: 0, Pass: 4, Ignore: 0`)，退出码 0。
+  6. **证据分级明确记录**：
+     - **Node 平台回归**：`protocol-suite.js` 33 项业务类单元与契约测试全通过；
+     - **官方隔离服务联调**：Hermes 0.21.5 / ca678285（端口 9199，`hermex/hermex-local`）真实握手、会话创建、审批执行与历史回填通过；
+     - **官方模拟器 UI 自动化**：OpenHarmony 6.0.1.112 API 21（`127.0.0.1:5555`）通过完整 4 项自动化测试与 6 阶段有效产物捕获，产物留档在 `test-artifacts/`；
      - **真机设备**：待监督者在实际物理设备上验证。
-- 更新时间：2026-10-21 05:16
+- 更新时间：2026-10-21 06:00
 - 当前分支：`harmonyos/native-port`
 - 实施者：AntiGravity
-- 监督审查参考：`REVIEW_HISTORY_16.md`, `REVIEW_UI_15.md`, `INCIDENT_IME_14.md`, `RESUME_RUN16.md`
+- 监督审查参考：`REVIEW_RUN16.md`, `RESUME_RUN17.md`, `INCIDENT_IME_14.md`
 
 ## 监督意见落实与本次核心重构详单
 
