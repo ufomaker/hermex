@@ -1,6 +1,6 @@
 # Hermex 鸿蒙功能移植对照表 (Feature Parity Matrix)
 
-最后更新：2026-10-21 06:00 (Run 17 阶段更新)
+最后更新：2026-10-21 06:45 (Run 18 阶段更新)
 
 > **验收标准分层说明**：
 > 1. **代码实现 (Implementation)**：ArkTS 生产代码、网络协议客户端、ViewModel 及原生 ArkUI 入口是否完整实现并接入主界面。
@@ -10,7 +10,7 @@
 | 编号 | 功能模块 | 上游 iOS 源码位置 | 鸿蒙实现源码与 UI 入口 | 代码实现 | 本地与模拟器验证 | 真机验收 | 现状与证据说明 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | F01 | 连接与认证 | `HermesConnection.swift`, `HermesREST.swift` | `HermesRESTClient.ets`, `AuthStore.ets`, `ConnectionViewModel.ets`, `Index.ets` (服务器弹窗) | ✅ 已实现 | ✅ 33 项回归 + UiTest 通过 | ✅ 真机验证通过 | 支持多服务器、版本探测、Cookie Jar携带与 `/api/auth/me` 核验；Preferences 元数据 + `@ohos.security.asset` 硬件密文保管库；真机与模拟器UiTest均验证通过 |
-| F02 | 会话管理 | `SessionList/`, `HermesSessionActions.swift` | `SessionListViewModel.ets`, `Index.ets` (会话列表抽屉) | ✅ 已实现 | ✅ 33 项回归 + 模拟器官方UiTest全流程通过 | 🟡 待真机复验 | 完整对齐上游 `HermesSessionActions.swift` 与 `SessionListViewModel.swift`：分页加载与去重、即时模糊搜索与一键清除恢复、分类Tab（全部/置顶/归档）、改名弹窗、置顶/取消置顶前置排序、归档/恢复、分支克隆 (Duplication)、JSON 导出；切服与竞态代次保护；严格禁止删除（非破坏性）；模拟器 `testSessionManagementUserFlow` 自动化交互全绿 |
+| F02 | 会话管理 | `SessionList/`, `HermesSessionActions.swift` | `SessionListViewModel.ets`, `HermesRESTClient.ets`, `Index.ets` (会话列表抽屉) | ✅ 已实现 | ✅ 33 项回归 + 模拟器官方UiTest全流程通过 (4/4 全绿) | 🟡 待真机复验 | 严格对齐上游真实契约：`searchSessions` 使用 `q=` 与 `%2B` 转义并携带 `exclude_sources`，`listSessionsPage` 使用 `archived: 'only' | 'exclude'`、`order=recent` 与 `min_messages=1`；`SessionListViewModel` 双流独立分页与回填过滤；切服即时物理擦除旧会话；Legacy WebUI 拒绝伪造修改；模拟器 `testSessionManagementUserFlow` 无条件断言搜索、改名、置顶、归档/解归档与双向恢复全绿通过 |
 | F03 | 原生聊天 | `Chat/`, `ChatTurnCoordinator.swift` | `ChatViewModel.ets`, `HermesHistoryNormalizer.ets`, `MarkdownView.ets`, `Index.ets` | ✅ 已实现 | ✅ 模拟器官方UiTest通过 | 🟡 待真机复验 | 中文流式、推理折叠、Markdown解析；落实 REVIEW_RUN16 两大历史归一化缺陷（轮次 user 边界严格约束、运行态工具声明保留为 running 状态机卡片）；模拟器UiTest实机回读终态回复 `"The command returned: 1."`，断线重连历史无损 |
 | F04 | 实时控制与审批 | `HermesCall.swift` (`approvalRespond`, `sessionInterrupt`, `clarifyLock`) | `HermesGatewayClient.ets`, `ChatViewModel.ets`, `Index.ets` (审批/澄清卡片) | ✅ 已实现 | ✅ 模拟器官方UiTest通过 | 🟡 待真机复验 | 严格按请求 ID 与 async 代次处理审批生命周期；模拟器UiTest实机检测到审批卡片，点击【允许一次】(`btn_approval_once`)，服务端执行 `python3 -c "print(1)"`，断言卡片彻底销毁、发送恢复与工具卡片正确呈现 |
 | F05 | 模型与参数配置 | `HermesModelCatalog.swift`, `HermesCall.swift` (`modelOptions`, `config.set`) | `ChatViewModel.ets`, `Index.ets` (模型弹窗) | ✅ 已实现 | ✅ 本地与9199通过 (测试 10) | ⚪ 待真机操作 | 真实获取服务端 `model.options`，并通过 `config.set` 写回活跃会话模型配置 |

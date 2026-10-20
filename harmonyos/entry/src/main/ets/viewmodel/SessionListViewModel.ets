@@ -6,26 +6,115 @@ import { BotConnection } from '../model/Connection';
 
 export type SessionFilterTab = 'all' | 'pinned' | 'archived';
 
+/**
+ * 单一归档维度的会话分页流状态
+ * 严格对齐上游 HermesSessionPages (HermesSessionPage.swift:207-270)
+ */
+export class SessionStreamState {
+  public sessions: HermesSession[] = [];
+  public identities: Set<string> = new Set<string>();
+  public nextOffset: number = 0;
+  public total: number = 0;
+  public hasMore: boolean = true;
+  public isLoaded: boolean = false;
+  public isLoading: boolean = false;
+  public isLoadingMore: boolean = false;
+
+  public reset(): void {
+    this.sessions = [];
+    this.identities.clear();
+    this.nextOffset = 0;
+    this.total = 0;
+    this.hasMore = true;
+    this.isLoaded = false;
+    this.isLoading = false;
+    this.isLoadingMore = false;
+  }
+
+  public appendPage(pageSessions: HermesSession[], pageSize: number, isArchivedTarget: boolean, serverTotal?: number): void {
+    let added = 0;
+    for (let i = 0; i < pageSessions.length; i++) {
+      const s = pageSessions[i];
+      if (!s.id) {
+        continue;
+      }
+      // 过滤非目标归档状态 (例如排除服务端向归档流回填的未归档置顶会话)
+      if (Boolean(s.is_archived) !== isArchivedTarget) {
+        continue;
+      }
+      if (!this.identities.has(s.id)) {
+        this.identities.add(s.id);
+        this.sessions.push(s);
+        added++;
+      } else {
+        // 就地刷新属性
+        for (let j = 0; j < this.sessions.length; j++) {
+          if (this.sessions[j].id === s.id) {
+            this.sessions[j] = s;
+            break;
+          }
+        }
+      }
+    }
+    this.nextOffset += pageSize;
+    // 对齐上游 HermesSessionPages.append: hasMore = page.count >= limit && added > 0
+    this.hasMore = pageSessions.length >= pageSize && added > 0;
+    this.isLoaded = true;
+    if (typeof serverTotal === 'number') {
+      this.total = serverTotal;
+    } else {
+      this.total = this.sessions.length;
+    }
+  }
+
+  public remove(id: string): void {
+    if (this.identities.has(id)) {
+      this.identities.delete(id);
+      this.total = Math.max(0, this.total - 1);
+    }
+    const nextList: HermesSession[] = [];
+    for (let i = 0; i < this.sessions.length; i++) {
+      if (this.sessions[i].id !== id) {
+        nextList.push(this.sessions[i]);
+      }
+    }
+    this.sessions = nextList;
+  }
+
+  public add(session: HermesSession): void {
+    if (!session.id) return;
+    this.remove(session.id);
+    this.identities.add(session.id);
+    this.sessions.unshift(session);
+    this.total++;
+  }
+}
+
+/**
+ * 会话列表视图模型
+ * 严格支持多服务器/Profile隔离、独立活跃流与归档流分页、防竞态代次保护、即时模糊搜索与一键清空恢复
+ */
 export class SessionListViewModel {
-  // 全量会话池 (去重缓存)
-  private allSessions: HermesSession[] = [];
-  // 过滤/搜索后呈现给界面的会话列表
+  // 活跃会话分页流 (archived: false / archived=exclude)
+  private activeStream: SessionStreamState = new SessionStreamState();
+  // 归档会话分页流 (archived: true / archived=only)
+  private archivedStream: SessionStreamState = new SessionStreamState();
+
+  // 最终呈现给 UI 的会话列表
   private displayedSessions: HermesSession[] = [];
 
   private isLoading: boolean = false;
   private isLoadingMore: boolean = false;
-  private hasMore: boolean = true;
-  private offset: number = 0;
   private pageSize: number = 20;
-  private totalCount: number = 0;
 
   private searchQuery: string = '';
   private activeFilterTab: SessionFilterTab = 'all';
 
-  // 跨服务器/Profile 隔离与防竞态请求代次
+  // 显式服务器与 Profile 所有者身份 + 请求代次
   private currentServerUrl: string = '';
   private currentProfile: string = '';
   private requestSerial: number = 0;
+  private searchRequestSerial: number = 0;
   private actionError: string | null = null;
 
   public getSessions(): HermesSession[] {
@@ -33,7 +122,7 @@ export class SessionListViewModel {
   }
 
   public getRawSessions(): HermesSession[] {
-    return this.allSessions;
+    return this.activeFilterTab === 'archived' ? this.archivedStream.sessions : this.activeStream.sessions;
   }
 
   public getIsLoading(): boolean {
@@ -45,11 +134,12 @@ export class SessionListViewModel {
   }
 
   public getHasMore(): boolean {
-    return this.hasMore;
+    return this.activeFilterTab === 'archived' ? this.archivedStream.hasMore : this.activeStream.hasMore;
   }
 
   public getTotalCount(): number {
-    return this.totalCount;
+    const stream = this.activeFilterTab === 'archived' ? this.archivedStream : this.activeStream;
+    return stream.total > 0 ? stream.total : stream.sessions.length;
   }
 
   public getSearchQuery(): string {
@@ -69,26 +159,45 @@ export class SessionListViewModel {
   }
 
   /**
+   * 检查连接所有者身份是否匹配
+   */
+  public isMatchingOwner(conn?: BotConnection | null): boolean {
+    if (!conn) return false;
+    const p = conn.activeProfile || 'default';
+    return this.currentServerUrl === conn.url && this.currentProfile === p;
+  }
+
+  /**
    * 首次/重新加载会话列表 (支持 legacy-webui 与 Hermes 直连)
+   * 若服务器或 profile 变更，立即清空旧会话池与展示列表，杜绝脏数据残留
    */
   public async loadSessions(conn: BotConnection): Promise<HermesSession[]> {
+    const p = conn.activeProfile || 'default';
+    const serverChanged = (this.currentServerUrl !== conn.url || this.currentProfile !== p);
+
+    if (serverChanged) {
+      // 切换连接时立即物理清空旧池，防止请求失败时仍然显示前一个服务器的会话
+      this.currentServerUrl = conn.url;
+      this.currentProfile = p;
+      this.activeStream.reset();
+      this.archivedStream.reset();
+      this.displayedSessions = [];
+      this.searchQuery = '';
+    }
+
     this.requestSerial++;
     const thisSerial = this.requestSerial;
-
-    this.currentServerUrl = conn.url;
-    this.currentProfile = conn.activeProfile || 'default';
     this.isLoading = true;
     this.actionError = null;
-    this.offset = 0;
 
     try {
       if (conn.serverVersion === 'legacy-webui') {
         const legacyItems = await LegacySSEClient.listSessions(conn.url, conn.token, conn.cookies);
-        if (thisSerial !== this.requestSerial) {
-          // 竞态拦截：用户在请求期间切换了服务器或发起新请求
+        if (thisSerial !== this.requestSerial || !this.isMatchingOwner(conn)) {
           return this.displayedSessions;
         }
-        this.allSessions = legacyItems.map((item) => {
+        this.activeStream.reset();
+        this.activeStream.sessions = legacyItems.map((item) => {
           const s: HermesSession = {
             id: item.id,
             runtime_id: item.id,
@@ -102,13 +211,19 @@ export class SessionListViewModel {
           };
           return s;
         });
-        this.totalCount = this.allSessions.length;
-        this.hasMore = false;
+        for (let i = 0; i < this.activeStream.sessions.length; i++) {
+          this.activeStream.identities.add(this.activeStream.sessions[i].id);
+        }
+        this.activeStream.hasMore = false;
+        this.activeStream.isLoaded = true;
+        this.archivedStream.reset();
+        this.archivedStream.hasMore = false;
         this.applyFilterAndSearch();
         return this.displayedSessions;
       }
 
-      // Hermes 直连：带分页
+      // Hermes 直连：按当前选中的 Tab 拉取对应 stream
+      const isArchived = (this.activeFilterTab === 'archived');
       const res = await HermesRESTClient.listSessionsPage(
         conn.url,
         this.currentProfile,
@@ -116,22 +231,25 @@ export class SessionListViewModel {
         conn.cookies,
         0,
         this.pageSize,
-        false
+        isArchived
       );
 
-      if (thisSerial !== this.requestSerial) {
-        // 竞态拦截
+      if (thisSerial !== this.requestSerial || !this.isMatchingOwner(conn)) {
         return this.displayedSessions;
       }
 
-      this.allSessions = this.deduplicateSessions(res.sessions);
-      this.totalCount = res.total;
-      this.hasMore = res.hasMore;
-      this.offset = this.allSessions.length;
+      if (isArchived) {
+        this.archivedStream.reset();
+        this.archivedStream.appendPage(res.sessions, this.pageSize, true, res.total);
+      } else {
+        this.activeStream.reset();
+        this.activeStream.appendPage(res.sessions, this.pageSize, false, res.total);
+      }
+
       this.applyFilterAndSearch();
       return this.displayedSessions;
     } catch (e) {
-      if (thisSerial === this.requestSerial) {
+      if (thisSerial === this.requestSerial && this.isMatchingOwner(conn)) {
         this.actionError = `加载会话失败: ${(e as Error).message || String(e)}`;
       }
       return this.displayedSessions;
@@ -146,75 +264,101 @@ export class SessionListViewModel {
    * 分页加载更多会话 (滚动到底部时触发)
    */
   public async loadMoreSessions(conn: BotConnection): Promise<boolean> {
-    if (!this.hasMore || this.isLoadingMore || this.isLoading) {
+    if (!this.isMatchingOwner(conn) || conn.serverVersion === 'legacy-webui') {
       return false;
     }
-    if (conn.serverVersion === 'legacy-webui') {
-      this.hasMore = false;
+    if (this.isLoading || this.isLoadingMore) {
       return false;
     }
 
-    const thisSerial = this.requestSerial;
+    const isArchived = (this.activeFilterTab === 'archived');
+    const stream = isArchived ? this.archivedStream : this.activeStream;
+    if (!stream.hasMore) {
+      return false;
+    }
+
     this.isLoadingMore = true;
+    stream.isLoadingMore = true;
+    this.requestSerial++;
+    const thisSerial = this.requestSerial;
+
     try {
       const res = await HermesRESTClient.listSessionsPage(
         conn.url,
         this.currentProfile,
         conn.token,
         conn.cookies,
-        this.allSessions.length,
+        stream.nextOffset,
         this.pageSize,
-        this.activeFilterTab === 'archived'
+        isArchived
       );
 
-      if (thisSerial !== this.requestSerial) {
+      if (thisSerial !== this.requestSerial || !this.isMatchingOwner(conn)) {
         return false;
       }
 
-      // 去重追加
-      this.allSessions = this.deduplicateSessions(this.allSessions.concat(res.sessions));
-      this.totalCount = res.total;
-      this.hasMore = res.hasMore;
-      this.offset = this.allSessions.length;
+      stream.appendPage(res.sessions, this.pageSize, isArchived, res.total);
       this.applyFilterAndSearch();
       return true;
     } catch (e) {
-      if (thisSerial === this.requestSerial) {
+      if (thisSerial === this.requestSerial && this.isMatchingOwner(conn)) {
         this.actionError = `加载更多失败: ${(e as Error).message || String(e)}`;
       }
       return false;
     } finally {
       if (thisSerial === this.requestSerial) {
         this.isLoadingMore = false;
+        stream.isLoadingMore = false;
       }
     }
   }
 
   /**
    * 设置搜索词 (即时本地检索 + 触发服务端检索)
+   * 严格核验代次与当前连接，杜绝慢搜索污染其他服务器或旧会话池
    */
-  public async setSearchQuery(query: string, conn?: BotConnection): Promise<void> {
-    this.searchQuery = query.trim();
+  public async setSearchQuery(query: string, conn?: BotConnection | null): Promise<void> {
+    this.searchQuery = (query || '').trim();
     this.applyFilterAndSearch();
 
-    // 若搜索词非空且存在 Hermes 连线，可并发查询服务端并合并结果
+    const thisSearchSerial = ++this.searchRequestSerial;
+
     if (this.searchQuery.length > 0 && conn && conn.serverVersion !== 'legacy-webui') {
+      const capturedUrl = conn.url;
+      const capturedProfile = conn.activeProfile || 'default';
       try {
         const serverResults = await HermesRESTClient.searchSessions(
-          conn.url,
-          this.currentProfile,
+          capturedUrl,
+          capturedProfile,
           this.searchQuery,
           conn.token,
           conn.cookies,
           20
         );
-        if (serverResults.length > 0) {
-          // 合并到全量池中并重新呈现
-          this.allSessions = this.deduplicateSessions(this.allSessions.concat(serverResults));
+
+        // 严格代次与连接归属核验！慢请求返回若连接已切换，必须直接丢弃
+        if (thisSearchSerial === this.searchRequestSerial &&
+            this.currentServerUrl === capturedUrl &&
+            this.currentProfile === capturedProfile &&
+            this.searchQuery.length > 0) {
+          for (let i = 0; i < serverResults.length; i++) {
+            const s = serverResults[i];
+            if (Boolean(s.is_archived)) {
+              if (!this.archivedStream.identities.has(s.id)) {
+                this.archivedStream.identities.add(s.id);
+                this.archivedStream.sessions.push(s);
+              }
+            } else {
+              if (!this.activeStream.identities.has(s.id)) {
+                this.activeStream.identities.add(s.id);
+                this.activeStream.sessions.push(s);
+              }
+            }
+          }
           this.applyFilterAndSearch();
         }
       } catch (_e) {
-        // 服务端检索容错回退至纯本地过滤
+        // 服务端检索容错回退纯本地过滤
       }
     }
   }
@@ -224,15 +368,21 @@ export class SessionListViewModel {
    */
   public clearSearch(): void {
     this.searchQuery = '';
+    this.searchRequestSerial++;
     this.applyFilterAndSearch();
   }
 
   /**
    * 切换视图分类 Tab ('all' | 'pinned' | 'archived')
+   * 若切换至 'archived' 且尚未从服务端加载归档页，自动异步拉取
    */
-  public setFilterTab(tab: SessionFilterTab): void {
+  public async setFilterTab(tab: SessionFilterTab, conn?: BotConnection | null): Promise<void> {
     this.activeFilterTab = tab;
-    this.applyFilterAndSearch();
+    if (tab === 'archived' && !this.archivedStream.isLoaded && conn && conn.serverVersion !== 'legacy-webui') {
+      await this.loadSessions(conn);
+    } else {
+      this.applyFilterAndSearch();
+    }
   }
 
   /**
@@ -245,23 +395,42 @@ export class SessionListViewModel {
       return false;
     }
 
+    if (conn.serverVersion === 'legacy-webui') {
+      this.actionError = '旧版 WebUI 不支持会话重命名';
+      return false;
+    }
+
+    if (!this.isMatchingOwner(conn)) {
+      this.actionError = '连接状态已变更';
+      return false;
+    }
+
     try {
-      if (conn.serverVersion !== 'legacy-webui') {
-        const payload: SessionUpdatePayload = { title: trimmed };
-        await HermesRESTClient.updateSession(
-          conn.url,
-          session.id,
-          session.profile || this.currentProfile,
-          payload,
-          conn.token,
-          conn.cookies
-        );
+      const payload: SessionUpdatePayload = { title: trimmed };
+      await HermesRESTClient.updateSession(
+        conn.url,
+        session.id,
+        session.profile || this.currentProfile,
+        payload,
+        conn.token,
+        conn.cookies
+      );
+
+      if (!this.isMatchingOwner(conn)) {
+        return false;
       }
+
       session.title = trimmed;
-      // 遍历更新本地池中对应项
-      for (let i = 0; i < this.allSessions.length; i++) {
-        if (this.allSessions[i].id === session.id) {
-          this.allSessions[i].title = trimmed;
+      // 在两个 stream 中更新对应项
+      for (let i = 0; i < this.activeStream.sessions.length; i++) {
+        if (this.activeStream.sessions[i].id === session.id) {
+          this.activeStream.sessions[i].title = trimmed;
+          break;
+        }
+      }
+      for (let i = 0; i < this.archivedStream.sessions.length; i++) {
+        if (this.archivedStream.sessions[i].id === session.id) {
+          this.archivedStream.sessions[i].title = trimmed;
           break;
         }
       }
@@ -277,23 +446,42 @@ export class SessionListViewModel {
    * 切换置顶状态
    */
   public async togglePinSession(conn: BotConnection, session: HermesSession): Promise<boolean> {
+    if (conn.serverVersion === 'legacy-webui') {
+      this.actionError = '旧版 WebUI 不支持会话置顶';
+      return false;
+    }
+
+    if (!this.isMatchingOwner(conn)) {
+      this.actionError = '连接状态已变更';
+      return false;
+    }
+
     const targetState = !session.is_pinned;
     try {
-      if (conn.serverVersion !== 'legacy-webui') {
-        const payload: SessionUpdatePayload = { pinned: targetState };
-        await HermesRESTClient.updateSession(
-          conn.url,
-          session.id,
-          session.profile || this.currentProfile,
-          payload,
-          conn.token,
-          conn.cookies
-        );
+      const payload: SessionUpdatePayload = { pinned: targetState };
+      await HermesRESTClient.updateSession(
+        conn.url,
+        session.id,
+        session.profile || this.currentProfile,
+        payload,
+        conn.token,
+        conn.cookies
+      );
+
+      if (!this.isMatchingOwner(conn)) {
+        return false;
       }
+
       session.is_pinned = targetState;
-      for (let i = 0; i < this.allSessions.length; i++) {
-        if (this.allSessions[i].id === session.id) {
-          this.allSessions[i].is_pinned = targetState;
+      for (let i = 0; i < this.activeStream.sessions.length; i++) {
+        if (this.activeStream.sessions[i].id === session.id) {
+          this.activeStream.sessions[i].is_pinned = targetState;
+          break;
+        }
+      }
+      for (let i = 0; i < this.archivedStream.sessions.length; i++) {
+        if (this.archivedStream.sessions[i].id === session.id) {
+          this.archivedStream.sessions[i].is_pinned = targetState;
           break;
         }
       }
@@ -307,28 +495,46 @@ export class SessionListViewModel {
 
   /**
    * 切换归档状态
+   * 严格实现归档流与活跃流之间的双向转移
    */
   public async toggleArchiveSession(conn: BotConnection, session: HermesSession): Promise<boolean> {
+    if (conn.serverVersion === 'legacy-webui') {
+      this.actionError = '旧版 WebUI 不支持会话归档';
+      return false;
+    }
+
+    if (!this.isMatchingOwner(conn)) {
+      this.actionError = '连接状态已变更';
+      return false;
+    }
+
     const targetState = !session.is_archived;
     try {
-      if (conn.serverVersion !== 'legacy-webui') {
-        const payload: SessionUpdatePayload = { archived: targetState };
-        await HermesRESTClient.updateSession(
-          conn.url,
-          session.id,
-          session.profile || this.currentProfile,
-          payload,
-          conn.token,
-          conn.cookies
-        );
+      const payload: SessionUpdatePayload = { archived: targetState };
+      await HermesRESTClient.updateSession(
+        conn.url,
+        session.id,
+        session.profile || this.currentProfile,
+        payload,
+        conn.token,
+        conn.cookies
+      );
+
+      if (!this.isMatchingOwner(conn)) {
+        return false;
       }
+
       session.is_archived = targetState;
-      for (let i = 0; i < this.allSessions.length; i++) {
-        if (this.allSessions[i].id === session.id) {
-          this.allSessions[i].is_archived = targetState;
-          break;
-        }
+      if (targetState === true) {
+        // 移入归档流，移出活跃流
+        this.activeStream.remove(session.id);
+        this.archivedStream.add(session);
+      } else {
+        // 移出归档流，移入活跃流
+        this.archivedStream.remove(session.id);
+        this.activeStream.add(session);
       }
+
       this.applyFilterAndSearch();
       return true;
     } catch (e) {
@@ -344,6 +550,9 @@ export class SessionListViewModel {
     if (conn.serverVersion === 'legacy-webui') {
       throw new Error('旧版 WebUI 不支持会话分支克隆');
     }
+    if (!this.isMatchingOwner(conn)) {
+      throw new Error('连接状态已变更');
+    }
     const newSession = await HermesRESTClient.duplicateSession(
       conn.url,
       session.id,
@@ -352,10 +561,11 @@ export class SessionListViewModel {
       conn.token,
       conn.cookies
     );
-    // 插入列表首部
-    this.allSessions.unshift(newSession);
-    this.totalCount++;
-    this.applyFilterAndSearch();
+
+    if (this.isMatchingOwner(conn)) {
+      this.activeStream.add(newSession);
+      this.applyFilterAndSearch();
+    }
     return newSession;
   }
 
@@ -365,6 +575,9 @@ export class SessionListViewModel {
   public async exportSession(conn: BotConnection, session: HermesSession): Promise<string> {
     if (conn.serverVersion === 'legacy-webui') {
       throw new Error('旧版 WebUI 不支持会话导出');
+    }
+    if (!this.isMatchingOwner(conn)) {
+      throw new Error('连接状态已变更');
     }
     return await HermesRESTClient.exportSession(
       conn.url,
@@ -395,49 +608,30 @@ export class SessionListViewModel {
       is_pinned: false,
       is_archived: false
     };
-    this.allSessions.unshift(session);
-    this.totalCount++;
+    this.activeStream.add(session);
     this.applyFilterAndSearch();
     return session;
-  }
-
-  /**
-   * 去重辅助函数 (按 id 保持唯一，保留最新版本)
-   */
-  private deduplicateSessions(list: HermesSession[]): HermesSession[] {
-    const seen = new Set<string>();
-    const result: HermesSession[] = [];
-    for (let i = 0; i < list.length; i++) {
-      const s = list[i];
-      if (!s.id || seen.has(s.id)) {
-        continue;
-      }
-      seen.add(s.id);
-      result.push(s);
-    }
-    return result;
   }
 
   /**
    * 综合应用当前过滤 Tab 与搜索词
    */
   private applyFilterAndSearch(): void {
-    let filtered = this.allSessions.slice();
+    let sourceList: HermesSession[] = [];
 
-    // 1. 分类 Tab 过滤
-    if (this.activeFilterTab === 'pinned') {
-      filtered = filtered.filter(s => s.is_pinned === true);
-    } else if (this.activeFilterTab === 'archived') {
-      filtered = filtered.filter(s => s.is_archived === true);
+    // 1. 根据当前 Tab 从独立流获取会话数据
+    if (this.activeFilterTab === 'archived') {
+      sourceList = this.archivedStream.sessions.slice();
+    } else if (this.activeFilterTab === 'pinned') {
+      sourceList = this.activeStream.sessions.filter(s => s.is_pinned === true && !s.is_archived);
     } else {
-      // 'all' Tab 默认展示未归档会话
-      filtered = filtered.filter(s => s.is_archived !== true);
+      sourceList = this.activeStream.sessions.filter(s => !s.is_archived);
     }
 
-    // 2. 搜索词本地模糊匹配 (匹配标题、预览、会话ID)
+    // 2. 搜索词过滤 (匹配标题、预览、会话ID)
     if (this.searchQuery.length > 0) {
       const q = this.searchQuery.toLowerCase();
-      filtered = filtered.filter(s => {
+      sourceList = sourceList.filter(s => {
         const titleMatch = (s.title || '').toLowerCase().includes(q);
         const previewMatch = (s.preview || '').toLowerCase().includes(q);
         const idMatch = s.id.toLowerCase().includes(q);
@@ -445,13 +639,13 @@ export class SessionListViewModel {
       });
     }
 
-    // 3. 排序策略：置顶的会话排在前面，其余按 updated_at 倒序排列
-    filtered.sort((a, b) => {
+    // 3. 排序策略：置顶优先，最新活跃优先
+    sourceList.sort((a, b) => {
       if (a.is_pinned && !b.is_pinned) return -1;
       if (!a.is_pinned && b.is_pinned) return 1;
       return (b.updated_at || 0) - (a.updated_at || 0);
     });
 
-    this.displayedSessions = filtered;
+    this.displayedSessions = sourceList;
   }
 }

@@ -854,12 +854,24 @@ async function runTestSuite() {
     const parsedUrl = new URL(req.url, 'http://127.0.0.1');
 
     if (parsedUrl.pathname === '/api/sessions/search' && req.method === 'GET') {
-      const q = (parsedUrl.searchParams.get('query') || '').toLowerCase();
+      // 严格检查：必须使用 q 参数！若使用 query 参数，直接返回 400 错误
+      if (parsedUrl.searchParams.has('query')) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: "Invalid parameter 'query'; upstream HermesREST strictly requires 'q'" }));
+        return;
+      }
+      const rawQ = parsedUrl.searchParams.get('q');
+      if (rawQ === null || rawQ === undefined || rawQ.trim() === '') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ results: [] }));
+        return;
+      }
+      const q = rawQ.toLowerCase();
       const p = parsedUrl.searchParams.get('profile') || 'default';
       const results = [];
       for (let i = 1; i <= 35; i++) {
         const title = `会话第 ${i} 课`;
-        if (title.toLowerCase().includes(q)) {
+        if (title.toLowerCase().includes(q) || `sess_f02_${i}`.includes(q)) {
           results.push({
             id: `sess_f02_${i}`,
             title: title,
@@ -870,6 +882,18 @@ async function runTestSuite() {
             updated_at: Date.now() - (35 - i) * 1000
           });
         }
+      }
+      // 特殊测试用例支持：c++ 编码测试 (检验 + 是否转义为 %2B 成功接收为 c++)
+      if (rawQ === 'c++') {
+        results.push({
+          id: 'sess_cpp_test',
+          title: 'C++ 进阶实战',
+          preview: 'C++ 高级开发',
+          profile: p,
+          running: false,
+          created_at: Date.now(),
+          updated_at: Date.now()
+        });
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ results }));
@@ -921,6 +945,15 @@ async function runTestSuite() {
       const prof = parsedUrl.searchParams.get('profile') || 'default';
       const offset = parseInt(parsedUrl.searchParams.get('offset') || '0', 10);
       const limit = parseInt(parsedUrl.searchParams.get('limit') || '50', 10);
+      const archived = parsedUrl.searchParams.get('archived');
+      const order = parsedUrl.searchParams.get('order');
+
+      // 严格校验上游 HermesREST.swift:448 契约：archived 必须为 'only' 或 'exclude'，不能是布尔字符串
+      if (archived === 'true' || archived === 'false') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: "archived parameter must be 'only' or 'exclude', got boolean string" }));
+        return;
+      }
 
       if (prof === 'fast_profile') {
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -933,7 +966,53 @@ async function runTestSuite() {
         return;
       }
 
-      // TEST 33: 当 limit 为 20 时，返回 35 条分页会话
+      // 归档流测试 (archived=only)
+      if (archived === 'only') {
+        const mockArchived = [
+          {
+            id: 'sess_archived_1',
+            title: '历史归档会话 1',
+            preview: '历史归档资料',
+            profile: prof,
+            archived: true,
+            pinned: false,
+            running: false,
+            created_at: Date.now() - 50000,
+            updated_at: Date.now() - 50000
+          },
+          {
+            id: 'sess_archived_2',
+            title: '历史归档会话 2',
+            preview: '历史归档记录',
+            profile: prof,
+            archived: true,
+            pinned: false,
+            running: false,
+            created_at: Date.now() - 60000,
+            updated_at: Date.now() - 60000
+          },
+          // 模拟服务端真实行为：回填未归档的置顶会话！
+          {
+            id: 'sess_f02_pinned_backfill',
+            title: '活跃置顶会话 (服务端回填)',
+            preview: '回填置顶项',
+            profile: prof,
+            archived: false,
+            pinned: true,
+            running: false,
+            created_at: Date.now() - 1000,
+            updated_at: Date.now() - 1000
+          }
+        ];
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          sessions: mockArchived,
+          total: 2
+        }));
+        return;
+      }
+
+      // 活跃会话流 (archived=exclude)
       if (limit === 20) {
         const mockList = [];
         for (let i = 1; i <= 35; i++) {
@@ -943,6 +1022,7 @@ async function runTestSuite() {
             preview: `这是第 ${i} 条会话预览`,
             profile: prof,
             running: false,
+            archived: false,
             created_at: Date.now() - (35 - i) * 1000,
             updated_at: Date.now() - (35 - i) * 1000
           });
@@ -2841,6 +2921,89 @@ export const test = true;
     await Promise.all([loadPromiseA, loadPromiseB]);
     assert(sessionVm.getRawSessions().every(s => s.profile === 'fast_profile'), '滞后返回的 Server A 数据绝不可覆盖活跃 Server B');
     console.log('  -> 跨服务器切换与竞态代次保护通过');
+
+    // 10. 测试 HermesRESTClient.searchSessions 契约 (q 编码, c++, 包含 exclude_sources, 空检索拦截)
+    const emptySearchRes = await HermesRESTClient.searchSessions(baseUrl, 'default', '   ');
+    assert(Array.isArray(emptySearchRes) && emptySearchRes.length === 0, '空检索应直接返回空数组 []');
+    const cppSearchRes = await HermesRESTClient.searchSessions(baseUrl, 'default', 'c++');
+    assert(cppSearchRes.length === 1 && cppSearchRes[0].id === 'sess_cpp_test', 'c++ 检索转义为 %2B 正确匹配服务端响应');
+    console.log('  -> searchSessions q 参数与 %2B 转义验证通过');
+
+    // 11. 测试归档流拉取与服务端置顶回填过滤 (archived=only 且过滤未归档置顶项)
+    const archivedVm = new SessionListViewModel();
+    await archivedVm.setFilterTab('archived', conn);
+    assert(archivedVm.getSessions().length === 2, `归档流仅展示 2 条真实归档项，实际为 ${archivedVm.getSessions().length}`);
+    assert(!archivedVm.getSessions().some(s => s.id === 'sess_f02_pinned_backfill'), '服务端向归档流回填的未归档置顶项必须被彻底过滤');
+    console.log('  -> 归档流独立服务端拉取与置顶回填过滤验证通过');
+
+    // 12. 测试反向解归档 (Unarchive 恢复至活跃流)
+    const unarchiveTarget = archivedVm.getSessions()[0];
+    const unarchiveOk = await archivedVm.toggleArchiveSession(conn, unarchiveTarget);
+    assert(unarchiveOk === true, '解归档操作应成功');
+    assert(unarchiveTarget.is_archived === false, '标记为未归档');
+    assert(!archivedVm.getSessions().some(s => s.id === unarchiveTarget.id), '已归档 Tab 中该项已移除');
+    await archivedVm.setFilterTab('all');
+    assert(archivedVm.getSessions().some(s => s.id === unarchiveTarget.id), '切换至 All Tab 后该项已成功恢复呈现');
+    console.log('  -> 会话解归档流转与双向无损状态恢复通过');
+
+    // 13. 测试 Legacy WebUI 严格保护 (不支持的操作严禁在内存中伪造成功)
+    const legacyConn = {
+      id: 'conn-legacy',
+      name: 'Legacy Server',
+      url: baseUrl,
+      serverVersion: 'legacy-webui',
+      token: 'leg-token',
+      cookies: 'leg_cookie=1'
+    };
+    const legacySession = {
+      id: 'legacy-sess-1',
+      title: '旧版原生会话',
+      profile: 'default',
+      is_pinned: false,
+      is_archived: false,
+      created_at: Date.now(),
+      updated_at: Date.now()
+    };
+    const legPinOk = await sessionVm.togglePinSession(legacyConn, legacySession);
+    assert(legPinOk === false, 'Legacy WebUI 置顶操作必须返回 false');
+    assert(legacySession.is_pinned === false, 'Legacy WebUI 置顶绝不可在内存中修改状态');
+    assert(sessionVm.getActionError().includes('不支持会话置顶'), '展示明确不支持错误信息');
+
+    const legArchiveOk = await sessionVm.toggleArchiveSession(legacyConn, legacySession);
+    assert(legArchiveOk === false, 'Legacy WebUI 归档操作必须返回 false');
+    assert(legacySession.is_archived === false, 'Legacy WebUI 归档绝不可在内存中修改状态');
+
+    const legRenameOk = await sessionVm.renameSession(legacyConn, legacySession, '新名');
+    assert(legRenameOk === false, 'Legacy WebUI 重命名必须返回 false');
+    assert(legacySession.title === '旧版原生会话', 'Legacy WebUI 标题绝不可在内存中被修改');
+
+    try {
+      await sessionVm.duplicateSession(legacyConn, legacySession);
+      assert(false, 'Legacy WebUI duplicateSession 必须抛出异常');
+    } catch (e) {
+      assert(e.message.includes('不支持会话分支克隆'), '抛出明确不支持异常');
+    }
+
+    try {
+      await sessionVm.exportSession(legacyConn, legacySession);
+      assert(false, 'Legacy WebUI exportSession 必须抛出异常');
+    } catch (e) {
+      assert(e.message.includes('不支持会话导出'), '抛出明确不支持异常');
+    }
+    console.log('  -> Legacy WebUI 操作拒绝与无状态污染保护通过');
+
+    // 14. 测试切服时旧会话池立即物理清空 (即使后续网络失败也不残留脏数据)
+    const badConn = {
+      id: 'conn-bad',
+      name: 'Bad Server',
+      url: 'http://127.0.0.1:9999/unreachable',
+      serverVersion: 'hermes',
+      activeProfile: 'default'
+    };
+    await sessionVm.loadSessions(badConn);
+    assert(sessionVm.getSessions().length === 0, '切换至不可用服务器时，旧服务器会话列表必须立即物理清空！');
+    assert(sessionVm.getActionError() !== null, '记录加载失败错误');
+    console.log('  -> 切换服务器旧会话物理擦除与脏数据防残留验证通过');
 
     console.log('[PASS 33] SessionListViewModel & HermesRESTClient F02 会话管理全生命周期通过');
   }

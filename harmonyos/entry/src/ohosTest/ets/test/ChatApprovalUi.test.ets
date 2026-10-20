@@ -293,25 +293,29 @@ export default function chatApprovalUiTest() {
 
       // 1. 打开会话管理列表抽屉
       hilog.info(DOMAIN, TAG, 'Step SM1: Locating and clicking btn_sessions_list...');
-      let btnSessions = await driver.findComponent(ON.id('btn_sessions_list'));
+      const btnSessions = await driver.findComponent(ON.id('btn_sessions_list'));
       expect(btnSessions !== null).assertTrue();
       if (btnSessions) {
         await btnSessions.click();
       }
       await driver.delayMs(1500);
 
-      // 2. 验证抽屉打开，新建会话与搜索栏可见
+      // 2. 验证抽屉打开，新建会话与搜索栏可见 (严格无条件断言)
       const btnNew = await driver.findComponent(ON.id('btn_new_session'));
       expect(btnNew !== null).assertTrue();
       const inputSearch = await driver.findComponent(ON.id('input_session_search'));
       expect(inputSearch !== null).assertTrue();
 
-      // 3. 测试搜索框输入过滤
-      hilog.info(DOMAIN, TAG, 'Step SM2: Entering search query in input_session_search...');
+      // 3. 测试搜索框输入与检索 (使用真实服务端存在的词 "python3")
+      hilog.info(DOMAIN, TAG, 'Step SM2: Entering search query "python3" in input_session_search...');
       if (inputSearch) {
-        await inputSearch.inputText('RUN');
-        await driver.delayMs(1000);
+        await inputSearch.inputText('python3');
+        await driver.delayMs(1500);
       }
+      // 验证检索结果中包含对应会话项
+      const matchedComp = await driver.findComponent(ON.text('python3', MatchPattern.CONTAINS));
+      expect(matchedComp !== null).assertTrue();
+
       // 检查清空按钮出现并点击清空
       const btnClear = await driver.findComponent(ON.id('btn_clear_session_search'));
       expect(btnClear !== null).assertTrue();
@@ -320,58 +324,97 @@ export default function chatApprovalUiTest() {
         await driver.delayMs(1000);
       }
 
-      // 4. 切换分类 Tab
-      hilog.info(DOMAIN, TAG, 'Step SM3: Testing filter tabs...');
+      // 4. 测试改名弹窗交互与保存 (严格断言改名按钮存在)
+      hilog.info(DOMAIN, TAG, 'Step SM3: Testing session rename dialog...');
+      const allRenameBtns = await driver.findComponents(ON.text('改名'));
+      expect(allRenameBtns !== null && allRenameBtns.length > 0).assertTrue();
+      await allRenameBtns[0].click();
+      await driver.delayMs(1000);
+
+      const inputRename = await driver.findComponent(ON.id('input_rename_session'));
+      expect(inputRename !== null).assertTrue();
+      const newTitle = `【F02实测】_${Date.now().toString(36)}`;
+      if (inputRename) {
+        await inputRename.inputText(newTitle);
+        await driver.delayMs(500);
+      }
+
+      const btnConfirmRename = await driver.findComponent(ON.id('btn_confirm_rename'));
+      expect(btnConfirmRename !== null).assertTrue();
+      if (btnConfirmRename) {
+        await btnConfirmRename.click();
+        await driver.delayMs(1500);
+      }
+
+      // 验证改名在界面生效
+      const renamedTitleComp = await driver.findComponent(ON.text(newTitle, MatchPattern.CONTAINS));
+      expect(renamedTitleComp !== null).assertTrue();
+      hilog.info(DOMAIN, TAG, 'Session rename verified on UI with title: %{public}s', newTitle);
+
+      // 5. 测试置顶操作与置顶 Tab 筛选
+      hilog.info(DOMAIN, TAG, 'Step SM4: Testing pin session...');
+      const allPinBtns = await driver.findComponents(ON.text('置顶'));
+      expect(allPinBtns !== null && allPinBtns.length > 0).assertTrue();
+      await allPinBtns[0].click();
+      await driver.delayMs(1500);
+
+      // 验证页面出现取消置顶按钮
+      const unpinBtn = await driver.findComponent(ON.text('取消置顶'));
+      expect(unpinBtn !== null).assertTrue();
+
+      // 切换到置顶 Tab
       const tabPinned = await driver.findComponent(ON.id('tab_session_pinned'));
+      expect(tabPinned !== null).assertTrue();
       if (tabPinned) {
         await tabPinned.click();
-        await driver.delayMs(800);
+        await driver.delayMs(1000);
       }
+      const pinnedInTab = await driver.findComponent(ON.text('取消置顶'));
+      expect(pinnedInTab !== null).assertTrue();
+
+      // 切回全部 Tab
       const tabAll = await driver.findComponent(ON.id('tab_session_all'));
+      expect(tabAll !== null).assertTrue();
       if (tabAll) {
         await tabAll.click();
-        await driver.delayMs(800);
-      }
-
-      // 5. 测试改名弹窗交互与保存
-      hilog.info(DOMAIN, TAG, 'Step SM4: Testing session rename dialog...');
-      const allRenameBtns = await driver.findComponents(ON.text('改名'));
-      if (allRenameBtns && allRenameBtns.length > 0) {
-        await allRenameBtns[0].click();
         await driver.delayMs(1000);
-
-        const inputRename = await driver.findComponent(ON.id('input_rename_session'));
-        expect(inputRename !== null).assertTrue();
-        const newTitle = `【F02重命名验证】_${Date.now().toString(36)}`;
-        if (inputRename) {
-          await inputRename.inputText(newTitle);
-          await driver.delayMs(500);
-        }
-
-        const btnConfirmRename = await driver.findComponent(ON.id('btn_confirm_rename'));
-        expect(btnConfirmRename !== null).assertTrue();
-        if (btnConfirmRename) {
-          await btnConfirmRename.click();
-          await driver.delayMs(1500);
-        }
-
-        // 验证改名在界面生效
-        const renamedTitleComp = await driver.findComponent(ON.text(newTitle, MatchPattern.CONTAINS));
-        expect(renamedTitleComp !== null).assertTrue();
-        hilog.info(DOMAIN, TAG, 'Session rename verified on UI with title: %{public}s', newTitle);
       }
 
-      // 6. 测试置顶操作
-      hilog.info(DOMAIN, TAG, 'Step SM5: Testing pin session...');
-      const allPinBtns = await driver.findComponents(ON.text('置顶'));
-      if (allPinBtns && allPinBtns.length > 0) {
-        await allPinBtns[0].click();
-        await driver.delayMs(1200);
+      // 6. 测试归档与解归档闭环 (归档 -> 切换归档Tab -> 验证 -> 恢复 -> 切回全部Tab -> 验证)
+      hilog.info(DOMAIN, TAG, 'Step SM5: Testing archive and unarchive roundtrip...');
+      const allArchiveBtns = await driver.findComponents(ON.text('归档'));
+      expect(allArchiveBtns !== null && allArchiveBtns.length > 0).assertTrue();
+      await allArchiveBtns[0].click();
+      await driver.delayMs(1500);
+
+      // 切换到已归档 Tab
+      const tabArchived = await driver.findComponent(ON.id('tab_session_archived'));
+      expect(tabArchived !== null).assertTrue();
+      if (tabArchived) {
+        await tabArchived.click();
+        await driver.delayMs(2000);
       }
+
+      // 验证归档列表中呈现“恢复”按钮
+      const unarchiveBtn = await driver.findComponent(ON.text('恢复'));
+      expect(unarchiveBtn !== null).assertTrue();
+      if (unarchiveBtn) {
+        await unarchiveBtn.click();
+        await driver.delayMs(1500);
+      }
+
+      // 切回全部 Tab 并验证已恢复项存在
+      if (tabAll) {
+        await tabAll.click();
+        await driver.delayMs(1000);
+      }
+      const restoredArchiveBtn = await driver.findComponent(ON.text('归档'));
+      expect(restoredArchiveBtn !== null).assertTrue();
 
       // 7. 关闭会话管理抽屉
       hilog.info(DOMAIN, TAG, 'Step SM6: Closing session list drawer...');
       const btnClose = await driver.findComponent(ON.id('btn_close_sessions'));
+      expect(btnClose !== null).assertTrue();
       if (btnClose) {
         await btnClose.click();
         await driver.delayMs(1000);

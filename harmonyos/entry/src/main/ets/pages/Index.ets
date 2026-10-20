@@ -571,9 +571,10 @@ struct Index {
     this.sessions = this.sessionVm.getSessions();
   }
 
-  private onSessionFilterTabChanged(tab: 'all' | 'pinned' | 'archived') {
+  private async onSessionFilterTabChanged(tab: 'all' | 'pinned' | 'archived') {
     this.sessionFilterTab = tab;
-    this.sessionVm.setFilterTab(tab);
+    const cur = this.connVm.getCurrentConnection();
+    await this.sessionVm.setFilterTab(tab, cur || undefined);
     this.sessions = this.sessionVm.getSessions();
   }
 

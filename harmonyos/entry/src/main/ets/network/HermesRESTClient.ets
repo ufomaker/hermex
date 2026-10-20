@@ -221,7 +221,8 @@ export class HermesRESTClient {
 
   /**
    * 分页拉取会话列表
-   * 对应 GET /api/sessions?profile={profile}&offset={offset}&limit={limit}&archived={archived}
+   * 严格对齐上游 HermesREST.swift:440-454:
+   * GET /api/sessions?profile={profile}&order=recent&archived={only|exclude}&limit={limit}&offset={offset}&min_messages=1&exclude_sources=cron,kanban,oneshot,subagent,tool
    */
   public static async listSessionsPage(
     baseUrl: string,
@@ -229,7 +230,7 @@ export class HermesRESTClient {
     token?: string,
     cookies?: string,
     offset: number = 0,
-    limit: number = 50,
+    limit: number = 25,
     archived: boolean = false
   ): Promise<SessionListPageResult> {
     const cleanUrl = HermesRESTClient.sanitizeUrl(baseUrl);
@@ -245,11 +246,18 @@ export class HermesRESTClient {
         headers['Cookie'] = cookies;
       }
       const params: string[] = [];
-      if (profile) params.push(`profile=${encodeURIComponent(profile)}`);
-      params.push(`offset=${offset}`);
+      if (profile && profile.length > 0) {
+        params.push(`profile=${encodeURIComponent(profile)}`);
+      }
+      params.push('order=recent');
+      params.push(`archived=${archived ? 'only' : 'exclude'}`);
       params.push(`limit=${limit}`);
-      if (archived) params.push('archived=true');
-      const query = params.length > 0 ? `?${params.join('&')}` : '';
+      params.push(`offset=${offset}`);
+      if (!archived) {
+        params.push('min_messages=1');
+      }
+      params.push('exclude_sources=cron,kanban,oneshot,subagent,tool');
+      const query = `?${params.join('&')}`;
 
       const response = await client.request(`${cleanUrl}/api/sessions${query}`, {
         method: http.RequestMethod.GET,
@@ -267,9 +275,14 @@ export class HermesRESTClient {
       const sessions: HermesSession[] = [];
       for (let i = 0; i < rawList.length; i++) {
         const item = rawList[i];
+        const titleStr = String(item['title'] || item['display_name'] || item['preview'] || '会话');
+        // 过滤群聊房间会话 (对齐 upstream isRoomSession: title.hasPrefix("Group: "))
+        if (titleStr.startsWith('Group: ')) {
+          continue;
+        }
         const s: HermesSession = {
           id: String(item['id'] || item['session_id'] || ''),
-          title: String(item['title'] || item['display_name'] || item['preview'] || '会话'),
+          title: titleStr,
           profile: String(item['profile'] || profile || 'default'),
           created_at: Number(item['created_at'] || item['started_at'] || Date.now()),
           updated_at: Number(item['updated_at'] || item['last_active'] || Date.now()),
@@ -281,7 +294,8 @@ export class HermesRESTClient {
         };
         sessions.push(s);
       }
-      const hasMore = offset + rawList.length < total;
+      // 上游分页契约：单页返回数量满额则视作可能还有下一页
+      const hasMore = rawList.length >= limit;
       const res: SessionListPageResult = { sessions, total, hasMore };
       return res;
     } finally {
@@ -300,7 +314,9 @@ export class HermesRESTClient {
 
   /**
    * 服务端会话检索
-   * 对应 GET /api/sessions/search?profile={profile}&query={query}&limit={limit}
+   * 严格对齐上游 HermesREST.swift:485-498:
+   * GET /api/sessions/search?q={query}&profile={profile}&limit={limit}&exclude_sources=cron,kanban,oneshot,subagent,tool
+   * 注意：参数为 q=，不可使用 query=；+ 号转义为 %2B
    */
   public static async searchSessions(
     baseUrl: string,
@@ -310,6 +326,10 @@ export class HermesRESTClient {
     cookies?: string,
     limit: number = 50
   ): Promise<HermesSession[]> {
+    const trimmed = (query || '').trim();
+    if (!trimmed) {
+      return [];
+    }
     const cleanUrl = HermesRESTClient.sanitizeUrl(baseUrl);
     const client = http.createHttp();
     try {
@@ -322,8 +342,16 @@ export class HermesRESTClient {
       if (cookies && cookies.length > 0) {
         headers['Cookie'] = cookies;
       }
-      const q = `?profile=${encodeURIComponent(profile)}&query=${encodeURIComponent(query)}&limit=${limit}`;
-      const response = await client.request(`${cleanUrl}/api/sessions/search${q}`, {
+      // 将 + 显式编码为 %2B，避免服务端当作空格解析
+      const encodedQ = encodeURIComponent(trimmed).replace(/\+/g, '%2B');
+      const params: string[] = [
+        `q=${encodedQ}`,
+        `profile=${encodeURIComponent(profile || 'default')}`,
+        `limit=${limit}`,
+        'exclude_sources=cron,kanban,oneshot,subagent,tool'
+      ];
+      const qStr = `?${params.join('&')}`;
+      const response = await client.request(`${cleanUrl}/api/sessions/search${qStr}`, {
         method: http.RequestMethod.GET,
         connectTimeout: 8000,
         readTimeout: 8000,
@@ -339,11 +367,15 @@ export class HermesRESTClient {
       const results: HermesSession[] = [];
       for (let i = 0; i < rawList.length; i++) {
         const item = rawList[i];
+        const titleStr = String(item['title'] || item['display_name'] || item['preview'] || '会话');
+        if (titleStr.startsWith('Group: ')) {
+          continue;
+        }
         results.push({
           id: String(item['id'] || item['session_id'] || ''),
-          title: String(item['title'] || item['display_name'] || item['preview'] || '会话'),
+          title: titleStr,
           profile: String(item['profile'] || profile || 'default'),
-          created_at: Number(item['created_at'] || item['started_at'] || Date.now()),
+          created_at: Number(item['created_at'] || item['started_at'] || item['session_started'] || Date.now()),
           updated_at: Number(item['updated_at'] || item['last_active'] || Date.now()),
           running: Boolean(item['running'] || item['is_active']),
           model: item['model'] ? String(item['model']) : undefined,

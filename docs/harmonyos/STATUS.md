@@ -1,44 +1,31 @@
 # Hermex HarmonyOS 移植状态追踪
 
-- 状态：**阶段六（Run 17 完善）F02 会话管理完整生命周期（非破坏性）、历史归一化轮次边界与运行态声明保留、33 项 Node 协议测试与模拟器官方 4/4 UiTest 全线通过 (Stage 6 Full F02 Session Management Lifecycle, Boundary Constraints & Official UiTest Verified)**
-- 当前阶段：Run 17 工作块已全部落实：
-  1. **历史归一化两大缺陷精准修复（落实 REVIEW_RUN16.md）**：
-     - **缺陷 1（轮次 user 边界严格约束）**：`HermesHistoryNormalizer.flushPendingToCurrentTurn` 增加 `lastUserIndex` 边界限制，孤儿工具或中间轮次工具调用严格保持在自身助手上下文，严禁逆向污染前序已完成轮次；
-     - **缺陷 2（运行态工具声明保留）**：历史中存在助手工具声明 (`assistant.tool_calls`) 但尚未收到对应 `tool` 结果时，生成 `ToolCallItem` 且赋予 `status: 'running'` 状态机语义，消息状态标记为 `'streaming'`，杜绝丢弃声明；
-     - 协议回归测试新增 `TEST 32`，精准断言轮次边界与运行态声明保留。
-  2. **协调器防竞态与安全清理升级（落实 REVIEW_RUN16.md 缺陷 3）**：
-     - 产物目录移除硬编码，使用相对路径或 `ARTIFACTS_DIR` / `BRAIN_DIR`；
-     - `hdcExec` 杜绝吞异常；远端与本地捕获前清理旧文件，防止旧产物残留；
-     - 截图严格校验 JPEG 魔数 `[0xFF, 0xD8, 0xFF]`；
-     - 引入统一的 `ensureCleanup()`，在 `exit`, `SIGINT`, `SIGTERM`, `uncaughtException` 时必定终止子进程并恢复反向端口 `rport tcp:9199 tcp:9199`。
-  3. **F02 会话管理全部非破坏性功能完整实现（严格禁止删除）**：
-     - 严格对齐上游 `HermesSessionActions.swift`、`APIClient+Sessions.swift` 与 `SessionListViewModel.swift`：
-       - **分页与去重**：`listSessionsPage` (offset, limit, total, hasMore) 支持首屏 20 项与追加加载，Set 去重；
-       - **搜索与清空恢复**：输入即时本地模糊匹配 + 联级服务端搜索，一键清除输入框 (`clearSearch`) 瞬间无损恢复全量会话；
-       - **分类 Tab 切换**：全部、置顶 📌、已归档 📦 三态隔离，默认视图隔离已归档会话；
-       - **改名回显**：`renameSession` 接入原生 `@kit.RemoteCommunicationKit` (`rcp`) HTTP `PATCH /api/sessions/{id}` (`{ title }`)，UI 弹窗支持输入并即时就地回读；
-       - **置顶与前置排序**：`togglePinSession` 发送 `PATCH /api/sessions/{id}` (`{ pinned }`)，置顶会话在列表中置顶前置展示；
-       - **归档与恢复**：`toggleArchiveSession` 发送 `PATCH /api/sessions/{id}` (`{ archived }`)，全量视图与归档视图严格过滤；
-       - **分支克隆 (Duplication)**：`duplicateSession` 实现导出完整 JSON -> 清洗血缘标识、parent_session_id 与消息 row id -> 生成 Hermes 标准 ID -> 导入 -> 重命名为 `<原标题> (copy)` -> 插入列表顶部；
-       - **导出**：`exportSession` 对应 `GET /api/sessions/{id}/export?profile={profile}`；
-       - **切服与代次竞态保护**：`requestSerial` 自增保护，拦截切服慢请求覆盖快请求；
-       - **非破坏性承诺**：严格禁止会话物理删除能力。
-  4. **全生命周期测试集扩展至 33 项全绿 (Node)**：
-     - `node harmonyos/tests/protocol-suite.js` 扩展至 33 项全量测试，覆盖 35 条会话分页追加 (20+15)、搜索恢复、置顶排序、归档过滤、改名、分支克隆、JSON导出与切服竞态，退出码 0。
-  5. **官方模拟器端到端 UI 测试 (4/4 全绿)**：
-     - `testCompleteChatAndApprovalFlow`：审批卡片点击允许一次、`python3 -c "print(1)"` 执行、终态回复精确回读、真实生命周期前后台切换、真实端口扰动断线与重连同会话恢复无损；
-     - `testRcpNativePatchEcho`：原生 RCP 发送 HTTP `PATCH` 至宿主机 9198 回显服务验证；
-     - `testSessionManagementUserFlow` (新增 F02 UI 自动化)：模拟器打开会话抽屉、搜索栏输入过滤、一键清空恢复、Tab切换、改名弹窗输入保存回显、置顶操作与关闭抽屉；
-     - 4 个测试全部通过 (`Tests run: 4, Failure: 0, Error: 0, Pass: 4, Ignore: 0`)，退出码 0。
-  6. **证据分级明确记录**：
-     - **Node 平台回归**：`protocol-suite.js` 33 项业务类单元与契约测试全通过；
-     - **官方隔离服务联调**：Hermes 0.21.5 / ca678285（端口 9199，`hermex/hermex-local`）真实握手、会话创建、审批执行与历史回填通过；
-     - **官方模拟器 UI 自动化**：OpenHarmony 6.0.1.112 API 21（`127.0.0.1:5555`）通过完整 4 项自动化测试与 6 阶段有效产物捕获，产物留档在 `test-artifacts/`；
-     - **真机设备**：待监督者在实际物理设备上验证。
-- 更新时间：2026-10-21 06:00
+- 状态：**阶段七（Run 18 完善）F02 会话管理真实契约对齐、切服双向隔离与官方模拟器 4/4 UiTest 无条件断言全绿通过 (Stage 7 Full F02 Real Contract Parity, Multi-Stream Isolation & Strict UiTest Verified)**
+- 当前阶段：Run 18 工作块已全部落实：
+  1. **HermesRESTClient.searchSessions 严格契约修复 (对齐 upstream HermesREST.swift:490)**：
+     - 查询参数由 `query` 修正为 `q`，并严格将 `+` 编码转义为 `%2B`；
+     - 显式携带 `exclude_sources=cron,kanban,oneshot,subagent,tool`；
+     - 空搜索词直接返回 `[]`，杜绝多余无效请求；过滤群聊房间会话。
+  2. **listSessionsPage 归档流契约与服务端回填过滤 (对齐 upstream HermesREST.swift:448, HermesSessionPage.swift:204-206)**：
+     - `archived` 参数由布尔字符串修正为 `'only'` 或 `'exclude'`，携带 `order=recent` 与 `exclude_sources`，活跃流携带 `min_messages=1`；
+     - `SessionStreamState.appendPage` 增加 `Boolean(s.is_archived) === isArchivedTarget` 严格状态门禁，主动过滤服务端向归档流回填的未归档置顶项。
+  3. **SessionListViewModel 架构重构与多流隔离**：
+     - 划分独立的 `activeStream` 与 `archivedStream`，分别维护独立分页游标、总数与已加载标识；
+     - 切换分类 Tab 至 `archived` 时若未加载自动发起服务端异步拉取；
+     - 归档/解归档在两个流之间执行无损双向转移；
+     - 切换服务器或 Profile 时立即物理清空旧流与展示列表，杜绝脏数据残留；
+     - Legacy WebUI 严格拒绝改名、置顶、归档、克隆与导出，绝不在内存中伪造变更。
+  4. **UiTest 移除宽容守卫与全流程真机断言**：
+     - `ChatApprovalUi.test.ets` 中彻底移除 `if (buttons.length > 0)` 宽容守卫；
+     - 无条件断言按钮存在，完整走通搜索 "python3" 匹配、改名弹窗输入保存、置顶与置顶Tab筛选、归档与归档Tab筛选、解归档恢复与全部Tab回显闭环。
+  5. **测试与编译全线通过**：
+     - DevEco `assembleHap`（entry 与 entry@ohosTest）双 HAP 编译成功 (退出码 0)；
+     - Node 回归测试 `protocol-suite.js` 扩展至 33 项全部通过 (退出码 0)；
+     - 官方模拟器（`127.0.0.1:5555`）执行 `run-e2e-with-network-test.js` 4 项测试全部通过 (0 Failures, 0 Errors, 6 阶段有效产物完整捕获并镜像至 Brain 目录)。
+- 更新时间：2026-10-21 06:48
 - 当前分支：`harmonyos/native-port`
 - 实施者：AntiGravity
-- 监督审查参考：`REVIEW_RUN16.md`, `RESUME_RUN17.md`, `INCIDENT_IME_14.md`
+- 监督审查参考：`REVIEW_F02_18.md`, `RESUME_RUN18.md`
 
 ## 监督意见落实与本次核心重构详单
 
