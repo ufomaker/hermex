@@ -1224,50 +1224,68 @@ struct Index {
                 // 工具调用状态卡片
                 if (msg.toolCalls && msg.toolCalls.length > 0) {
                   ForEach(msg.toolCalls, (tool: ToolCallItem) => {
-                    Row() {
-                      Text(`工具: ${tool.name}`)
-                        .fontSize(11)
-                        .fontWeight(FontWeight.Medium)
-                        .fontColor('#374151')
-                      Blank()
-                      Text(tool.status === 'running' ? '执行中...' : '已完成')
-                        .fontSize(11)
-                        .fontColor(tool.status === 'running' ? '#D97706' : '#10B981')
+                    Column() {
+                      Row() {
+                        Text(`工具: ${tool.name}`)
+                          .id(`txt_tool_name_${tool.id}`)
+                          .fontSize(11)
+                          .fontWeight(FontWeight.Medium)
+                          .fontColor('#374151')
+                        Blank()
+                        Text(tool.status === 'running' ? '执行中...' : (tool.status === 'failed' ? '执行失败' : '已完成'))
+                          .id(`txt_tool_status_${tool.id}`)
+                          .fontSize(11)
+                          .fontColor(tool.status === 'running' ? '#D97706' : (tool.status === 'failed' ? '#EF4444' : '#10B981'))
+                      }
+                      .width('100%')
+
+                      if (tool.output && tool.output.trim().length > 0) {
+                        Text(tool.output.length > 200 ? tool.output.substring(0, 200) + '...' : tool.output)
+                          .id(`txt_tool_output_${tool.id}`)
+                          .fontSize(10)
+                          .fontColor('#4B5563')
+                          .fontFamily('monospace')
+                          .margin({ top: 3 })
+                          .maxLines(3)
+                          .textOverflow({ overflow: TextOverflow.Ellipsis })
+                      }
                     }
                     .width('100%')
                     .padding(6)
                     .margin({ bottom: 4 })
                     .backgroundColor('#E5E7EB')
                     .borderRadius(4)
-                  }, (tool: ToolCallItem) => `${tool.id}_${tool.status}_${tool.name}`)
+                  }, (tool: ToolCallItem) => `${tool.id}_${tool.status}_${tool.name}_${tool.output || ''}`)
                 }
 
                 // 主文字气泡 (集成 MarkdownView)
-                Column() {
-                  if (msg.role === 'user') {
-                    Text(msg.content)
-                      .fontSize(15)
-                      .fontColor('#FFFFFF')
-                  } else {
-                    MarkdownView({ content: msg.content || (msg.status === 'streaming' ? '思考与撰写中...' : '') })
+                if ((msg.content && msg.content.trim().length > 0) || (msg.role === 'assistant' && msg.status === 'streaming')) {
+                  Column() {
+                    if (msg.role === 'user') {
+                      Text(msg.content)
+                        .fontSize(15)
+                        .fontColor('#FFFFFF')
+                    } else {
+                      MarkdownView({ content: msg.content || (msg.status === 'streaming' ? '思考与撰写中...' : '') })
+                    }
+                    if (msg.content && msg.content.includes('[🎤 语音')) {
+                      Button(this.isPlayingAudio && this.currentlyPlayingAudioUrl.length > 0 ? '⏹ 停止播放' : '▶ 播放语音')
+                        .fontSize(11)
+                        .height(26)
+                        .backgroundColor('#E0F2FE')
+                        .fontColor('#0284C7')
+                        .margin({ top: 6 })
+                        .onClick(async () => {
+                          await this.handlePlayVoiceMessage(msg.content);
+                        })
+                    }
                   }
-                  if (msg.content && msg.content.includes('[🎤 语音')) {
-                    Button(this.isPlayingAudio && this.currentlyPlayingAudioUrl.length > 0 ? '⏹ 停止播放' : '▶ 播放语音')
-                      .fontSize(11)
-                      .height(26)
-                      .backgroundColor('#E0F2FE')
-                      .fontColor('#0284C7')
-                      .margin({ top: 6 })
-                      .onClick(async () => {
-                        await this.handlePlayVoiceMessage(msg.content);
-                      })
-                  }
+                  .id(msg.role === 'assistant' ? 'msg_bubble_assistant' : 'msg_bubble_user')
+                  .padding(12)
+                  .backgroundColor(msg.role === 'user' ? '#007AFF' : '#F2F2F7')
+                  .borderRadius(12)
+                  .alignSelf(msg.role === 'user' ? ItemAlign.End : ItemAlign.Start)
                 }
-                .id(msg.role === 'assistant' ? 'msg_bubble_assistant' : 'msg_bubble_user')
-                .padding(12)
-                .backgroundColor(msg.role === 'user' ? '#007AFF' : '#F2F2F7')
-                .borderRadius(12)
-                .alignSelf(msg.role === 'user' ? ItemAlign.End : ItemAlign.Start)
               }
               .width('100%')
               .alignItems(msg.role === 'user' ? HorizontalAlign.End : HorizontalAlign.Start)

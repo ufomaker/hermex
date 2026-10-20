@@ -94,8 +94,9 @@ export default function chatApprovalUiTest() {
       await driver.delayMs(2000);
 
       // 5. 中文输入并发出（携带唯一标记，防止混淆）
-      const testTag = 'RUN15_' + Date.now().toString(36);
+      const testTag = 'RUN16_' + Date.now().toString(36);
       const uniquePrompt = `【${testTag}】请执行命令: python3 -c 'print(1)'`;
+      hilog.info(DOMAIN, TAG, 'PROMPT_TAG: %{public}s', testTag);
       hilog.info(DOMAIN, TAG, 'Step 5: Sending unique command prompt: %{public}s', uniquePrompt);
 
       const inputChat = await driver.findComponent(ON.id('input_chat_message'));
@@ -129,6 +130,8 @@ export default function chatApprovalUiTest() {
       }
       expect(btnOnce !== null).assertTrue();
       expect(cardContainer !== null).assertTrue();
+      hilog.info(DOMAIN, TAG, 'PHASE: CAPTURE_STAGE_01_APPROVAL_CARD');
+      await driver.delayMs(2500); // 留出时间让协调器捕获稳定的审批卡片页面
       hilog.info(DOMAIN, TAG, 'Step 6: Real approval card detected. Clicking once...');
       if (btnOnce) {
         await btnOnce.click();
@@ -165,6 +168,8 @@ export default function chatApprovalUiTest() {
       // (5) 助手气泡组件存在
       const assistantBubble = await driver.findComponent(ON.id('msg_bubble_assistant'));
       expect(assistantBubble !== null).assertTrue();
+      hilog.info(DOMAIN, TAG, 'PHASE: CAPTURE_STAGE_02_EXACT_REPLY');
+      await driver.delayMs(2500); // 留出时间让协调器捕获稳定的终态回复页面
       hilog.info(DOMAIN, TAG, 'Step 7 PASS: Exact reply verified, approval card dismissed, generation ended!');
 
       // 8. 真实系统生命周期测试 (切换主页后台 -> 恢复前台)
@@ -182,9 +187,13 @@ export default function chatApprovalUiTest() {
       // 验证切回前台后，历史正文依然完整呈现
       const historyAfterFg = await driver.findComponent(ON.text('The command returned: 1.', MatchPattern.CONTAINS));
       expect(historyAfterFg !== null).assertTrue();
+      hilog.info(DOMAIN, TAG, 'PHASE: CAPTURE_STAGE_03_AFTER_LIFECYCLE');
+      await driver.delayMs(2500); // 留出时间捕获生命周期恢复后的页面
       hilog.info(DOMAIN, TAG, 'Step 8 PASS: Real OS lifecycle foreground/background transition verified!');
 
       // 9. 真实网络扰动与同会话重连断言
+      hilog.info(DOMAIN, TAG, 'PHASE: CAPTURE_STAGE_04_BEFORE_DISCONNECT');
+      await driver.delayMs(2000);
       hilog.info(DOMAIN, TAG, 'PHASE: DISCONNECT_TRIGGER_READY');
       // 等待宿主机协调脚本移除 9199 反向端口并断开连接
       let isDisconnected = false;
@@ -201,6 +210,8 @@ export default function chatApprovalUiTest() {
         await driver.delayMs(1000);
       }
       expect(isDisconnected).assertTrue();
+      hilog.info(DOMAIN, TAG, 'PHASE: CAPTURE_STAGE_05_DURING_DISCONNECT');
+      await driver.delayMs(2000);
       hilog.info(DOMAIN, TAG, 'Step 9.1 PASS: Real network disconnect verified on UI!');
 
       // 通知宿主机协调脚本恢复反向端口 9199
@@ -218,14 +229,25 @@ export default function chatApprovalUiTest() {
       // 等待重新连接完成，并验证同一会话历史消息重新拉取成功
       let isReconnected = false;
       let finalReplyAfterReconnect: Component | null = null;
+      let promptAfterReconnect: Component | null = null;
+      let toolNameAfterReconnect: Component | null = null;
+      let toolStatusAfterReconnect: Component | null = null;
+      let rawJsonBubbleOnScreen: Component | null = null;
+
       for (let i = 0; i < 30; i++) {
         const txtStatus = await driver.findComponent(ON.id('txt_connection_status'));
         finalReplyAfterReconnect = await driver.findComponent(ON.text('The command returned: 1.', MatchPattern.CONTAINS));
+        promptAfterReconnect = await driver.findComponent(ON.text(uniquePrompt, MatchPattern.CONTAINS));
+        toolNameAfterReconnect = await driver.findComponent(ON.text('工具: terminal', MatchPattern.CONTAINS));
+        toolStatusAfterReconnect = await driver.findComponent(ON.text('已完成', MatchPattern.CONTAINS));
+        rawJsonBubbleOnScreen = await driver.findComponent(ON.text('"exit_code": 0', MatchPattern.CONTAINS));
+
         if (txtStatus) {
           const sText = await txtStatus.getText();
-          hilog.info(DOMAIN, TAG, 'Polling reconnect [%{public}d]: sText=%{public}s, foundReply=%{public}s', i, sText, String(finalReplyAfterReconnect !== null));
+          hilog.info(DOMAIN, TAG, 'Polling reconnect [%{public}d]: sText=%{public}s, foundReply=%{public}s, foundPrompt=%{public}s, foundTool=%{public}s',
+            i, sText, String(finalReplyAfterReconnect !== null), String(promptAfterReconnect !== null), String(toolNameAfterReconnect !== null));
           if (sText.indexOf('会话已恢复') >= 0 || sText.indexOf('已恢复') >= 0 || sText.indexOf('已就绪') >= 0 || sText.indexOf('已连接') >= 0 || sText.indexOf('在线') >= 0) {
-            if (finalReplyAfterReconnect) {
+            if (finalReplyAfterReconnect && promptAfterReconnect && toolNameAfterReconnect) {
               isReconnected = true;
               break;
             }
@@ -241,7 +263,15 @@ export default function chatApprovalUiTest() {
       }
       expect(isReconnected).assertTrue();
       expect(finalReplyAfterReconnect !== null).assertTrue();
-      hilog.info(DOMAIN, TAG, 'Step 9.2 PASS: Real network reconnection to same session verified with exact reply intact!');
+      expect(promptAfterReconnect !== null).assertTrue();
+      expect(toolNameAfterReconnect !== null).assertTrue();
+      expect(toolStatusAfterReconnect !== null).assertTrue();
+      // 绝不可将原始 tool 结果 JSON 渲染为气泡
+      expect(rawJsonBubbleOnScreen === null).assertTrue();
+
+      hilog.info(DOMAIN, TAG, 'PHASE: CAPTURE_STAGE_06_RECONNECTED_HISTORY');
+      await driver.delayMs(2500); // 留出时间捕获重连历史页面
+      hilog.info(DOMAIN, TAG, 'Step 9.2 PASS: Real network reconnection verified with prompt, tool name terminal, and exact reply intact!');
     });
 
     it('testRcpNativePatchEcho', 0, async () => {

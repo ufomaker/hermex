@@ -79,3 +79,4 @@ __pycache__/
 **/*.hsp
 harmonyos/local.properties
 harmonyos/artifacts/
+test-artifacts/

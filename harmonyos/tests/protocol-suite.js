@@ -747,6 +747,7 @@ const { NotificationUtils } = customRequire(rootDir, './entry/src/main/ets/utils
 const { DeepLinkUtils, AppDeepLinkRouter } = customRequire(rootDir, './entry/src/main/ets/utils/DeepLinkUtils.ets');
 const { ShareUtils } = customRequire(rootDir, './entry/src/main/ets/utils/ShareUtils.ets');
 const { VoiceUtils } = customRequire(rootDir, './entry/src/main/ets/utils/VoiceUtils.ets');
+const { HermesHistoryNormalizer } = customRequire(rootDir, './entry/src/main/ets/utils/HermesHistoryNormalizer.ets');
 
 // --- 3. 端到端行为与契约验证 ---
 
@@ -2430,12 +2431,146 @@ export const test = true;
 
   console.log('[PASS 30] DeepLinkUtils、AppDeepLinkRouter、ShareUtils 与 VoiceUtils 平台集成测试通过');
 
+  // --- 测试用例 31: 真实服务端证据与通用历史归一化 (HermesHistoryNormalizer) ---
+  console.log('\n[TEST 31] 测试真实服务端证据 run15-server-evidence.json 与多工具/乱序/失败/非JSON场景历史归一化:');
+  {
+    // 1. 读取真实隔离服务证据 fixture: run15-server-evidence.json
+    let evidenceFixturePath = path.resolve(__dirname, '../../../hermex-supervision/run15-server-evidence.json');
+    if (!fs.existsSync(evidenceFixturePath)) {
+      evidenceFixturePath = path.resolve(__dirname, 'fixtures/run15-server-evidence.json');
+    }
+    assert(fs.existsSync(evidenceFixturePath), 'run15-server-evidence.json 存在');
+    const fixtureData = JSON.parse(fs.readFileSync(evidenceFixturePath, 'utf8'));
+
+    const normalizedFromFixture = HermesHistoryNormalizer.normalize(fixtureData.messages);
+    console.log(`  -> 真实证据 ${fixtureData.messages.length} 行原始消息归一化为 ${normalizedFromFixture.length} 条结构化消息`);
+
+    // 断言 1: 消息数量与角色
+    assert(normalizedFromFixture.length >= 2, '至少包含用户与助手消息');
+    const userMsg = normalizedFromFixture.find(m => m.role === 'user');
+    assert(userMsg && userMsg.content.includes(fixtureData.prompt_marker), '用户消息包含唯一标记 prompt');
+
+    const astFinalMsg = normalizedFromFixture.find(m => m.role === 'assistant' && m.content.includes('The command returned: 1.'));
+    assert(astFinalMsg, '助手终态回复包含 "The command returned: 1."');
+
+    // 断言 2: tool 角色绝不可伪装为助手独立消息气泡，且不能有整段 raw JSON 气泡
+    const toolAsMsg = normalizedFromFixture.filter(m => m.role === 'tool');
+    assert(toolAsMsg.length === 0, 'tool 角色绝不可作为独立 ChatMessage 呈现');
+    const rawJsonBubble = normalizedFromFixture.filter(m => m.content.includes('"exit_code": 0') || m.content.includes('"approval":'));
+    assert(rawJsonBubble.length === 0, '原始 tool 输出 JSON 绝不可作为正文消息气泡');
+
+    // 断言 3: 工具名称与调用关联正确
+    assert(astFinalMsg.toolCalls && astFinalMsg.toolCalls.length === 1, '助手终态消息附带 1 个工具调用');
+    const tool0 = astFinalMsg.toolCalls[0];
+    assert(tool0.name === 'terminal', `工具名称应为 terminal，实际为 ${tool0.name}`);
+    assert(tool0.status === 'completed', '工具状态应为 completed');
+    assert(tool0.output === '1', `工具输出应解析为 1，实际为 ${tool0.output}`);
+    assert(tool0.input && tool0.input.includes('python3 -c \\"print(1)\\"'), '工具输入参数保留完整');
+    console.log('  -> 真实证据 fixture 归一化验证通过 (工具名: terminal, 结果: 1, 终态正文完整)');
+
+    // 2. 测试场景：多工具并发调用 + 乱序返回
+    const multiToolRaw = [
+      {
+        id: 201,
+        role: 'user',
+        content: '请同时读取两个文件'
+      },
+      {
+        id: 202,
+        role: 'assistant',
+        content: '正在读取...',
+        tool_calls: [
+          { id: 'call_read_a', function: { name: 'file_read', arguments: '{"path":"/a.txt"}' } },
+          { id: 'call_read_b', function: { name: 'file_read', arguments: '{"path":"/b.txt"}' } }
+        ]
+      },
+      {
+        id: 203,
+        role: 'tool',
+        tool_call_id: 'call_read_b', // 乱序返回 B
+        tool_name: 'file_read',
+        content: '{"output":"Content of B","exit_code":0}'
+      },
+      {
+        id: 204,
+        role: 'tool',
+        tool_call_id: 'call_read_a', // 后返回 A
+        tool_name: 'file_read',
+        content: '{"output":"Content of A","exit_code":0}'
+      },
+      {
+        id: 205,
+        role: 'assistant',
+        content: '两个文件均已读取完毕。',
+        finish_reason: 'stop'
+      }
+    ];
+    const multiNorm = HermesHistoryNormalizer.normalize(multiToolRaw);
+    const multiAst = multiNorm.find(m => m.content.includes('两个文件均已读取完毕'));
+    assert(multiAst && multiAst.toolCalls && multiAst.toolCalls.length === 2, '正确收集并发返回的 2 个工具');
+    assert(multiAst.toolCalls.some(t => t.id === 'call_read_a' && t.output === 'Content of A'), '工具 A 关联输出正确');
+    assert(multiAst.toolCalls.some(t => t.id === 'call_read_b' && t.output === 'Content of B'), '工具 B 关联输出正确');
+    console.log('  -> 多工具并发与乱序返回归一化通过');
+
+    // 3. 测试场景：工具执行失败 (exit_code != 0 或 error 字段)
+    const failedToolRaw = [
+      { id: 301, role: 'user', content: '运行失败命令' },
+      {
+        id: 302,
+        role: 'assistant',
+        tool_calls: [{ id: 'call_fail', function: { name: 'bash', arguments: '{"cmd":"exit 1"}' } }]
+      },
+      {
+        id: 303,
+        role: 'tool',
+        tool_call_id: 'call_fail',
+        content: '{"error":"Permission denied","exit_code":1}'
+      },
+      {
+        id: 304,
+        role: 'assistant',
+        content: '执行遇到权限问题。'
+      }
+    ];
+    const failedNorm = HermesHistoryNormalizer.normalize(failedToolRaw);
+    const failedAst = failedNorm.find(m => m.content.includes('执行遇到权限问题'));
+    assert(failedAst && failedAst.toolCalls && failedAst.toolCalls.length === 1, '失败工具挂载');
+    assert(failedAst.toolCalls[0].status === 'failed', '状态正确标记为 failed');
+    assert(failedAst.toolCalls[0].output === 'Permission denied', '输出提取错误内容');
+    console.log('  -> 工具执行失败与错误状态捕获通过');
+
+    // 4. 测试场景：非 JSON 纯文本工具输出 + 未关联 tool_call_id 兜底
+    const nonJsonRaw = [
+      { id: 401, role: 'user', content: '查看状态' },
+      {
+        id: 402,
+        role: 'tool',
+        tool_name: 'git_status',
+        content: 'On branch main\nnothing to commit'
+      },
+      {
+        id: 403,
+        role: 'assistant',
+        content: '当前工作区干净。'
+      }
+    ];
+    const nonJsonNorm = HermesHistoryNormalizer.normalize(nonJsonRaw);
+    const nonJsonAst = nonJsonNorm.find(m => m.content.includes('当前工作区干净'));
+    assert(nonJsonAst && nonJsonAst.toolCalls && nonJsonAst.toolCalls.length === 1, '非 JSON 结果且无 id 工具正确兜底关联');
+    assert(nonJsonAst.toolCalls[0].name === 'git_status', '名称正确提取');
+    assert(nonJsonAst.toolCalls[0].output.includes('On branch main'), '非 JSON 纯文本原样保留');
+    console.log('  -> 非 JSON 纯文本与缺失 ID 兜底容错通过');
+
+    console.log('[PASS 31] HermesHistoryNormalizer 真实证据与通用历史归一化全链路通过');
+  }
+
   vm.disconnect();
   server.close();
 
   console.log('\n======================================================');
-  console.log('✅ 所有 30 项端到端生产代码行为回归测试全部通过 (退出码 0)');
+  console.log('✅ 所有 31 项端到端生产代码行为回归测试全部通过 (退出码 0)');
   console.log('覆盖真实生产业务类：');
+  console.log('  - HermesHistoryNormalizer.ets (上游 HermesTranscriptHistory.swift 对齐通用历史归一化、多工具、乱序、失败、非JSON与证据 fixture 回归)');
   console.log('  - HermesRESTClient.ets (Cookie Jar、登录、/api/auth/me 核验、Ticket、会话与历史)');
   console.log('  - HermesGatewayClient.ets (WebSocket 握手、client.capabilities 回执、关闭码、RPC 30s 超时、取消、file.attach)');
   console.log('  - ChatViewModel.ets (会话恢复门禁、禁止发送、async 代次乱序拦截、中文流式、推理、工具、连续同名工具审批防误清、模型配置、文档附加)');

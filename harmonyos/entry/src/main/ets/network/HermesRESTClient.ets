@@ -2,6 +2,7 @@ import http from '@ohos.net.http';
 import { BotConnection, HermesStatus } from '../model/Connection';
 import { HermesSession } from '../model/Session';
 import { ChatMessage, ToolCallItem } from '../model/ChatMessage';
+import { HermesHistoryNormalizer } from '../utils/HermesHistoryNormalizer';
 
 export interface LoginResult {
   token?: string;
@@ -274,34 +275,7 @@ export class HermesRESTClient {
       const dataStr = typeof response.result === 'string' ? response.result : JSON.stringify(response.result);
       const parsed = JSON.parse(dataStr) as Record<string, Object>;
       const rawMsgs = Array.isArray(parsed['messages']) ? (parsed['messages'] as Array<Record<string, Object>>) : [];
-      const messages: ChatMessage[] = [];
-
-      for (let i = 0; i < rawMsgs.length; i++) {
-        const item = rawMsgs[i];
-        const roleStr = String(item['role'] || 'assistant');
-        const role = (roleStr === 'user' ? 'user' : (roleStr === 'system' ? 'system' : 'assistant'));
-        const content = String(item['content'] || '');
-        const rawTools = Array.isArray(item['tool_calls']) ? (item['tool_calls'] as Array<Record<string, Object>>) : [];
-        const tools: ToolCallItem[] = [];
-        for (let j = 0; j < rawTools.length; j++) {
-          const t = rawTools[j];
-          tools.push({
-            id: String(t['id'] || `tool_${j}`),
-            name: String(t['name'] || 'tool'),
-            output: t['output'] ? String(t['output']) : undefined,
-            status: 'completed'
-          });
-        }
-        messages.push({
-          id: String(item['id'] || `msg_${i}_${Date.now()}`),
-          role: role,
-          content: content,
-          toolCalls: tools,
-          status: 'complete',
-          createdAt: Number(item['created_at'] || Date.now())
-        });
-      }
-      return messages;
+      return HermesHistoryNormalizer.normalize(rawMsgs);
     } finally {
       client.destroy();
     }

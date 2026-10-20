@@ -1,39 +1,40 @@
 # Hermex HarmonyOS 移植状态追踪
 
-- 状态：**阶段五（Run 15 完善）官方模拟器 Hypium 端到端 UI 审批流、精确终态回复、真实系统生命周期与真实网络扰动断线同会话重连全线通过 (Stage 5 Full Official Hypium E2E UiTest, Exact Reply, Real Lifecycle & Real Network Drop/Reconnect Verified)**
-- 当前阶段：Run 15 工作块已全部落实：
-  1. **核心 UI 精确正文与状态机断言 (落实 REVIEW_UI_14.md 审查项 1)**：
-     - 在 `harmonyos/entry/src/ohosTest/ets/test/ChatApprovalUi.test.ets` 中，将弱断言 `ON.text('1')` 彻底替换为对 stub 模型真实终态回复 `"The command returned: 1."` 的精确文本断言；
-     - 指令输入引入毫秒级动态唯一标识 `【RUN15_${timestamp}】请执行命令: python3 -c 'print(1)'`，严密防范多轮测试历史消息脏数据污染；
-     - 严格断言审批卡片（`btn_approval_once`）彻底销毁、生成状态（`btn_stop_generating`）彻底终止、发送入口（`btn_send_message`）恢复可用、助手消息气泡（`msg_bubble_assistant`）成功渲染。
-  2. **真实系统生命周期前后台切换 (落实 REVIEW_UI_14.md 审查项 2)**：
-     - 废除单测内部篡改 `AppStorage.setOrCreate('appScenePhase', ...)` 的假前后台逻辑；
-     - 改用真实系统级操作：通过 `driver.pressHome()` 真实退出至系统桌面，触发 EntryAbility 真实 `onBackground`，随后通过 `delegator.startAbility({ bundleName, abilityName: 'EntryAbility' })` 真实唤醒应用触发 `onForeground`；
-     - 切回前台后严格验证同一会话历史记录与精确正文无损回填。
-  3. **真实网络扰动与同会话重连 (落实 REVIEW_UI_14.md 审查项 3)**：
-     - 编写宿主机协调器脚本 `harmonyos/tests/run-e2e-with-network-test.js`，通过实时监听 hilog 事件阶段：
-       - 在测试发出 `PHASE: DISCONNECT_TRIGGER_READY` 时，宿主机执行 `hdc fport rm tcp:9199 tcp:9199` 真实切断端口；
-       - UI 状态栏组件 `txt_connection_status` 真实感知网络中断并显示为 `"已断开"`（红灯）；
-       - 在测试发出 `PHASE: DISCONNECT_VERIFIED_NOW_RECONNECT` 时，宿主机执行 `hdc rport tcp:9199 tcp:9199` 恢复反向端口；
-       - 点击状态栏重新连接按钮 `btn_reconnect_status`，触发 `chatVm.attachSession` 经由 `session.resume` 恢复到同一会话 (`storedSessionId`)；
-       - 状态栏正确变为 `"会话已恢复"`，历史消息完整保留，终态回复 `"The command returned: 1."` 完好无损。
-  4. **六大阶段真实屏幕与布局树快照留档**：
-     - `snap_01_approval_card.jpeg` / `layout_01_approval_card.json`
-     - `snap_02_exact_reply.jpeg` / `layout_02_exact_reply.json`
-     - `snap_03_after_real_lifecycle.jpeg` / `layout_03_after_real_lifecycle.json`
-     - `snap_04_before_disconnect.jpeg` / `layout_04_before_disconnect.json`
-     - `snap_05_during_disconnect.jpeg` / `layout_05_during_disconnect.json`
-     - `snap_06_reconnected_history.jpeg` / `layout_06_reconnected_history.json`
-  5. **官方 Hypium UiTest + RCP PATCH 全量通过**：
-     - `Tests run: 3, Failure: 0, Error: 0, Pass: 3, Ignore: 0` (退出码 0)
-  6. **安全与协议合规（落实 INCIDENT_IME_14.md）**：
-     - 严禁且无任何自动勾选、自动同意隐私协议或输入法协议的违规行为；
-     - 严禁且未通过 shell 命令预先绕过授权或授予敏感系统权限；
-     - `harmonyos/build-profile.json5` 持续保持 `skip-worktree` (`S`)，签名字段安全无泄漏。
-- 更新时间：2026-10-21 02:55
+- 状态：**阶段五（Run 16 完善）通用历史归一化、真实服务端工具调用与结果结构化恢复、协调器防竞态与严格断言全线通过 (Stage 5 Universal History Normalization, Tool Association & Robust Coordinator Verified)**
+- 当前阶段：Run 16 工作块已全部落实：
+  1. **生产级历史归一化引擎与工具关联（落实 REVIEW_HISTORY_16.md）**：
+     - 新建生产工具类 `HermesHistoryNormalizer.ets`，严格对齐上游 `HermesTranscriptHistory.swift` 与 `ChatMessage.swift` 规范；
+     - 准确解析 `assistant.tool_calls` 中的嵌套 `function.name` 与 `function.arguments`，维护跨轮次调用映射表；
+     - `role === "tool"` 绝不伪装为助手独立气泡，提取输出结构（解析 JSON `output`/`error`/`exit_code`，或保留纯文本）并正确绑定至对应工具调用声明；
+     - 工具执行状态（`completed` / `failed`）根据退出码与错误字段动态判别；
+     - 彻底消除恢复历史后全段原始 JSON 覆盖助手正文的缺陷，正常保留 assistant 文本；
+     - 兼容未知角色与字段，无丢失数据风险；
+     - 生产 `HermesRESTClient.getSessionMessages` 全面接入 `HermesHistoryNormalizer.normalize`。
+  2. **协议与行为回归套件扩展至 31 项全绿**：
+     - 新增 `TEST 31`，直接驱动真实隔离服务证据 fixture `run15-server-evidence.json`；
+     - 覆盖并发多工具、乱序返回、工具执行失败、非 JSON 纯文本、无 ID 工具兜底关联；
+     - 31/31 测试全量通过（退出码 0）。
+  3. **协调器防竞态与产物有效性增强（落实 REVIEW_UI_15.md）**：
+     - 测试用例与协调器引入阶段同步（`PHASE: CAPTURE_STAGE_...`），预留稳定延迟，杜绝异步抢跑导致截图截入系统桌面过度帧；
+     - 产物目录改为相对路径 `test-artifacts/` 或由 `ARTIFACTS_DIR` 环境变量指定；
+     - `captureArtifacts` 增加严格门禁：截图必须存在且 > 1000 字节，布局树必须为有效 JSON 且子节点非空；
+     - 退出核验增加全量检查：必须 3 个用例全部通过、零失败、零错误、断网与恢复两个阶段齐备、且所有 6 个阶段有效产物全部捕获。
+  4. **UI 测试多重断言闭环（模拟器 127.0.0.1:5555）**：
+     - 带有动态唯一种子 `RUN16_mvh6l6d7` 的 prompt 完整保留；
+     - 工具卡片正确显示 `工具: terminal`（非 `tool`）与 `已完成`；
+     - 工具输出显示为 `1`；
+     - 终态回复 `The command returned: 1.` 完整呈现；
+     - 绝对断言：界面绝无 `"exit_code": 0` 等原始 JSON 气泡；
+     - 记录会话 ID 为真实 `20261021_051410_b8fe7b`，重连确为同一会话。
+  5. **证据分级明确记录**：
+     - **Node 平台回归**：`protocol-suite.js` 31 项业务类单元与契约测试全通过；
+     - **官方隔离服务联调**：Hermes 0.21.5 / ca678285（端口 9199，`hermex/hermex-local`）通过真实握手、会话创建、审批执行与历史回填；
+     - **官方模拟器 UI 自动化**：OpenHarmony 6.0.1.112 API 21（`127.0.0.1:5555`）通过完整 6 阶段自动化测试，产物留档在 `test-artifacts/` 与 Brain 目录；
+     - **真机设备**：待监督者在实际物理设备上验证。
+- 更新时间：2026-10-21 05:16
 - 当前分支：`harmonyos/native-port`
 - 实施者：AntiGravity
-- 监督审查参考：`REVIEW_UI_14.md`, `INCIDENT_IME_14.md`, `RESUME_RUN15.md`
+- 监督审查参考：`REVIEW_HISTORY_16.md`, `REVIEW_UI_15.md`, `INCIDENT_IME_14.md`, `RESUME_RUN16.md`
 
 ## 监督意见落实与本次核心重构详单
 
