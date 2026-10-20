@@ -8,8 +8,12 @@ import { ChatMessage, ToolCallItem } from '../model/ChatMessage';
 import { ModelOption } from '../model/Approval';
 import { WorkspaceFileEntry } from '../network/HermesWorkspaceClient';
 import { HermesFileClient } from '../network/HermesFileClient';
+import { AuthStore } from '../storage/AuthStore';
 import { MarkdownView } from '../components/MarkdownView';
 import promptAction from '@ohos.promptAction';
+import picker from '@ohos.file.picker';
+import fs from '@ohos.file.fs';
+import util from '@ohos.util';
 
 @Entry
 @Component
@@ -60,22 +64,16 @@ struct Index {
   @State isDownloadingFile: boolean = false;
 
   // Attachment States
-  @State attachmentFileName: string = 'screenshot.png';
-  @State attachmentDataUrl: string = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
   @State isUploadingAttachment: boolean = false;
   @State attachmentStatusText: string = '';
 
-  aboutToAppear() {
+  async aboutToAppear() {
     this.chatVm.setListener({
       onStateChanged: () => {
         this.syncVmState();
       },
       onErrorToast: (msg: string) => {
-        try {
-          promptAction.showToast({ message: msg, duration: 3000 });
-        } catch (e) {
-          // ignore prompt error in headless test
-        }
+        this.showToast(msg);
       }
     });
 
@@ -92,11 +90,21 @@ struct Index {
       }
     });
 
+    // 严格等待 AuthStore 完成平台安全存储初始化与冷启动数据还原
+    await AuthStore.getInstance().waitUntilReady();
     this.initDefaultConnection();
   }
 
   aboutToDisappear() {
     this.chatVm.disconnect();
+  }
+
+  private showToast(message: string): void {
+    try {
+      promptAction.showToast({ message: message, duration: 3000 });
+    } catch (e) {
+      // ignore
+    }
   }
 
   private syncVmState() {
@@ -205,72 +213,206 @@ struct Index {
       this.showSessionListDialog = false;
       this.refreshSessions();
     } catch (e) {
-      try {
-        promptAction.showToast({ message: `创建会话失败: ${e}`, duration: 3000 });
-      } catch (err) {}
+      this.showToast(`创建会话失败: ${e}`);
     }
   }
 
+  /**
+   * 下载文件并实际保存到文件系统或用户选择的存储位置
+   */
   private async handleDownloadFile(entry: WorkspaceFileEntry) {
     const cur = this.connVm.getCurrentConnection();
     if (!cur) return;
+
     try {
+      this.showToast(`正在下载 ${entry.name}...`);
       const buffer = await this.workspaceVm.downloadFile(cur, entry, this.currentSessionId);
+
+      let savedLocation = '';
       try {
-        promptAction.showToast({ message: `文件已下载: ${entry.name} (${buffer.byteLength} 字节)`, duration: 3000 });
-      } catch (e) {}
+        const docPicker = new picker.DocumentViewPicker();
+        const saveOptions = new picker.DocumentSaveOptions();
+        saveOptions.newFileNames = [entry.name];
+        const uris = await docPicker.save(saveOptions);
+        if (uris && uris.length > 0) {
+          const file = fs.openSync(uris[0], fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
+          fs.writeSync(file.fd, buffer);
+          fs.closeSync(file.fd);
+          savedLocation = uris[0];
+        }
+      } catch (pickerErr) {
+        // DocumentViewPicker 异常时优雅降级写入沙箱
+      }
+
+      if (!savedLocation) {
+        const ctx = getContext(this);
+        const targetPath = `${ctx.filesDir}/${entry.name}`;
+        const file = fs.openSync(targetPath, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC);
+        fs.writeSync(file.fd, buffer);
+        fs.closeSync(file.fd);
+        savedLocation = targetPath;
+      }
+
+      this.showToast(`文件已成功保存: ${savedLocation} (${buffer.byteLength} 字节)`);
     } catch (e) {
-      try {
-        promptAction.showToast({ message: `下载失败: ${e}`, duration: 3000 });
-      } catch (err) {}
+      this.showToast(`下载或保存失败: ${e}`);
     }
   }
 
-  private async handleUploadAttachment() {
+  /**
+   * 从系统相册选择真实图片并上传
+   */
+  private async pickPhotoAndUpload() {
     const cur = this.connVm.getCurrentConnection();
     if (!cur) {
-      try {
-        promptAction.showToast({ message: '请先连接服务器', duration: 3000 });
-      } catch (e) {}
+      this.showToast('请先连接服务器');
       return;
     }
-
-    if (!this.attachmentDataUrl.trim()) {
-      try {
-        promptAction.showToast({ message: '请输入或选择图片 Data URL', duration: 3000 });
-      } catch (e) {}
-      return;
-    }
-
-    this.isUploadingAttachment = true;
-    this.attachmentStatusText = '正在上传图片...';
 
     try {
+      const photoPicker = new picker.PhotoViewPicker();
+      const result = await photoPicker.select({
+        MIMEType: picker.PhotoViewMIMETypes.IMAGE_TYPE,
+        maxSelectNumber: 1
+      });
+
+      if (!result || !result.photoUris || result.photoUris.length === 0) {
+        return;
+      }
+
+      const selectedUri = result.photoUris[0];
+      const filename = selectedUri.split('/').pop() || 'photo.jpg';
+
+      this.isUploadingAttachment = true;
+      this.attachmentStatusText = `正在读取并上传 ${filename}...`;
+
+      const file = fs.openSync(selectedUri, fs.OpenMode.READ_ONLY);
+      const stat = fs.statSync(file.fd);
+      const buf = new ArrayBuffer(stat.size);
+      fs.readSync(file.fd, buf);
+      fs.closeSync(file.fd);
+
+      const base64Helper = new util.Base64Helper();
+      const b64 = base64Helper.encodeToStringSync(new Uint8Array(buf));
+      const dataUrl = `data:image/jpeg;base64,${b64}`;
+
       const profile = cur.activeProfile ? cur.activeProfile : 'default';
-      const result = await HermesFileClient.uploadImage(
+      const uploadResult = await HermesFileClient.uploadImage(
         cur.url,
         profile,
-        this.attachmentFileName || 'image.png',
-        this.attachmentDataUrl,
+        filename,
+        dataUrl,
         cur.token,
         cur.cookies
       );
 
-      const targetPath = result.path || result.url || this.attachmentFileName;
-      this.attachmentStatusText = `上传成功: ${targetPath}`;
-      const refTag = `![${this.attachmentFileName}](${targetPath})\n`;
+      const targetPath = uploadResult.path || uploadResult.url || filename;
+      const refTag = `![${filename}](${targetPath})\n`;
       this.inputText = this.inputText ? `${this.inputText}\n${refTag}` : refTag;
 
-      try {
-        promptAction.showToast({ message: `图片已上传并插入输入框: ${targetPath}`, duration: 3000 });
-      } catch (e) {}
-
+      this.showToast(`图片已上传: ${filename}`);
       this.showAttachmentDialog = false;
     } catch (e) {
+      this.showToast(`选择/上传图片失败: ${e}`);
       this.attachmentStatusText = `上传失败: ${e}`;
-      try {
-        promptAction.showToast({ message: `上传失败: ${e}`, duration: 3000 });
-      } catch (err) {}
+    } finally {
+      this.isUploadingAttachment = false;
+    }
+  }
+
+  /**
+   * 从系统文件管理器选择文档并上传
+   */
+  private async pickDocumentAndUpload() {
+    const cur = this.connVm.getCurrentConnection();
+    if (!cur) {
+      this.showToast('请先连接服务器');
+      return;
+    }
+
+    try {
+      const docPicker = new picker.DocumentViewPicker();
+      const uris = await docPicker.select();
+      if (!uris || uris.length === 0) {
+        return;
+      }
+
+      const selectedUri = uris[0];
+      const filename = selectedUri.split('/').pop() || 'document.bin';
+
+      this.isUploadingAttachment = true;
+      this.attachmentStatusText = `正在读取并上传 ${filename}...`;
+
+      const file = fs.openSync(selectedUri, fs.OpenMode.READ_ONLY);
+      const stat = fs.statSync(file.fd);
+      const buf = new ArrayBuffer(stat.size);
+      fs.readSync(file.fd, buf);
+      fs.closeSync(file.fd);
+
+      const base64Helper = new util.Base64Helper();
+      const b64 = base64Helper.encodeToStringSync(new Uint8Array(buf));
+      const dataUrl = `data:application/octet-stream;base64,${b64}`;
+
+      const profile = cur.activeProfile ? cur.activeProfile : 'default';
+      const uploadResult = await HermesFileClient.uploadImage(
+        cur.url,
+        profile,
+        filename,
+        dataUrl,
+        cur.token,
+        cur.cookies
+      );
+
+      const targetPath = uploadResult.path || uploadResult.url || filename;
+      const refTag = `[${filename}](${targetPath})\n`;
+      this.inputText = this.inputText ? `${this.inputText}\n${refTag}` : refTag;
+
+      this.showToast(`文件已上传: ${filename}`);
+      this.showAttachmentDialog = false;
+    } catch (e) {
+      this.showToast(`选择/上传文件失败: ${e}`);
+      this.attachmentStatusText = `上传失败: ${e}`;
+    } finally {
+      this.isUploadingAttachment = false;
+    }
+  }
+
+  /**
+   * 上传内置测试样例图 (供无图库或自动化测试环境便捷验证)
+   */
+  private async uploadSampleImage() {
+    const cur = this.connVm.getCurrentConnection();
+    if (!cur) {
+      this.showToast('请先连接服务器');
+      return;
+    }
+
+    this.isUploadingAttachment = true;
+    this.attachmentStatusText = '正在上传测试图...';
+
+    try {
+      const filename = 'sample_1px.png';
+      const dataUrl = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+
+      const profile = cur.activeProfile ? cur.activeProfile : 'default';
+      const uploadResult = await HermesFileClient.uploadImage(
+        cur.url,
+        profile,
+        filename,
+        dataUrl,
+        cur.token,
+        cur.cookies
+      );
+
+      const targetPath = uploadResult.path || uploadResult.url || filename;
+      const refTag = `![${filename}](${targetPath})\n`;
+      this.inputText = this.inputText ? `${this.inputText}\n${refTag}` : refTag;
+
+      this.showToast(`测试图片已上传并插入输入框`);
+      this.showAttachmentDialog = false;
+    } catch (e) {
+      this.showToast(`上传测试图失败: ${e}`);
+      this.attachmentStatusText = `上传失败: ${e}`;
     } finally {
       this.isUploadingAttachment = false;
     }
@@ -494,7 +636,7 @@ struct Index {
       .layoutWeight(1)
       .padding({ left: 16, right: 16, top: 12, bottom: 12 })
 
-      // 5. 底部输入栏与控制 (支持附件上传)
+      // 5. 底部输入栏与控制 (支持原生附件调起)
       Row() {
         Button('📎')
           .fontSize(18)
@@ -917,57 +1059,15 @@ struct Index {
         .position({ x: '5%', y: '12%' })
       }
 
-      // 10. 附件图片上传弹窗
+      // 10. 原生附件选择与上传弹窗 (真正使用系统相册与文件管理器)
       if (this.showAttachmentDialog) {
         Column() {
-          Text('上传图片附件')
-            .fontSize(18)
-            .fontWeight(FontWeight.Bold)
-            .margin({ bottom: 12 })
-
-          TextInput({ text: this.attachmentFileName, placeholder: '文件名 (例如 prompt.png)' })
-            .height(38)
-            .margin({ bottom: 8 })
-            .onChange((val: string) => {
-              this.attachmentFileName = val;
-            })
-
-          TextInput({ text: this.attachmentDataUrl, placeholder: '图片 Data URL (data:image/png;base64,...)' })
-            .height(38)
-            .margin({ bottom: 8 })
-            .onChange((val: string) => {
-              this.attachmentDataUrl = val;
-            })
-
-          if (this.attachmentStatusText.length > 0) {
-            Text(this.attachmentStatusText)
-              .fontSize(11)
-              .fontColor('#4B5563')
-              .margin({ bottom: 8 })
-          }
-
           Row() {
-            Button('填入测试图')
-              .fontSize(12)
-              .backgroundColor('#F2F2F7')
-              .fontColor('#007AFF')
-              .margin({ right: 8 })
-              .onClick(() => {
-                this.attachmentFileName = 'sample-1px.png';
-                this.attachmentDataUrl = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
-              })
-
-            Button(this.isUploadingAttachment ? '上传中...' : '上传并附加')
-              .fontSize(12)
-              .backgroundColor('#007AFF')
-              .fontColor('#FFFFFF')
-              .enabled(!this.isUploadingAttachment)
-              .margin({ right: 8 })
-              .onClick(async () => {
-                await this.handleUploadAttachment();
-              })
-
-            Button('取消')
+            Text('添加附件')
+              .fontSize(18)
+              .fontWeight(FontWeight.Bold)
+            Blank()
+            Button('关闭')
               .fontSize(12)
               .backgroundColor('#E5E5EA')
               .fontColor('#374151')
@@ -975,13 +1075,58 @@ struct Index {
                 this.showAttachmentDialog = false;
               })
           }
+          .width('100%')
+          .margin({ bottom: 14 })
+
+          if (this.attachmentStatusText.length > 0) {
+            Text(this.attachmentStatusText)
+              .fontSize(12)
+              .fontColor(this.isUploadingAttachment ? '#2563EB' : '#4B5563')
+              .margin({ bottom: 12 })
+          }
+
+          Column({ space: 10 }) {
+            Button('📷 从系统相册选择图片')
+              .fontSize(14)
+              .width('100%')
+              .height(44)
+              .backgroundColor('#007AFF')
+              .fontColor('#FFFFFF')
+              .enabled(!this.isUploadingAttachment)
+              .onClick(async () => {
+                await this.pickPhotoAndUpload();
+              })
+
+            Button('📄 从文件管理器选择文档')
+              .fontSize(14)
+              .width('100%')
+              .height(44)
+              .backgroundColor('#F2F2F7')
+              .fontColor('#007AFF')
+              .enabled(!this.isUploadingAttachment)
+              .onClick(async () => {
+                await this.pickDocumentAndUpload();
+              })
+
+            Button('🧪 上传测试样例图片 (1px PNG)')
+              .fontSize(13)
+              .width('100%')
+              .height(40)
+              .backgroundColor('#E5E7EB')
+              .fontColor('#374151')
+              .enabled(!this.isUploadingAttachment)
+              .onClick(async () => {
+                await this.uploadSampleImage();
+              })
+          }
+          .width('100%')
         }
         .width('85%')
-        .padding(18)
+        .padding(20)
         .backgroundColor('#FFFFFF')
         .borderRadius(16)
         .shadow({ radius: 20, color: '#40000000' })
-        .position({ x: '7.5%', y: '20%' })
+        .position({ x: '7.5%', y: '25%' })
       }
     }
     .width('100%')

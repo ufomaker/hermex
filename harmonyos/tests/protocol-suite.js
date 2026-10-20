@@ -4,7 +4,7 @@
  * - HermesRESTClient.ets
  * - HermesGatewayClient.ets
  * - ChatViewModel.ets
- * - AuthStore.ets
+ * - AuthStore.ets (HarmonyPlatformAuthAdapter + Preferences + AssetStoreKit 密文硬件保管库)
  * - WorkspaceViewModel.ets
  * - HermesWorkspaceClient.ets
  * - HermesFileClient.ets
@@ -12,7 +12,7 @@
  * - HermesInsightsClient.ets
  * - LegacySSEClient.ets
  * - MarkdownParser.ets
- * 注入 @ohos.net.http, @ohos.net.webSocket, @ohos.data.preferences 平台适配器
+ * 注入 @ohos.net.http, @ohos.net.webSocket, @ohos.data.preferences, @ohos.security.asset, @ohos.file.fs, @ohos.file.picker, @ohos.util 平台适配器
  * 由独立 Mock Hermes 网关驱动真实网络与协议全闭环
  */
 
@@ -74,7 +74,6 @@ const platformHttpAdapter = {
               });
               res.on('end', () => {
                 const fullBuffer = Buffer.concat(chunks);
-                // 处理 ArrayBuffer 期望类型 (expectDataType === 2 / ARRAY_BUFFER)
                 if (options.expectDataType === 2) {
                   const ab = new ArrayBuffer(fullBuffer.length);
                   const view = new Uint8Array(ab);
@@ -187,6 +186,8 @@ const platformWebSocketAdapter = {
 platformWebSocketAdapter.default = platformWebSocketAdapter;
 
 const memoryPrefs = new Map();
+let mockPrefFailOnPut = false;
+
 const platformPreferencesAdapter = {
   default: {
     getPreferences: async (ctx, name) => {
@@ -195,7 +196,12 @@ const platformPreferencesAdapter = {
       }
       const store = memoryPrefs.get(name);
       return {
-        put: async (key, val) => store.set(key, val),
+        put: async (key, val) => {
+          if (mockPrefFailOnPut) {
+            throw new Error('Preferences put failed');
+          }
+          store.set(key, val);
+        },
         get: async (key, defVal) => store.has(key) ? store.get(key) : defVal,
         delete: async (key) => store.delete(key),
         clear: async () => store.clear(),
@@ -207,6 +213,125 @@ const platformPreferencesAdapter = {
     return platformPreferencesAdapter.default.getPreferences(ctx, name);
   }
 };
+
+// --- Mock AssetStoreKit (@ohos.security.asset) 硬件级加密凭据保管库 ---
+const mockAssetStorage = new Map();
+let mockAssetFailOnSave = false;
+let mockAssetFailOnRemove = false;
+
+const platformAssetAdapter = {
+  Tag: {
+    SECRET: 0x20000001,
+    ALIAS: 0x20000002,
+    RETURN_TYPE: 0x20000040
+  },
+  ReturnType: {
+    ALL: 0,
+    ATTRIBUTES: 1
+  },
+  add: async (attributes) => {
+    if (mockAssetFailOnSave) {
+      throw { code: 24000008, message: 'Database operation failed' };
+    }
+    const aliasBytes = attributes.get(platformAssetAdapter.Tag.ALIAS);
+    const secretBytes = attributes.get(platformAssetAdapter.Tag.SECRET);
+    const key = Buffer.from(aliasBytes).toString('utf8');
+    if (mockAssetStorage.has(key)) {
+      throw { code: 24000003, message: 'Asset already exists' };
+    }
+    mockAssetStorage.set(key, secretBytes);
+  },
+  update: async (query, updateAttrs) => {
+    if (mockAssetFailOnSave) {
+      throw { code: 24000008, message: 'Database operation failed' };
+    }
+    const aliasBytes = query.get(platformAssetAdapter.Tag.ALIAS);
+    const key = Buffer.from(aliasBytes).toString('utf8');
+    const secretBytes = updateAttrs.get(platformAssetAdapter.Tag.SECRET);
+    mockAssetStorage.set(key, secretBytes);
+  },
+  query: async (query) => {
+    const aliasBytes = query.get(platformAssetAdapter.Tag.ALIAS);
+    const key = Buffer.from(aliasBytes).toString('utf8');
+    if (!mockAssetStorage.has(key)) {
+      throw { code: 24000002, message: 'Asset not found' };
+    }
+    const secretBytes = mockAssetStorage.get(key);
+    const map = new Map();
+    map.set(platformAssetAdapter.Tag.SECRET, secretBytes);
+    return [map];
+  },
+  remove: async (query) => {
+    if (mockAssetFailOnRemove) {
+      throw { code: 24000008, message: 'Database operation failed' };
+    }
+    const aliasBytes = query.get(platformAssetAdapter.Tag.ALIAS);
+    const key = Buffer.from(aliasBytes).toString('utf8');
+    if (!mockAssetStorage.has(key)) {
+      throw { code: 24000002, message: 'Asset not found' };
+    }
+    mockAssetStorage.delete(key);
+  }
+};
+platformAssetAdapter.default = platformAssetAdapter;
+
+const platformFsAdapter = {
+  OpenMode: {
+    READ_ONLY: 0,
+    WRITE_ONLY: 1,
+    READ_WRITE: 2,
+    CREATE: 0o100,
+    TRUNC: 0o1000
+  },
+  openSync: (filePath, mode) => {
+    return { fd: 99, path: filePath };
+  },
+  writeSync: (fd, buffer) => {
+    return buffer.byteLength || buffer.length || 0;
+  },
+  readSync: (fd, buffer) => {
+    return buffer.byteLength || 0;
+  },
+  statSync: (fd) => {
+    return { size: 1024 };
+  },
+  closeSync: (fd) => {}
+};
+platformFsAdapter.default = platformFsAdapter;
+
+const platformPickerAdapter = {
+  PhotoViewMIMETypes: {
+    IMAGE_TYPE: 'image/*'
+  },
+  PhotoViewPicker: class {
+    select(options) {
+      return Promise.resolve({ photoUris: ['file:///data/storage/el2/base/photos/test_picked.png'] });
+    }
+  },
+  DocumentViewPicker: class {
+    select(options) {
+      return Promise.resolve(['file:///data/storage/el2/base/docs/test_doc.bin']);
+    }
+    save(options) {
+      return Promise.resolve(['file:///data/storage/el2/base/docs/saved_artifact.bin']);
+    }
+  },
+  DocumentSaveOptions: class {
+    constructor() {
+      this.newFileNames = [];
+    }
+  }
+};
+platformPickerAdapter.default = platformPickerAdapter;
+
+const platformUtilAdapter = {
+  Base64Helper: class {
+    encodeToStringSync(arr) {
+      return Buffer.from(arr).toString('base64');
+    }
+  }
+};
+platformUtilAdapter.default = platformUtilAdapter;
 
 // --- 2. 真实 ArkTS 模块加载器 ---
 
@@ -221,6 +346,18 @@ function customRequire(callerDir, modPath) {
   }
   if (modPath === '@ohos.data.preferences') {
     return platformPreferencesAdapter;
+  }
+  if (modPath === '@ohos.security.asset') {
+    return platformAssetAdapter;
+  }
+  if (modPath === '@ohos.file.fs') {
+    return platformFsAdapter;
+  }
+  if (modPath === '@ohos.file.picker') {
+    return platformPickerAdapter;
+  }
+  if (modPath === '@ohos.util') {
+    return platformUtilAdapter;
   }
   if (modPath === '@ohos.promptAction') {
     return {
@@ -266,7 +403,7 @@ const rootDir = path.resolve(__dirname, '..');
 const { HermesRESTClient } = customRequire(rootDir, './entry/src/main/ets/network/HermesRESTClient.ets');
 const { HermesGatewayClient } = customRequire(rootDir, './entry/src/main/ets/network/HermesGatewayClient.ets');
 const { ChatViewModel } = customRequire(rootDir, './entry/src/main/ets/viewmodel/ChatViewModel.ets');
-const { AuthStore } = customRequire(rootDir, './entry/src/main/ets/storage/AuthStore.ets');
+const { AuthStore, HarmonyPlatformAuthAdapter } = customRequire(rootDir, './entry/src/main/ets/storage/AuthStore.ets');
 const { HermesWorkspaceClient } = customRequire(rootDir, './entry/src/main/ets/network/HermesWorkspaceClient.ets');
 const { HermesFileClient } = customRequire(rootDir, './entry/src/main/ets/network/HermesFileClient.ets');
 const { WorkspaceViewModel } = customRequire(rootDir, './entry/src/main/ets/viewmodel/WorkspaceViewModel.ets');
@@ -449,7 +586,6 @@ async function runTestSuite() {
     if (req.url.startsWith('/api/fs/download') && req.method === 'GET') {
       serverStats.verifiedDownloadArtifactBinary = true;
       res.writeHead(200, { 'Content-Type': 'application/octet-stream' });
-      // 返回带有 PNG 签名的 12 字节二进制测试产物
       const bin = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01, 0x02, 0xff]);
       res.end(bin);
       return;
@@ -659,7 +795,7 @@ async function runTestSuite() {
   assert(serverStats.lastCloseCode === 1000, `关闭码必须为正常码 1000，当前记录: ${serverStats.lastCloseCode} (杜绝非法 1006)`);
   console.log('[PASS 3] 真实 HermesGatewayClient 握手回执与关闭码通过');
 
-  // --- 测试用例 4: 生产 HermesGatewayClient 握手前关闭取消 (Settle Connect Promise) 与 RPC 超时 ---
+  // --- 测试用例 4: 生产 HermesGatewayClient 握手前关闭取消 (Settle Connect Promise) 与 RPC 30s 超时清理 ---
   console.log('\n[TEST 4] 测试真实 HermesGatewayClient 握手前 disconnect 取消与 RPC 30s 超时清理:');
   const cancelGw = new HermesGatewayClient({});
   let cancelRejected = false;
@@ -846,9 +982,18 @@ async function runTestSuite() {
   assert(vm.currentModel === 'claude-3-5-sonnet', '模型切换成功更新 currentModel');
   console.log('[PASS 10] 真实模型切换契约通过');
 
-  // --- 测试用例 11: 生产 AuthStore 真实持久化与跨重启还原 ---
-  console.log('\n[TEST 11] 测试真实 AuthStore 配置与凭据物理隔离持久化与启动恢复:');
+  // --- 测试用例 11: 真实 HarmonyPlatformAuthAdapter + Preferences + AssetStoreKit 密文硬件保管库与异常传播测试 (落实 REVIEW_STORAGE_03) ---
+  console.log('\n[TEST 11] 测试真实 HarmonyPlatformAuthAdapter (Preferences 元数据 + AssetStoreKit 密文硬件保管库 + 启动 ready + 异常传播):');
   const authStore = AuthStore.getInstance();
+  const mockContext = {};
+  const platformAdapter = new HarmonyPlatformAuthAdapter(mockContext);
+  authStore.setStorageAdapter(platformAdapter);
+
+  // 初始化并等待准备就绪
+  await authStore.init(mockContext);
+  await authStore.waitUntilReady();
+
+  // 保存连接
   await authStore.saveConnection({
     id: 'conn_sec_1',
     name: '我的生产Hermes',
@@ -861,40 +1006,76 @@ async function runTestSuite() {
     isCurrent: true
   });
 
-  const exportedMeta = authStore.exportMetadata();
-  const exportedVault = authStore.exportVault();
+  // 1. 断言 Preferences 仅保存非敏感元数据，绝对不包含任何明文 password, token, cookies
+  const rawMetaJson = await memoryPrefs.get('hermex_auth_metadata').get('connections_metadata', '[]');
+  const storedMetaList = JSON.parse(rawMetaJson);
+  assert(storedMetaList.length === 1, 'Preferences 存储 1 条元数据记录');
+  assert(storedMetaList[0].url === 'https://hermes.example.com', 'Preferences 存储包含 URL');
+  assert(storedMetaList[0].password === undefined, 'Preferences 绝不能存储明文 password！');
+  assert(storedMetaList[0].token === undefined, 'Preferences 绝不能存储明文 token！');
+  assert(storedMetaList[0].cookies === undefined, 'Preferences 绝不能存储明文 cookies！');
 
-  assert(exportedMeta.length === 1, '元数据导出 1 条记录');
-  assert(exportedMeta[0].url === 'https://hermes.example.com', '元数据包含 URL');
-  assert(exportedMeta[0].password === undefined, '非敏感元数据配置中绝不能包含 password！');
-  assert(exportedMeta[0].token === undefined, '非敏感元数据配置中绝不能包含 token！');
+  // 2. 断言敏感凭据必须物理进入 AssetStoreKit 硬件级密文保管库
+  assert(mockAssetStorage.has('hermex_cred_conn_sec_1'), '敏感凭证必须保存到 AssetStoreKit (hermex_cred_conn_sec_1)');
+  const assetSecretBytes = mockAssetStorage.get('hermex_cred_conn_sec_1');
+  const assetSecretStr = Buffer.from(assetSecretBytes).toString('utf8');
+  assert(assetSecretStr.includes('jwt_token_secret_xyz'), 'AssetStoreKit 包含真实的密文 Token');
+  assert(assetSecretStr.includes('super_secret_password'), 'AssetStoreKit 包含真实的密文密码');
 
-  assert(exportedVault.length === 1, '敏感凭据保管库导出 1 条记录');
-  assert(exportedVault[0].token === 'jwt_token_secret_xyz', '敏感凭据隔离存储 token');
-  assert(exportedVault[0].cookies === 'cookie_session_abc', '敏感凭据隔离存储 cookies');
+  // 3. 测试写入失败异常严格传播 (杜绝静默失败)
+  console.log('  -> 测试 Asset 写入异常传播...');
+  mockAssetFailOnSave = true;
+  let saveFailedCaught = false;
+  try {
+    await authStore.saveConnection({
+      id: 'conn_fail_test',
+      name: '失败连接',
+      url: 'https://fail.com',
+      token: 'token_bad'
+    });
+  } catch (err) {
+    saveFailedCaught = true;
+  }
+  assert(saveFailedCaught, 'AssetStore 写入异常必须直接向上抛出，绝不能被内部静默吞噬！');
+  mockAssetFailOnSave = false;
 
-  // 模拟应用完全退出并冷启动
-  console.log('  -> 模拟冷启动 restoreFromStorage()...');
-  await authStore.restoreFromStorage();
-  const reloaded = authStore.getCurrentConnection();
-  assert(reloaded !== null && reloaded.name === '我的生产Hermes', '冷启动还原连接元数据成功');
-  assert(reloaded.token === 'jwt_token_secret_xyz', '冷启动从隔离保管库还原敏感 Token');
-  assert(reloaded.password === 'super_secret_password', '冷启动从隔离保管库还原密码');
+  // 4. 测试删除失败异常严格传播
+  console.log('  -> 测试 Asset 删除异常传播...');
+  mockAssetFailOnRemove = true;
+  let removeFailedCaught = false;
+  try {
+    await authStore.removeConnection('conn_sec_1');
+  } catch (err) {
+    removeFailedCaught = true;
+  }
+  assert(removeFailedCaught, 'AssetStore 删除异常必须直接向上抛出！');
+  mockAssetFailOnRemove = false;
 
-  // 彻底擦除凭据
+  // 5. 测试真实冷启动恢复 (模拟杀进程重启)
+  console.log('  -> 测试真实冷启动还原 (Preferences 元数据 + AssetStoreKit 凭据整合)...');
+  // 重新创建 adapter 与重新初始化
+  const restartAdapter = new HarmonyPlatformAuthAdapter(mockContext);
+  authStore.setStorageAdapter(restartAdapter);
+  await authStore.init(mockContext);
+  await authStore.waitUntilReady();
+
+  const restoredConn = authStore.getCurrentConnection();
+  assert(restoredConn !== null && restoredConn.name === '我的生产Hermes', '冷启动从 Preferences 恢复元数据');
+  assert(restoredConn.token === 'jwt_token_secret_xyz', '冷启动从 AssetStoreKit 恢复密文 Token');
+  assert(restoredConn.password === 'super_secret_password', '冷启动从 AssetStoreKit 恢复密文密码');
+
+  // 6. 正常彻底移除连接
   await authStore.removeConnection('conn_sec_1');
-  assert(authStore.getConnections().length === 0, '移除连接后配置列表为空');
-  assert(authStore.exportVault().length === 0, '移除连接后凭据库对应项彻底物理擦除');
-  console.log('[PASS 11] AuthStore 元数据与凭据隔离安全存储及重启恢复通过');
+  assert(!mockAssetStorage.has('hermex_cred_conn_sec_1'), '移除后 AssetStoreKit 硬件保管库必须彻底擦除记录');
+  assert(authStore.getConnections().length === 0, '移除后 Preferences 与内存连接列表清空');
+  console.log('[PASS 11] 真实 HarmonyPlatformAuthAdapter + Preferences + AssetStoreKit 密文硬件保管库通过');
 
   // --- 测试用例 12: 生产 HermesWorkspaceClient 路径安全穿透防护 (严格对齐 HermesWorkspaceFileClient.swift:117-124) ---
   console.log('\n[TEST 12] 测试真实 HermesWorkspaceClient.resolveHostPath 路径遍历拒绝与合规拼接:');
-  // 1. 合规拼接测试
   assert(HermesWorkspaceClient.resolveHostPath('/workspace/root', '') === '/workspace/root', '空相对路径返回根');
   assert(HermesWorkspaceClient.resolveHostPath('/workspace/root', '.') === '/workspace/root', '. 相对路径返回根');
   assert(HermesWorkspaceClient.resolveHostPath('/workspace/root', 'src/app') === '/workspace/root/src/app', '正常相对路径正确组合');
 
-  // 2. 注入拒绝测试
   let rejectedTraversal = false;
   try {
     HermesWorkspaceClient.resolveHostPath('/workspace/root', '../outside/secret.txt');
@@ -937,15 +1118,12 @@ async function runTestSuite() {
   assert(wsVm.entries.length === 2, '真实加载工作区 2 个条目');
   assert(wsVm.entries[0].name === 'src' && wsVm.entries[0].isDirectory, '首个条目为 src 目录');
 
-  // 进入子目录
   await wsVm.enterDirectory(botConn, wsVm.entries[0]);
   assert(wsVm.pathHistory.length === 1, '进入子目录后历史深度为 1');
 
-  // 返回上一级
   await wsVm.navigateUp(botConn);
   assert(wsVm.currentRelativePath === '', '返回上一级后 relativePath 回到根');
 
-  // 查看文本文件
   await wsVm.viewFile(botConn, { name: 'version.ts', path: 'src/version.ts', isDirectory: false });
   assert(wsVm.isViewingFile === true, '标记正在查看文件');
   assert(wsVm.selectedFileText.includes('export const version = "1.0.0";'), '预览文本内容解析成功');
@@ -967,7 +1145,6 @@ async function runTestSuite() {
   assert(serverStats.verifiedImageUploadDataUrl, '上传图片 payload 必须携带 data_url 字段 (严格对齐 HermesREST.swift:379-384)');
   assert(uploadRes.path === 'uploads/screenshot.png', '附件图片上传成功获取 remote path');
 
-  // 产物二进制下载测试
   const artifactBuffer = await HermesFileClient.downloadArtifact(
     baseUrl,
     'output/build.bin',
@@ -982,7 +1159,6 @@ async function runTestSuite() {
   const binView = new Uint8Array(artifactBuffer);
   assert(binView[0] === 0x89 && binView[1] === 0x50 && binView[2] === 0x4e && binView[3] === 0x47, 'PNG 魔数签名完整保留');
 
-  // 同时验证 WorkspaceViewModel.downloadFile
   const wsBuffer = await wsVm.downloadFile(botConn, { name: 'build.bin', path: 'output/build.bin', isDirectory: false });
   assert(wsBuffer instanceof ArrayBuffer && wsBuffer.byteLength === 12, 'WorkspaceViewModel.downloadFile 成功产出 ArrayBuffer');
   console.log('[PASS 14] 真实 HermesFileClient data_url 上传与 ArrayBuffer 二进制下载通过');
@@ -1069,7 +1245,7 @@ export const test = true;
   console.log('  - HermesRESTClient.ets (Cookie Jar、登录、/api/auth/me 核验、Ticket、会话与历史)');
   console.log('  - HermesGatewayClient.ets (WebSocket 握手、client.capabilities 回执、关闭码、RPC 30s 超时、取消)');
   console.log('  - ChatViewModel.ets (会话恢复门禁、禁止发送、async 代次乱序拦截、中文流式、推理、工具、审批重试、模型配置)');
-  console.log('  - AuthStore.ets (元数据与敏感凭据物理隔离存储、冷启动持久化恢复)');
+  console.log('  - AuthStore.ets (真实 HarmonyPlatformAuthAdapter + Preferences 元数据 + AssetStoreKit 密文硬件保管库 + 启动 ready + 异常传播)');
   console.log('  - HermesWorkspaceClient.ets (路径穿越防护、远程目录与文件读取)');
   console.log('  - WorkspaceViewModel.ets (目录层级导航、历史回退、文件预览与下载)');
   console.log('  - HermesFileClient.ets (data_url 图片上传、ArrayBuffer 二进制产物下载)');
