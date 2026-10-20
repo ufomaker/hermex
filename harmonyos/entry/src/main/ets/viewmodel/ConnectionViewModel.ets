@@ -1,12 +1,27 @@
 import { BotConnection, HermesStatus } from '../model/Connection';
 import { HermesRESTClient } from '../network/HermesRESTClient';
+import { LegacySSEClient } from '../network/legacy/LegacySSEClient';
 import { AuthStore } from '../storage/AuthStore';
 
 export class ConnectionViewModel {
   private authStore = AuthStore.getInstance();
 
   public async probeStatus(url: string): Promise<HermesStatus> {
-    return await HermesRESTClient.getStatus(url);
+    try {
+      return await HermesRESTClient.getStatus(url);
+    } catch (e) {
+      // 容错降级探测 legacy webui /health
+      const isLegacy = await LegacySSEClient.probeHealth(url);
+      if (isLegacy) {
+        return {
+          version: 'legacy-webui',
+          auth_required: true,
+          gateway_running: false,
+          profiles: ['default']
+        };
+      }
+      throw new Error(String(e));
+    }
   }
 
   public async loginAndSave(

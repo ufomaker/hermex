@@ -356,6 +356,17 @@ const platformUtilAdapter = {
 };
 platformUtilAdapter.default = platformUtilAdapter;
 
+const platformNotificationAdapter = {
+  isNotificationEnabled: async () => true,
+  publish: async (req) => {},
+  cancel: async (id) => {},
+  ContentType: {
+    NOTIFICATION_CONTENT_BASIC_TEXT: 0,
+    NOTIFICATION_CONTENT_LONG_TEXT: 1
+  }
+};
+platformNotificationAdapter.default = platformNotificationAdapter;
+
 // --- 2. 真实 ArkTS 模块加载器 ---
 
 const moduleCache = new Map();
@@ -386,6 +397,9 @@ function customRequire(callerDir, modPath) {
     return {
       showToast: () => {}
     };
+  }
+  if (modPath === '@ohos.notificationManager' || modPath === '@ohos.notification') {
+    return platformNotificationAdapter;
   }
 
   // 相对路径解析
@@ -443,6 +457,8 @@ const { GitWorkspaceViewModel } = customRequire(rootDir, './entry/src/main/ets/v
 const { SkillsViewModel } = customRequire(rootDir, './entry/src/main/ets/viewmodel/SkillsViewModel.ets');
 const { CronViewModel } = customRequire(rootDir, './entry/src/main/ets/viewmodel/CronViewModel.ets');
 const { InsightsViewModel } = customRequire(rootDir, './entry/src/main/ets/viewmodel/InsightsViewModel.ets');
+const { KanbanViewModel } = customRequire(rootDir, './entry/src/main/ets/viewmodel/KanbanViewModel.ets');
+const { NotificationUtils } = customRequire(rootDir, './entry/src/main/ets/utils/NotificationUtils.ets');
 
 // --- 3. 端到端行为与契约验证 ---
 
@@ -1641,15 +1657,141 @@ export const test = true;
   assert(messageCompleteReceivedByVm, 'message.complete 必须接收');
   console.log('[PASS 25] 严格 turn-tool-approval-frames.json 录制帧状态机验证通过');
 
+  // [TEST 26] 测试 ChatViewModel 异步审批竞争、生命周期与会话切换状态隔离
+  console.log('\n[TEST 26] 测试 ChatViewModel 异步审批竞争、生命周期与会话切换状态隔离:');
+  const isolatedVm = new ChatViewModel();
+  let approvalResolve = null;
+  const mockGatewayForApproval = {
+    respondApproval: async (sessionId, requestId, choice) => {
+      return new Promise((resolve) => {
+        approvalResolve = () => resolve({ ok: true });
+      });
+    },
+    disconnect: () => {}
+  };
+  isolatedVm.gateway = mockGatewayForApproval;
+  isolatedVm.isConnected = true;
+  isolatedVm.runtimeSessionId = 'test-session-1';
+  isolatedVm.sessionAttachGeneration = 1;
+
+  // 1. 设置初始审批请求
+  isolatedVm.currentApproval = {
+    id: 'srq-1',
+    requestId: 'req-uuid-1',
+    sessionId: 'test-session-1',
+    toolName: 'terminal',
+    command: 'ls',
+    choices: ['once', 'deny']
+  };
+
+  // 2. 触发异步提交审批 (RPC 挂起中)
+  const submitPromise = isolatedVm.submitApproval('once');
+  assert(isolatedVm.isSubmittingApproval === true, '审批提交中标记必须为 true');
+
+  // 3. 在 RPC 在途期间，推入新审批请求 (例如后续并发审批)
+  isolatedVm.currentApproval = {
+    id: 'srq-2',
+    requestId: 'req-uuid-2',
+    sessionId: 'test-session-1',
+    toolName: 'terminal',
+    command: 'git status',
+    choices: ['once', 'deny']
+  };
+
+  // 4. 前一个 RPC 完成返回
+  approvalResolve();
+  await submitPromise;
+
+  // 5. 校验：不能冲掉新审批
+  assert(isolatedVm.currentApproval !== null, '新到达的审批请求绝不可被前一个 RPC 的完成清除');
+  assert(isolatedVm.currentApproval.requestId === 'req-uuid-2', '当前审批必须保留为 req-uuid-2');
+  assert(isolatedVm.isSubmittingApproval === false, '审批提交状态恢复为 false');
+
+  // 6. 测试会话切换代次保护：在途提交时切断连接
+  const submitPromise2 = isolatedVm.submitApproval('once');
+  isolatedVm.disconnect();
+  approvalResolve();
+  await submitPromise2;
+  assert(isolatedVm.currentApproval === null, '断开连接后审批已清空');
+  console.log('[PASS 26] ChatViewModel 异步审批竞争与代次状态隔离测试通过');
+
+  // [TEST 27] 测试 HermesKanbanClient 与 KanbanViewModel 看板完整生命周期
+  console.log('\n[TEST 27] 测试 HermesKanbanClient 与 KanbanViewModel 看板完整生命周期:');
+  const kanbanServer = http.createServer((req, res) => {
+    const parsed = new URL(req.url, 'http://127.0.0.1');
+    if (parsed.pathname === '/api/plugins/kanban/config') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ enabled: true, version: '1.0' }));
+    } else if (parsed.pathname === '/api/plugins/kanban/boards') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(['Sprint-1', 'Backlog']));
+    } else if (parsed.pathname === '/api/plugins/kanban/board') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        columns: [
+          { name: 'To Do', cards: [{ id: 'card-1', title: 'Task 1', status: 'To Do' }] },
+          { name: 'Done', cards: [] }
+        ],
+        latest_event_id: 'ev-100'
+      }));
+    } else if (parsed.pathname === '/api/plugins/kanban/tasks' && req.method === 'POST') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, id: 'card-2' }));
+    } else if (parsed.pathname.startsWith('/api/plugins/kanban/tasks/') && req.method === 'POST') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+
+  const kanbanPort = await new Promise((r) => kanbanServer.listen(0, '127.0.0.1', () => r(kanbanServer.address().port)));
+  const kanbanConn = {
+    url: `http://127.0.0.1:${kanbanPort}`,
+    token: 'test-token',
+    cookies: 'session=abc'
+  };
+
+  const kanbanVm = new KanbanViewModel();
+  await kanbanVm.loadBoards(kanbanConn);
+  assert(kanbanVm.isAvailable === true, '看板插件可用');
+  assert(kanbanVm.boards.length === 2, '成功获取 2 个看板');
+  assert(kanbanVm.selectedBoard === 'Sprint-1', '默认选中第一个看板');
+  assert(kanbanVm.currentSnapshot !== null, '成功加载看板快照');
+  assert(kanbanVm.currentSnapshot.columns.length === 2, '快照包含 2 个泳道');
+
+  const createOk = await kanbanVm.createCard(kanbanConn, 'New Card', 'Description');
+  assert(createOk === true, '卡片创建成功');
+
+  const updateOk = await kanbanVm.updateCardStatus(kanbanConn, 'card-1', 'Done');
+  assert(updateOk === true, '卡片状态更新成功');
+
+  kanbanServer.close();
+  console.log('[PASS 27] HermesKanbanClient 与 KanbanViewModel 完整生命周期测试通过');
+
+  // [TEST 28] 测试 NotificationUtils 系统通知分发与跨平台降级
+  console.log('\n[TEST 28] 测试 NotificationUtils 系统通知分发与跨平台降级:');
+  const notifAvail = await NotificationUtils.isNotificationEnabled();
+  assert(typeof notifAvail === 'boolean', '通知可用性检查返回布尔值');
+
+  const pubOk = await NotificationUtils.publishNotification('测试通知', '内容明细');
+  assert(pubOk === true, '基础通知分发成功');
+
+  await NotificationUtils.notifyApprovalRequired('python3 -c "print(1)"', 'terminal');
+  await NotificationUtils.notifyTurnComplete('任务处理完毕');
+  await NotificationUtils.cancelNotification(2001);
+  console.log('[PASS 28] NotificationUtils 系统通知与后台提示测试通过');
+
   vm.disconnect();
   server.close();
 
   console.log('\n======================================================');
-  console.log('✅ 所有 25 项端到端生产代码行为回归测试全部通过 (退出码 0)');
+  console.log('✅ 所有 28 项端到端生产代码行为回归测试全部通过 (退出码 0)');
   console.log('覆盖真实生产业务类：');
   console.log('  - HermesRESTClient.ets (Cookie Jar、登录、/api/auth/me 核验、Ticket、会话与历史)');
   console.log('  - HermesGatewayClient.ets (WebSocket 握手、client.capabilities 回执、关闭码、RPC 30s 超时、取消、file.attach)');
-  console.log('  - ChatViewModel.ets (会话恢复门禁、禁止发送、async 代次乱序拦截、中文流式、推理、工具、审批重试、模型配置、文档附加)');
+  console.log('  - ChatViewModel.ets (会话恢复门禁、禁止发送、async 代次乱序拦截、中文流式、推理、工具、审批竞争隔离、模型配置、文档附加)');
   console.log('  - AuthStore.ets (真实 HarmonyPlatformAuthAdapter + Preferences 元数据 + AssetStoreKit 密文硬件保管库 + UTF-8 中文/Emoji + 原子回滚 + clearAll 物理擦除)');
   console.log('  - AttachmentUtils.ets (动态 MIME 判定、图片/文档分流、防路径穿越清洗、UUID 附件名)');
   console.log('  - HermesWorkspaceClient.ets (路径穿越防护、远程目录与文件读取)');
@@ -1657,10 +1799,11 @@ export const test = true;
   console.log('  - HermesFileClient.ets (data_url 图片上传、ArrayBuffer 二进制产物下载)');
   console.log('  - HermesProjectClient.ets / GitWorkspaceViewModel.ets (项目列表、Git 根目录、分支列表、切换分支)');
   console.log('  - HermesSkillsClient.ets / HermesMemoryClient.ets / SkillsViewModel.ets (技能开关、Soul读取与保存、长期记忆)');
-  console.log('  - HermesKanbanClient.ets (看板可用性、看板列表与卡片快照)');
+  console.log('  - HermesKanbanClient.ets / KanbanViewModel.ets (看板可用性、看板列表、泳道卡片快照、新建与状态流转)');
   console.log('  - HermesCronClient.ets / CronViewModel.ets (定时任务调度、触发、暂停与恢复)');
   console.log('  - HermesInsightsClient.ets / InsightsViewModel.ets (模型用量与成本统计)');
   console.log('  - LegacySSEClient.ets (上游旧版 WebUI 健康探针与 SSE 数据帧解析)');
+  console.log('  - NotificationUtils.ets (系统通知管理器、审批待办与任务完成提醒)');
   console.log('  - MarkdownParser.ets / MarkdownView.ets (代码块、表格、列表、引用与多级标题解析渲染)');
   console.log('======================================================');
 }

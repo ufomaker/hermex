@@ -16,6 +16,9 @@ import { CronJobItem } from '../network/HermesCronClient';
 import { SkillSummary } from '../network/HermesSkillsClient';
 import { ModelUsageItem } from '../network/HermesInsightsClient';
 import { GitBranchInfo } from '../network/HermesProjectClient';
+import { KanbanViewModel } from '../viewmodel/KanbanViewModel';
+import { KanbanBoardSnapshot, KanbanColumnItem, KanbanCardItem } from '../network/HermesKanbanClient';
+import { NotificationUtils } from '../utils/NotificationUtils';
 import { AuthStore } from '../storage/AuthStore';
 import { MarkdownView } from '../components/MarkdownView';
 import { getMimeType, isImageFile, sanitizeFilename, generateAttachmentName } from '../utils/AttachmentUtils';
@@ -42,7 +45,7 @@ struct Index {
   @State showWorkspaceDialog: boolean = false;
   @State showAttachmentDialog: boolean = false;
   @State showToolsDialog: boolean = false;
-  @State selectedToolsTab: number = 0; // 0:任务, 1:技能, 2:设定, 3:用量, 4:Git
+  @State selectedToolsTab: number = 0; // 0:任务, 1:技能, 2:设定, 3:用量, 4:Git, 5:看板
 
   // ViewModels
   private connVm: ConnectionViewModel = new ConnectionViewModel();
@@ -53,6 +56,13 @@ struct Index {
   private skillsVm: SkillsViewModel = new SkillsViewModel();
   private insightsVm: InsightsViewModel = new InsightsViewModel();
   private gitVm: GitWorkspaceViewModel = new GitWorkspaceViewModel();
+  private kanbanVm: KanbanViewModel = new KanbanViewModel();
+
+  // Kanban States
+  @State kanbanBoards: string[] = [];
+  @State selectedKanbanBoard: string = '';
+  @State kanbanSnapshot: KanbanBoardSnapshot | null = null;
+  @State newCardTitleInput: string = '';
 
   // Observable UI States
   @State isConnected: boolean = false;
@@ -112,6 +122,14 @@ struct Index {
         this.viewingFileText = this.workspaceVm.selectedFileText;
         this.isViewingFile = this.workspaceVm.isViewingFile;
         this.isDownloadingFile = this.workspaceVm.isDownloading;
+      }
+    });
+
+    this.kanbanVm.setListener({
+      onStateChanged: () => {
+        this.kanbanBoards = this.kanbanVm.boards.slice();
+        this.selectedKanbanBoard = this.kanbanVm.selectedBoard;
+        this.kanbanSnapshot = this.kanbanVm.currentSnapshot;
       }
     });
 
@@ -263,6 +281,9 @@ struct Index {
       } else if (this.selectedToolsTab === 4) {
         await this.gitVm.loadProjectsAndGit(cur, this.workspacePath);
         this.toolsStatusText = this.gitVm.statusMessage;
+      } else if (this.selectedToolsTab === 5) {
+        await this.kanbanVm.loadBoards(cur);
+        this.toolsStatusText = this.kanbanVm.statusMessage;
       }
     } catch (e) {
       this.toolsStatusText = `加载异常: ${e}`;
@@ -1467,8 +1488,19 @@ struct Index {
               .height(30)
               .backgroundColor(this.selectedToolsTab === 4 ? '#007AFF' : '#F2F2F7')
               .fontColor(this.selectedToolsTab === 4 ? '#FFFFFF' : '#374151')
+              .margin({ right: 4 })
               .onClick(async () => {
                 this.selectedToolsTab = 4;
+                await this.loadCurrentToolsData();
+              })
+
+            Button('看板')
+              .fontSize(11)
+              .height(30)
+              .backgroundColor(this.selectedToolsTab === 5 ? '#007AFF' : '#F2F2F7')
+              .fontColor(this.selectedToolsTab === 5 ? '#FFFFFF' : '#374151')
+              .onClick(async () => {
+                this.selectedToolsTab = 5;
                 await this.loadCurrentToolsData();
               })
           }
@@ -1881,6 +1913,211 @@ struct Index {
                       })
                   }
                   .width('100%')
+                }
+              }
+              .width('100%')
+            }
+
+            // Tab 5: 项目看板 (F11)
+            if (this.selectedToolsTab === 5) {
+              Column() {
+                Row() {
+                  Text(this.selectedKanbanBoard ? `看板: ${this.selectedKanbanBoard}` : '项目看板')
+                    .fontSize(13)
+                    .fontWeight(FontWeight.Bold)
+                    .layoutWeight(1)
+
+                  Button('刷新')
+                    .fontSize(11)
+                    .height(26)
+                    .backgroundColor('#E5E5EA')
+                    .fontColor('#374151')
+                    .onClick(async () => {
+                      const cur = this.connVm.getCurrentConnection();
+                      if (cur) {
+                        await this.kanbanVm.loadBoards(cur);
+                      }
+                    })
+                }
+                .width('100%')
+                .margin({ bottom: 8 })
+
+                if (!this.kanbanVm.isAvailable) {
+                  Column() {
+                    Text('服务端未安装或未启用看板插件')
+                      .fontSize(12)
+                      .fontColor('#EF4444')
+                      .margin({ top: 12, bottom: 4 })
+                    Text('接口 /api/plugins/kanban/config 返回 404')
+                      .fontSize(11)
+                      .fontColor('#6B7280')
+                  }
+                  .width('100%')
+                  .padding(12)
+                  .backgroundColor('#FEF2F2')
+                  .borderRadius(8)
+                } else if (this.kanbanBoards.length === 0) {
+                  Text('当前服务端暂无可用看板')
+                    .fontSize(12)
+                    .fontColor('#6B7280')
+                    .margin({ top: 12 })
+                } else {
+                  // 看板选择器
+                  if (this.kanbanBoards.length > 1) {
+                    Row() {
+                      ForEach(this.kanbanBoards, (bName: string) => {
+                        Button(bName)
+                          .fontSize(10)
+                          .height(24)
+                          .backgroundColor(this.selectedKanbanBoard === bName ? '#007AFF' : '#E5E5EA')
+                          .fontColor(this.selectedKanbanBoard === bName ? '#FFFFFF' : '#374151')
+                          .margin({ right: 4 })
+                          .onClick(async () => {
+                            const cur = this.connVm.getCurrentConnection();
+                            if (cur) {
+                              await this.kanbanVm.loadBoardSnapshot(cur, bName);
+                            }
+                          })
+                      })
+                    }
+                    .width('100%')
+                    .margin({ bottom: 8 })
+                  }
+
+                  // 快速创建卡片
+                  Row() {
+                    TextInput({ placeholder: '输入新任务/卡片标题...', text: this.newCardTitleInput })
+                      .height(30)
+                      .fontSize(11)
+                      .layoutWeight(1)
+                      .margin({ right: 6 })
+                      .onChange((val: string) => {
+                        this.newCardTitleInput = val;
+                      })
+
+                    Button('新建卡片')
+                      .fontSize(11)
+                      .height(30)
+                      .backgroundColor('#007AFF')
+                      .fontColor('#FFFFFF')
+                      .onClick(async () => {
+                        const cur = this.connVm.getCurrentConnection();
+                        const title = this.newCardTitleInput.trim();
+                        if (cur && title) {
+                          const ok = await this.kanbanVm.createCard(cur, title);
+                          if (ok) {
+                            this.newCardTitleInput = '';
+                            this.showToast('卡片创建成功');
+                          } else {
+                            this.showToast(this.kanbanVm.statusMessage);
+                          }
+                        }
+                      })
+                  }
+                  .width('100%')
+                  .margin({ bottom: 8 })
+
+                  // 看板泳道与卡片列表
+                  if (this.kanbanSnapshot && this.kanbanSnapshot.columns.length > 0) {
+                    List({ space: 8 }) {
+                      ForEach(this.kanbanSnapshot.columns, (col: KanbanColumnItem) => {
+                        ListItem() {
+                          Column() {
+                            Row() {
+                              Text(`${col.name}`)
+                                .fontSize(12)
+                                .fontWeight(FontWeight.Bold)
+                                .fontColor('#1F2937')
+                              Blank()
+                              Text(`${col.cards.length}`)
+                                .fontSize(11)
+                                .fontColor('#6B7280')
+                                .padding({ left: 6, right: 6, top: 1, bottom: 1 })
+                                .backgroundColor('#E5E7EB')
+                                .borderRadius(10)
+                            }
+                            .width('100%')
+                            .margin({ bottom: 6 })
+
+                            if (col.cards.length === 0) {
+                              Text('暂无卡片')
+                                .fontSize(11)
+                                .fontColor('#9CA3AF')
+                                .margin({ top: 4, bottom: 4 })
+                            } else {
+                              ForEach(col.cards, (card: KanbanCardItem) => {
+                                Column() {
+                                  Row() {
+                                    Text(card.title)
+                                      .fontSize(12)
+                                      .fontWeight(FontWeight.Medium)
+                                      .layoutWeight(1)
+
+                                    if (card.assignee) {
+                                      Text(card.assignee)
+                                        .fontSize(10)
+                                        .fontColor('#4B5563')
+                                        .backgroundColor('#E5E7EB')
+                                        .padding({ left: 4, right: 4, top: 1, bottom: 1 })
+                                        .borderRadius(4)
+                                    }
+                                  }
+                                  .width('100%')
+
+                                  if (card.description) {
+                                    Text(card.description)
+                                      .fontSize(10)
+                                      .fontColor('#6B7280')
+                                      .maxLines(2)
+                                      .margin({ top: 2 })
+                                  }
+
+                                  Row() {
+                                    Text(`ID: ${card.id}`)
+                                      .fontSize(9)
+                                      .fontColor('#9CA3AF')
+                                      .layoutWeight(1)
+
+                                    Button('流转')
+                                      .fontSize(10)
+                                      .height(20)
+                                      .backgroundColor('#E5E5EA')
+                                      .fontColor('#007AFF')
+                                      .onClick(async () => {
+                                        const cur = this.connVm.getCurrentConnection();
+                                        if (cur) {
+                                          const nextStatus = col.name.toLowerCase().includes('done') ? 'todo' : 'done';
+                                          await this.kanbanVm.updateCardStatus(cur, card.id, nextStatus);
+                                        }
+                                      })
+                                  }
+                                  .width('100%')
+                                  .margin({ top: 4 })
+                                }
+                                .width('100%')
+                                .padding(6)
+                                .backgroundColor('#FFFFFF')
+                                .borderRadius(6)
+                                .margin({ bottom: 4 })
+                                .border({ width: 1, color: '#E5E7EB' })
+                              })
+                            }
+                          }
+                          .width('100%')
+                          .padding(8)
+                          .backgroundColor('#F3F4F6')
+                          .borderRadius(8)
+                        }
+                      })
+                    }
+                    .height(240)
+                    .width('100%')
+                  } else {
+                    Text('当前看板暂无泳道数据')
+                      .fontSize(12)
+                      .fontColor('#9CA3AF')
+                      .margin({ top: 12 })
+                  }
                 }
               }
               .width('100%')

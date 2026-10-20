@@ -3,6 +3,7 @@ import { ChatMessage, ToolCallItem } from '../model/ChatMessage';
 import { ApprovalRequest, ClarifyRequest, ModelOption } from '../model/Approval';
 import { HermesRESTClient } from '../network/HermesRESTClient';
 import { HermesGatewayClient, GatewayEventCallbacks } from '../network/HermesGatewayClient';
+import { NotificationUtils } from '../utils/NotificationUtils';
 
 export interface ChatUIStateListener {
   onStateChanged: () => void;
@@ -236,7 +237,7 @@ export class ChatViewModel {
               current.toolCalls.push(tool);
             }
           }
-          if (this.currentApproval && (this.currentApproval.toolName === tool.name || (this.currentApproval.command && tool.input && tool.input.includes('print(1)')))) {
+          if (this.currentApproval && this.currentApproval.toolName === tool.name) {
             this.currentApproval = null;
           }
           this.notify();
@@ -251,7 +252,14 @@ export class ChatViewModel {
             }
             current.status = 'complete';
           }
+          if (this.currentApproval && (!this.currentApproval.sessionId || this.currentApproval.sessionId === sid)) {
+            this.currentApproval = null;
+          }
+          if (this.currentClarify && (!this.currentClarify.sessionId || this.currentClarify.sessionId === sid)) {
+            this.currentClarify = null;
+          }
           this.notify();
+          NotificationUtils.notifyTurnComplete(text ? text.slice(0, 100) : '任务已执行完成');
         },
         onSessionInfo: (sid: string, running: boolean, model?: string, title?: string) => {
           if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
@@ -263,6 +271,12 @@ export class ChatViewModel {
             const current = this.getLatestAssistantMessage();
             if (current && current.status === 'streaming') {
               current.status = 'complete';
+            }
+            if (this.currentApproval && (!this.currentApproval.sessionId || this.currentApproval.sessionId === sid)) {
+              this.currentApproval = null;
+            }
+            if (this.currentClarify && (!this.currentClarify.sessionId || this.currentClarify.sessionId === sid)) {
+              this.currentClarify = null;
             }
           }
           this.notify();
@@ -290,6 +304,7 @@ export class ChatViewModel {
           if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
           this.currentApproval = req;
           this.notify();
+          NotificationUtils.notifyApprovalRequired(req.command, req.toolName);
         },
         onClarifyRequest: (req: ClarifyRequest) => {
           if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
@@ -348,6 +363,10 @@ export class ChatViewModel {
     this.gateway.setActiveRuntime(newSessionId);
     this.isConnected = true;
     this.messages = [];
+    this.currentApproval = null;
+    this.currentClarify = null;
+    this.isSubmittingApproval = false;
+    this.isSubmittingClarify = false;
     this.notify();
     return storedId;
   }
@@ -441,20 +460,32 @@ export class ChatViewModel {
     if (!this.gateway || !this.currentApproval || this.isSubmittingApproval) {
       return;
     }
-    this.isSubmittingApproval = true;
-    this.notify();
-
+    const currentAttachGen = this.sessionAttachGeneration;
+    const activeGateway = this.gateway;
     const req = this.currentApproval;
     const targetSessionId = req.sessionId || this.runtimeSessionId;
     const targetRequestId = req.requestId || req.id;
+
+    this.isSubmittingApproval = true;
+    this.notify();
+
     try {
       await this.gateway.respondApproval(targetSessionId, targetRequestId, choice);
-      this.currentApproval = null;
+      if (this.sessionAttachGeneration === currentAttachGen && this.gateway === activeGateway) {
+        // 严格比对请求 ID，防止异步返回时冲掉在此期间到达的后续审批
+        if (this.currentApproval && (this.currentApproval.requestId === targetRequestId || this.currentApproval.id === targetRequestId)) {
+          this.currentApproval = null;
+        }
+      }
     } catch (e) {
-      this.toast(`审批提交失败，请重试: ${e}`);
+      if (this.sessionAttachGeneration === currentAttachGen && this.gateway === activeGateway) {
+        this.toast(`审批提交失败，请重试: ${e}`);
+      }
     } finally {
-      this.isSubmittingApproval = false;
-      this.notify();
+      if (this.sessionAttachGeneration === currentAttachGen && this.gateway === activeGateway) {
+        this.isSubmittingApproval = false;
+        this.notify();
+      }
     }
   }
 
@@ -465,18 +496,30 @@ export class ChatViewModel {
     if (!this.gateway || !this.currentClarify || this.isSubmittingClarify) {
       return;
     }
+    const currentAttachGen = this.sessionAttachGeneration;
+    const activeGateway = this.gateway;
+    const req = this.currentClarify;
+    const targetId = req.id || req.requestId;
+
     this.isSubmittingClarify = true;
     this.notify();
 
-    const req = this.currentClarify;
     try {
       await this.gateway.answerClarify(req.id, answer);
-      this.currentClarify = null;
+      if (this.sessionAttachGeneration === currentAttachGen && this.gateway === activeGateway) {
+        if (this.currentClarify && (this.currentClarify.id === targetId || this.currentClarify.requestId === targetId)) {
+          this.currentClarify = null;
+        }
+      }
     } catch (e) {
-      this.toast(`澄清答复提交失败，请重试: ${e}`);
+      if (this.sessionAttachGeneration === currentAttachGen && this.gateway === activeGateway) {
+        this.toast(`澄清答复提交失败，请重试: ${e}`);
+      }
     } finally {
-      this.isSubmittingClarify = false;
-      this.notify();
+      if (this.sessionAttachGeneration === currentAttachGen && this.gateway === activeGateway) {
+        this.isSubmittingClarify = false;
+        this.notify();
+      }
     }
   }
 
@@ -539,5 +582,9 @@ export class ChatViewModel {
     this.isConnected = false;
     this.isGenerating = false;
     this.runtimeSessionId = '';
+    this.currentApproval = null;
+    this.currentClarify = null;
+    this.isSubmittingApproval = false;
+    this.isSubmittingClarify = false;
   }
 }

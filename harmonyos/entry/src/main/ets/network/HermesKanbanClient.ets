@@ -75,12 +75,12 @@ export class HermesKanbanClient {
         readTimeout: 10000
       });
       if (resp.responseCode === 200) {
-        const raw = JSON.parse(String(resp.result || '[]'));
+        const raw = JSON.parse(String(resp.result || '[]')) as Array<Record<string, Object> | string>;
         const list: string[] = [];
         if (Array.isArray(raw)) {
           for (let i = 0; i < raw.length; i++) {
             const b = raw[i];
-            const name = typeof b === 'string' ? b : String(b.name || b.id || '');
+            const name = typeof b === 'string' ? b : String(b['name'] || b['id'] || '');
             if (name) list.push(name);
           }
         }
@@ -118,24 +118,24 @@ export class HermesKanbanClient {
         readTimeout: 12000
       });
       if (resp.responseCode === 200) {
-        const data = JSON.parse(String(resp.result || '{}'));
-        const rawCols = Array.isArray(data.columns) ? data.columns : [];
+        const data = JSON.parse(String(resp.result || '{}')) as Record<string, Object>;
+        const rawCols = (data['columns'] as Array<Record<string, Object>>) || [];
         const columns: KanbanColumnItem[] = [];
 
         for (let i = 0; i < rawCols.length; i++) {
           const col = rawCols[i];
-          const colName = String(col.name || 'Column');
-          const rawCards = Array.isArray(col.cards) ? col.cards : [];
+          const colName = String(col['name'] || 'Column');
+          const rawCards = (col['cards'] as Array<Record<string, Object>>) || [];
           const cards: KanbanCardItem[] = [];
 
           for (let j = 0; j < rawCards.length; j++) {
             const c = rawCards[j];
             cards.push({
-              id: String(c.id || `card-${j}`),
-              title: String(c.title || c.name || 'Untitled'),
-              status: String(c.status || colName),
-              assignee: c.assignee ? String(c.assignee) : undefined,
-              description: c.description ? String(c.description) : undefined
+              id: String(c['id'] || `card-${j}`),
+              title: String(c['title'] || c['name'] || 'Untitled'),
+              status: String(c['status'] || colName),
+              assignee: c['assignee'] ? String(c['assignee']) : undefined,
+              description: c['description'] ? String(c['description']) : undefined
             });
           }
           columns.push({ name: colName, cards: cards });
@@ -144,12 +144,99 @@ export class HermesKanbanClient {
         return {
           boardName: boardName,
           columns: columns,
-          latestEventId: data.latest_event_id ? String(data.latest_event_id) : undefined
+          latestEventId: data['latest_event_id'] ? String(data['latest_event_id']) : undefined
         };
       }
       return null;
     } catch (_e) {
       return null;
+    } finally {
+      req.destroy();
+    }
+  }
+
+  /**
+   * 创建看板卡片：POST /api/plugins/kanban/tasks?board=<name>
+   */
+  public static async createCard(
+    baseUrl: string,
+    boardName: string,
+    title: string,
+    description?: string,
+    assignee?: string,
+    token?: string,
+    cookies?: string
+  ): Promise<boolean> {
+    const cleanUrl = baseUrl.replace(/\/+$/, '');
+    const req = http.createHttp();
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json'
+    };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    if (cookies) headers['Cookie'] = cookies;
+
+    const payload: Record<string, Object> = {
+      'title': title,
+      'body': description || '',
+      'idempotency_key': `card_${Date.now()}`
+    };
+    if (assignee) {
+      payload['assignee'] = assignee;
+    }
+
+    try {
+      const b = encodeURIComponent(boardName);
+      const resp = await req.request(`${cleanUrl}/api/plugins/kanban/tasks?board=${b}`, {
+        method: http.RequestMethod.POST,
+        header: headers,
+        extraData: JSON.stringify(payload),
+        connectTimeout: 8000,
+        readTimeout: 10000
+      });
+      return resp.responseCode === 200 || resp.responseCode === 201;
+    } catch (_e) {
+      return false;
+    } finally {
+      req.destroy();
+    }
+  }
+
+  /**
+   * 更新看板卡片状态：PATCH /api/plugins/kanban/tasks/<id>?board=<name>
+   */
+  public static async updateCardStatus(
+    baseUrl: string,
+    boardName: string,
+    cardId: string,
+    status: string,
+    token?: string,
+    cookies?: string
+  ): Promise<boolean> {
+    const cleanUrl = baseUrl.replace(/\/+$/, '');
+    const req = http.createHttp();
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json'
+    };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    if (cookies) headers['Cookie'] = cookies;
+
+    const payload: Record<string, Object> = {
+      'status': status
+    };
+
+    try {
+      const b = encodeURIComponent(boardName);
+      const id = encodeURIComponent(cardId);
+      const resp = await req.request(`${cleanUrl}/api/plugins/kanban/tasks/${id}?board=${b}`, {
+        method: http.RequestMethod.POST,
+        header: headers,
+        extraData: JSON.stringify(payload),
+        connectTimeout: 8000,
+        readTimeout: 10000
+      });
+      return resp.responseCode === 200 || resp.responseCode === 204;
+    } catch (_e) {
+      return false;
     } finally {
       req.destroy();
     }
