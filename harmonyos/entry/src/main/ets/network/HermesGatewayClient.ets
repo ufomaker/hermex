@@ -53,6 +53,7 @@ export class HermesGatewayClient {
   private lastActivityTimestamp: number = 0;
   private activeRuntimeId: string = '';
   private generation: number = 0;
+  private pendingConnectReject: ((err: Error) => void) | null = null;
 
   constructor(callbacks: GatewayEventCallbacks) {
     this.callbacks = callbacks;
@@ -76,9 +77,9 @@ export class HermesGatewayClient {
    * @param ticket 通过 /api/auth/ws-ticket 换取的单次 ticket
    */
   public async connect(baseUrl: string, ticket: string): Promise<void> {
+    this.disconnect();
     this.generation += 1;
     const currentGen = this.generation;
-    this.disconnect();
 
     let cleanUrl = baseUrl.trim();
     if (cleanUrl.endsWith('/')) {
@@ -92,17 +93,33 @@ export class HermesGatewayClient {
     this.ws = webSocket.createWebSocket();
 
     return new Promise<void>((resolve, reject) => {
+      this.pendingConnectReject = reject;
+      let isSettled = false;
+
+      const settleReject = (err: Error) => {
+        if (!isSettled) {
+          isSettled = true;
+          this.pendingConnectReject = null;
+          reject(err);
+        }
+      };
+
+      const settleResolve = () => {
+        if (!isSettled) {
+          isSettled = true;
+          this.pendingConnectReject = null;
+          resolve();
+        }
+      };
+
       if (!this.ws) {
-        reject(new Error('WebSocket client creation failed'));
+        settleReject(new Error('WebSocket client creation failed'));
         return;
       }
 
-      let isSettled = false;
-
       this.ws.on('open', (err, value) => {
         if (err && !isSettled) {
-          isSettled = true;
-          reject(new Error(`WebSocket open error: ${JSON.stringify(err)}`));
+          settleReject(new Error(`WebSocket open error: ${JSON.stringify(err)}`));
           return;
         }
         this.lastActivityTimestamp = Date.now();
@@ -127,19 +144,15 @@ export class HermesGatewayClient {
             try {
               await this.call('client.capabilities', { 'server_requests': true });
               if (!isSettled && this.generation === currentGen) {
-                isSettled = true;
                 this.isConnected = true;
                 this.startHeartbeat(currentGen);
                 if (this.callbacks.onConnected) {
                   this.callbacks.onConnected();
                 }
-                resolve();
+                settleResolve();
               }
             } catch (capErr) {
-              if (!isSettled) {
-                isSettled = true;
-                reject(new Error(`Capabilities handshake failed: ${capErr}`));
-              }
+              settleReject(new Error(`Capabilities handshake failed: ${capErr}`));
             }
           });
         } catch (e) {
@@ -149,24 +162,20 @@ export class HermesGatewayClient {
 
       this.ws.on('close', (err, value) => {
         if (this.generation !== currentGen) {
+          settleReject(new Error('Connection closed by remote before handshake'));
           return;
         }
         this.cleanupState('Connection closed by remote');
-        if (!isSettled) {
-          isSettled = true;
-          reject(new Error('Connection closed before handshake completion'));
-        }
+        settleReject(new Error('Connection closed before handshake completion'));
       });
 
       this.ws.on('error', (err) => {
         if (this.generation !== currentGen) {
+          settleReject(new Error(`Connection error before handshake: ${JSON.stringify(err)}`));
           return;
         }
         this.cleanupState(`Connection error: ${JSON.stringify(err)}`);
-        if (!isSettled) {
-          isSettled = true;
-          reject(new Error(`WebSocket error: ${JSON.stringify(err)}`));
-        }
+        settleReject(new Error(`WebSocket error: ${JSON.stringify(err)}`));
       });
 
       const connectHeaders: Record<string, string> = {
@@ -176,9 +185,8 @@ export class HermesGatewayClient {
       this.ws.connect(wsUrl, {
         header: connectHeaders
       }, (err, value) => {
-        if (err && !isSettled) {
-          isSettled = true;
-          reject(new Error(`Failed to connect ws: ${JSON.stringify(err)}`));
+        if (err) {
+          settleReject(new Error(`Failed to connect ws: ${JSON.stringify(err)}`));
         }
       });
     });
@@ -186,6 +194,10 @@ export class HermesGatewayClient {
 
   public disconnect(): void {
     this.generation += 1;
+    if (this.pendingConnectReject) {
+      this.pendingConnectReject(new Error('Connection aborted by client disconnect'));
+      this.pendingConnectReject = null;
+    }
     this.cleanupState('Client explicitly disconnected');
     if (this.ws) {
       try {
@@ -229,7 +241,7 @@ export class HermesGatewayClient {
         this.cleanupState('Heartbeat silent timeout (45s without frame)');
         if (this.ws) {
           try {
-            this.ws.close({ code: 1006, reason: 'Silent timeout' });
+            this.ws.close({ code: 3001, reason: 'Silent timeout' });
           } catch (e) {}
         }
         return;

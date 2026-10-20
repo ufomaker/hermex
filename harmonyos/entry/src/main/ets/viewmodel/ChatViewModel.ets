@@ -26,13 +26,14 @@ export class ChatViewModel {
   private runtimeSessionId: string = '';
   private currentProfile: string = 'default';
   private listener: ChatUIStateListener | null = null;
+  private sessionAttachGeneration: number = 0;
 
   public setListener(listener: ChatUIStateListener): void {
     this.listener = listener;
   }
 
   private notify(): void {
-    if (this.listener) {
+    if (this.listener && this.listener.onStateChanged) {
       this.listener.onStateChanged();
     }
   }
@@ -56,68 +57,105 @@ export class ChatViewModel {
   }
 
   /**
-   * 初始化并连接到指定会话
+   * 初始化并连接到指定会话 (具备严格的 async 代次保护与恢复门禁)
    */
   public async attachSession(conn: BotConnection, targetSessionId: string): Promise<void> {
     this.disconnect();
+    const currentAttachGen = ++this.sessionAttachGeneration;
     this.storedSessionId = targetSessionId;
-    this.runtimeSessionId = targetSessionId;
+    this.runtimeSessionId = '';
+    this.isConnected = false;
     this.currentProfile = conn.activeProfile || 'default';
     this.connectionStatusText = '正在换取 Ticket...';
     this.notify();
 
     try {
-      // 1. 换取单次有效 ticket (支持 Cookie 与 Token)
+      // 1. 换取单次有效 ticket
       const ticket = await HermesRESTClient.getWsTicket(conn.url, conn.token, conn.cookies);
+      if (this.sessionAttachGeneration !== currentAttachGen) {
+        return; // 过期调用，立即放弃
+      }
+
       this.connectionStatusText = '正在建立 Gateway 握手...';
       this.notify();
 
-      // 2. 构造回调
+      // 2. 构造回调 (双重绑定代次与实例身份)
+      let activeGateway: HermesGatewayClient | null = null;
       const callbacks: GatewayEventCallbacks = {
         onConnected: async () => {
-          this.isConnected = true;
-          this.connectionStatusText = '已连接网关';
-          this.notify();
+          if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) {
+            return;
+          }
 
           // 3. 恢复会话上下文并获得真实 runtime ID
           if (this.gateway && this.storedSessionId) {
             try {
               const resumeRes = await this.gateway.resumeSession(this.storedSessionId, this.currentProfile);
-              const runtime = String(resumeRes['session_id'] || this.storedSessionId);
+              if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) {
+                return;
+              }
+              const runtime = String(resumeRes['session_id'] || '');
+              if (!runtime) {
+                throw new Error('resume 未返回有效 session_id');
+              }
               this.runtimeSessionId = runtime;
               this.gateway.setActiveRuntime(runtime);
+              this.isConnected = true;
+              this.connectionStatusText = '会话已恢复';
+              this.notify();
             } catch (resErr) {
-              this.toast(`恢复会话失败: ${resErr}`);
+              if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) {
+                return;
+              }
+              this.runtimeSessionId = '';
+              this.isConnected = false;
+              this.connectionStatusText = '会话恢复失败';
+              this.toast(`会话恢复失败: ${resErr}`);
+              this.notify();
+              return; // 恢复失败严禁宣布已就绪
             }
+          } else {
+            this.isConnected = true;
+            this.connectionStatusText = '网关已连接 (待建会话)';
+            this.notify();
           }
 
           // 4. 拉取该会话真实历史消息并加载到界面
-          try {
-            const history = await HermesRESTClient.getSessionMessages(
-              conn.url,
-              this.storedSessionId,
-              this.currentProfile,
-              conn.token,
-              conn.cookies
-            );
-            if (history.length > 0) {
-              this.messages = history;
-              this.notify();
+          if (this.storedSessionId) {
+            try {
+              const history = await HermesRESTClient.getSessionMessages(
+                conn.url,
+                this.storedSessionId,
+                this.currentProfile,
+                conn.token,
+                conn.cookies
+              );
+              if (this.sessionAttachGeneration === currentAttachGen && this.gateway === activeGateway && history.length > 0) {
+                this.messages = history;
+                this.notify();
+              }
+            } catch (histErr) {
+              // 新会话可能暂无历史
             }
-          } catch (histErr) {
-            // 新会话可能暂无历史，不阻断
           }
 
           // 5. 刷新模型列表
-          this.refreshModels();
+          if (this.sessionAttachGeneration === currentAttachGen && this.gateway === activeGateway) {
+            this.refreshModels();
+          }
         },
         onDisconnected: (reason: string) => {
+          if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) {
+            return;
+          }
           this.isConnected = false;
           this.isGenerating = false;
+          this.runtimeSessionId = '';
           this.connectionStatusText = `已断开: ${reason}`;
           this.notify();
         },
         onMessageStart: (sid: string) => {
+          if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
           this.isGenerating = true;
           const newMsg: ChatMessage = {
             id: `msg_ast_${Date.now()}`,
@@ -132,6 +170,7 @@ export class ChatViewModel {
           this.notify();
         },
         onMessageDelta: (sid: string, delta: string) => {
+          if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
           const current = this.getLatestAssistantMessage();
           if (current) {
             current.content += delta;
@@ -139,6 +178,7 @@ export class ChatViewModel {
           }
         },
         onReasoningDelta: (sid: string, delta: string) => {
+          if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
           const current = this.getLatestAssistantMessage();
           if (current) {
             current.reasoning = (current.reasoning || '') + delta;
@@ -146,6 +186,7 @@ export class ChatViewModel {
           }
         },
         onToolStart: (sid: string, tool: ToolCallItem) => {
+          if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
           const current = this.getLatestAssistantMessage();
           if (current) {
             current.toolCalls = current.toolCalls || [];
@@ -154,6 +195,7 @@ export class ChatViewModel {
           }
         },
         onToolComplete: (sid: string, tool: ToolCallItem) => {
+          if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
           const current = this.getLatestAssistantMessage();
           if (current && current.toolCalls) {
             const idx = current.toolCalls.findIndex(t => t.id === tool.id || t.name === tool.name);
@@ -166,6 +208,7 @@ export class ChatViewModel {
           }
         },
         onMessageComplete: (sid: string) => {
+          if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
           this.isGenerating = false;
           const current = this.getLatestAssistantMessage();
           if (current) {
@@ -174,6 +217,7 @@ export class ChatViewModel {
           this.notify();
         },
         onSessionInfo: (sid: string, running: boolean, model?: string, title?: string) => {
+          if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
           this.isGenerating = running;
           if (model) {
             this.currentModel = model;
@@ -181,6 +225,7 @@ export class ChatViewModel {
           this.notify();
         },
         onError: (sid: string, errText: string) => {
+          if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
           this.isGenerating = false;
           const current = this.getLatestAssistantMessage();
           if (current) {
@@ -199,20 +244,30 @@ export class ChatViewModel {
           this.notify();
         },
         onApprovalRequest: (req: ApprovalRequest) => {
+          if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
           this.currentApproval = req;
           this.notify();
         },
         onClarifyRequest: (req: ClarifyRequest) => {
+          if (this.sessionAttachGeneration !== currentAttachGen || this.gateway !== activeGateway) return;
           this.currentClarify = req;
           this.notify();
         }
       };
 
-      this.gateway = new HermesGatewayClient(callbacks);
-      this.gateway.setActiveRuntime(this.runtimeSessionId);
+      const newGateway = new HermesGatewayClient(callbacks);
+      activeGateway = newGateway;
+      if (this.sessionAttachGeneration !== currentAttachGen) {
+        return;
+      }
+      this.gateway = newGateway;
       await this.gateway.connect(conn.url, ticket);
     } catch (e) {
+      if (this.sessionAttachGeneration !== currentAttachGen) {
+        return;
+      }
       this.isConnected = false;
+      this.runtimeSessionId = '';
       this.connectionStatusText = `连接失败: ${e}`;
       this.toast(`网关握手失败: ${e}`);
       this.notify();
@@ -223,8 +278,8 @@ export class ChatViewModel {
    * 真实在服务端创建会话并切入
    */
   public async createAndAttachNewSession(conn: BotConnection): Promise<string> {
-    if (!this.gateway || !this.isConnected) {
-      throw new Error('网关尚未连接');
+    if (!this.gateway) {
+      throw new Error('网关尚未初始化');
     }
     const profile = conn.activeProfile || 'default';
     const res = await this.gateway.createSession(profile);
@@ -235,6 +290,7 @@ export class ChatViewModel {
     this.storedSessionId = newSessionId;
     this.runtimeSessionId = newSessionId;
     this.gateway.setActiveRuntime(newSessionId);
+    this.isConnected = true;
     this.messages = [];
     this.notify();
     return newSessionId;
@@ -250,11 +306,15 @@ export class ChatViewModel {
   }
 
   /**
-   * 发送聊天文本 (使用真实 runtimeSessionId)
+   * 发送聊天文本 (严格校验真实 runtimeSessionId 与连接状态)
    */
   public async sendMessage(text: string): Promise<void> {
     const trimmed = text.trim();
-    if (!trimmed || !this.runtimeSessionId || !this.gateway) {
+    if (!trimmed) {
+      return;
+    }
+    if (!this.isConnected || !this.runtimeSessionId || !this.gateway) {
+      this.toast('当前会话尚未就绪或恢复失败，无法发送');
       return;
     }
 
@@ -317,7 +377,6 @@ export class ChatViewModel {
       this.currentApproval = null;
     } catch (e) {
       this.toast(`审批提交失败，请重试: ${e}`);
-      // 保持 currentApproval 不清除，供用户重试
     } finally {
       this.isSubmittingApproval = false;
       this.notify();
@@ -351,6 +410,7 @@ export class ChatViewModel {
    */
   public async switchModel(modelName: string): Promise<void> {
     if (!this.gateway || !this.runtimeSessionId) {
+      this.toast('当前无活跃会话，无法配置模型');
       return;
     }
     const oldModel = this.currentModel;
@@ -382,11 +442,13 @@ export class ChatViewModel {
   }
 
   public disconnect(): void {
+    this.sessionAttachGeneration += 1;
     if (this.gateway) {
       this.gateway.disconnect();
       this.gateway = null;
     }
     this.isConnected = false;
     this.isGenerating = false;
+    this.runtimeSessionId = '';
   }
 }

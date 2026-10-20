@@ -68,6 +68,8 @@ __pycache__/
 
 # HarmonyOS / DevEco Studio
 .hvigor/
+.idea/
+**/.idea/
 **/build/
 **/.cxx/
 **/.preview/

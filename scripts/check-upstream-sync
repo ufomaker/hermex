@@ -3,38 +3,66 @@ set -euo pipefail
 
 BASELINE_FILE="docs/harmonyos/upstream_baseline.json"
 
-echo "=== Hermex 上游基线与更新核查报告 ==="
-echo "执行时间: $(date '+%Y-%m-%d %H:%M:%S')"
-
 if [ ! -f "$BASELINE_FILE" ]; then
     echo "错误: 缺少基线配置文件 $BASELINE_FILE" >&2
     exit 1
 fi
 
-if ! git remote get-url upstream >/dev/null 2>&1; then
-    echo "错误: 未配置 upstream 远程仓库。" >&2
-    exit 1
-fi
+MOCK_REMOTE=""
+MOCK_FAIL=0
 
-UPSTREAM_URL=$(git remote get-url upstream)
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --mock-remote)
+            MOCK_REMOTE="$2"
+            shift 2
+            ;;
+        --mock-fail)
+            MOCK_FAIL=1
+            shift
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
 REVIEWED_SHA=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$BASELINE_FILE')).reviewed_upstream_master_sha)")
-ADAPTED_SHA=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$BASELINE_FILE')).adapted_harmonyos_sha)")
+FUNCTIONAL_SHA=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$BASELINE_FILE')).verified_functional_baseline_sha)")
+DEV_HEAD_SHA=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$BASELINE_FILE')).in_progress_harmonyos_head_sha)")
 HERMES_PIN=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$BASELINE_FILE')).hermes_agent_tested_sha)")
 LEGACY_PIN=$(node -e "console.log(JSON.parse(require('fs').readFileSync('$BASELINE_FILE')).legacy_webui_tested_sha)")
 
-echo "上游仓库地址: $UPSTREAM_URL"
-echo "已审查的上游 iOS Master 基线: $REVIEWED_SHA"
-echo "鸿蒙端已适配 Commit: $ADAPTED_SHA"
-echo "后端直连 Hermes Pin (HERMES_AGENT_TESTED_SHA): $HERMES_PIN"
+echo "=== Hermex 上游基线与更新核查报告 ==="
+echo "执行时间: $(date '+%Y-%m-%d %H:%M:%S %z')"
+echo "已审查的上游 iOS Master 基线 (reviewed_upstream_master_sha): $REVIEWED_SHA"
+echo "已通过全量功能验收的鸿蒙基线 (verified_functional_baseline_sha): $FUNCTIONAL_SHA"
+echo "当前开发中鸿蒙提交 (in_progress_harmonyos_head_sha): $DEV_HEAD_SHA"
+echo "直连 Hermes 后端契约 Pin (HERMES_AGENT_TESTED_SHA): $HERMES_PIN"
 echo "Legacy WebUI 后端契约 Pin (UPSTREAM_TESTED_SHA): $LEGACY_PIN"
 
-echo "正在查询上游 master 远端真实引用 (git ls-remote)..."
-REMOTE_LINE=$(git ls-remote upstream refs/heads/master 2>&1) || {
-    echo "错误: 访问上游仓库失败，请检查网络连接。" >&2
+if [ "$MOCK_FAIL" -eq 1 ]; then
+    echo "错误: [测试模式] 访问上游仓库失败 (模拟网络异常)" >&2
     exit 2
-}
+fi
 
-REMOTE_MASTER_SHA=$(echo "$REMOTE_LINE" | awk '{print $1}')
+if [ -n "$MOCK_REMOTE" ]; then
+    REMOTE_MASTER_SHA="$MOCK_REMOTE"
+    echo "[测试模式] 使用模拟远端 master SHA: $REMOTE_MASTER_SHA"
+else
+    if ! git remote get-url upstream >/dev/null 2>&1; then
+        echo "错误: 未配置 upstream 远程仓库。" >&2
+        exit 1
+    fi
+    UPSTREAM_URL=$(git remote get-url upstream)
+    echo "上游仓库地址: $UPSTREAM_URL"
+    echo "正在查询上游 master 远端真实引用 (git ls-remote)..."
+    REMOTE_LINE=$(git ls-remote upstream refs/heads/master 2>&1) || {
+        echo "错误: 访问上游仓库失败，请检查网络连接。" >&2
+        exit 2
+    }
+    REMOTE_MASTER_SHA=$(echo "$REMOTE_LINE" | awk '{print $1}')
+fi
 
 if [ -z "$REMOTE_MASTER_SHA" ]; then
     echo "错误: 未能在上游找到 refs/heads/master 引用。" >&2
@@ -47,7 +75,7 @@ if [ "$REVIEWED_SHA" = "$REMOTE_MASTER_SHA" ]; then
     echo "核查结果: [无更新] 上游 master 自上次审查以来无新提交 ($REVIEWED_SHA)。"
 else
     echo "核查结果: [发现新更新] 上游 master 存在新提交！"
-    echo "  基线已审查: $REVIEWED_SHA"
+    echo "  已审查基线: $REVIEWED_SHA"
     echo "  远端最新:   $REMOTE_MASTER_SHA"
     echo "  提示: 请由监督者评估变更范围后推进基线与鸿蒙功能适配。"
 fi

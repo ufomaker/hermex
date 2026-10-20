@@ -5,12 +5,13 @@ import { BotConnection, HermesStatus } from '../model/Connection';
 import { HermesSession } from '../model/Session';
 import { ChatMessage, ToolCallItem } from '../model/ChatMessage';
 import { ModelOption } from '../model/Approval';
+import { MarkdownView } from '../components/MarkdownView';
 import promptAction from '@ohos.promptAction';
 
 @Entry
 @Component
 struct Index {
-  @State serverUrl: string = 'http://127.0.0.1:61688';
+  @State serverUrl: string = '';
   @State usernameInput: string = '';
   @State passwordInput: string = '';
   @State statusProbeText: string = '';
@@ -357,11 +358,15 @@ struct Index {
                 })
               }
 
-              // 主文字气泡
+              // 主文字气泡 (集成 MarkdownView)
               Column() {
-                Text(msg.content || (msg.status === 'streaming' ? '思考与撰写中...' : ''))
-                  .fontSize(15)
-                  .fontColor(msg.role === 'user' ? '#FFFFFF' : '#111827')
+                if (msg.role === 'user') {
+                  Text(msg.content)
+                    .fontSize(15)
+                    .fontColor('#FFFFFF')
+                } else {
+                  MarkdownView({ content: msg.content || (msg.status === 'streaming' ? '思考与撰写中...' : '') })
+                }
               }
               .padding(12)
               .backgroundColor(msg.role === 'user' ? '#007AFF' : '#F2F2F7')
@@ -426,12 +431,17 @@ struct Index {
             .fontWeight(FontWeight.Bold)
             .margin({ bottom: 16 })
 
-          TextInput({ text: this.serverUrl, placeholder: '服务器地址 (例如 http://127.0.0.1:61688)' })
+          TextInput({ text: this.serverUrl, placeholder: '服务器地址 (例如 https://hermes.domain.com 或 http://192.168.1.100:8787)' })
             .height(40)
-            .margin({ bottom: 10 })
+            .margin({ bottom: 4 })
             .onChange((val: string) => {
               this.serverUrl = val;
             })
+
+          Text('说明：在真机上 127.0.0.1 指向手机自身，无法直连电脑；请填写电脑的局域网 IP 或外网 HTTPS 域名。')
+            .fontSize(11)
+            .fontColor('#6B7280')
+            .margin({ bottom: 10 })
 
           TextInput({ text: this.usernameInput, placeholder: '用户名 (可选)' })
             .height(40)

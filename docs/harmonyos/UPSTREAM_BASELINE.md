@@ -11,19 +11,24 @@
 ## 2. 后端协议与版本兼容性 Pin 说明
 
 - `HERMES_AGENT_TESTED_SHA`：
-  - 说明：后端 `hermes-agent` Python 网关测试验证提交与发布版本 Pin。
+  - 说明：后端直连 `hermes-agent` Python 网关测试验证提交与发布版本 Pin。
   - Commit: `ca6782850432927f33df4775cb6dd45bb51460d2`
   - Tested Version: `0.21.5`
 - `UPSTREAM_TESTED_SHA`：
-  - 说明：原作者 `hermex` (iOS 客户端仓库) 上游主线测试提交 Pin。
+  - 说明：legacy `hermes-webui` 后端契约兼容性测试提交 Pin（对应上游 upstream 仓库 `hermes-webui` 的 Git commit）。
   - Commit: `c67fd2dd270a1128c2754200406bca58e9d9a25a`
+- `reviewed_upstream_master_sha`：
+  - 说明：原作者 `hermex` iOS 客户端源码仓库当前已审查的基线快照 Commit（记录于 `docs/harmonyos/upstream_baseline.json`）。
+  - Commit: `b26d7c564ae5459bffd2f448118b986741f6720f`
+- `verified_functional_baseline_sha`：
+  - 说明：鸿蒙端全量功能已通过端到端验收的稳定基线 Commit（当前为 `null`，待全量功能验收完成后由监督者确认并推进）。
 - 最低兼容版本门槛：`0.21.3`（`HermesCompatibility.minimumVersion`）。
 - 本机运行服务静态探测实况（仅探测公开版本与状态，不接触密钥及敏感数据）：
   - 端口：`61688`
   - 探针端点：`GET http://127.0.0.1:61688/api/status`
   - 汇报版本：`0.22.2`（release_date: `2026.9.24`）
   - 门槛判断：`0.22.2 >= 0.21.3` 满足客户端准入的最低版本要求。
-  - **重要说明**：满足最低版本号仅代表静态准入门槛通过，不代表与 0.22.2 的完整协议兼容性已经验证；实际协议兼容性以 WebSocket 真实握手和隔离测试结果为准。
+  - **重要说明**：满足最低版本号仅代表静态准入门槛通过，不代表与 0.22.2 的完整协议兼容性已经验证；实际协议兼容性以 WebSocket 真实握手和隔离测试结果为准。本地 127.0.0.1 仅为开发调试探测，真机不可作为产品默认连接。
 
 ## 3. 核心通信协议证据（源码固定核查结果）
 
