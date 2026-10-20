@@ -1,31 +1,39 @@
 # Hermex HarmonyOS 移植状态追踪
 
-- 状态：**阶段五官方模拟器 Hypium 端到端 UI 审批流与原生 RCP 实机验证全线闭环 (Stage 5 Official Hypium UiTest End-to-End Chat Approval & Native RCP Device Verified)**
-- 当前阶段：Run 14 工作块已全部落实：
-  1. **官方 Hypium UiTest 真机端到端全旅程页面测试 (F01/F03/F04/F10)**：
-     - 在 `harmonyos/entry/src/ohosTest/ets/test/ChatApprovalUi.test.ets` 中建立标准 stageMode 测试套件；
-     - 在 OpenHarmony 6 官方模拟器（`127.0.0.1:5555`）上运行真实 `aa test`，通过 `@ohos.UiTest` 的 `Driver` 真实驱动应用界面组件（包含 `btn_server_settings`, `input_server_url`, `input_username`, `input_password`, `btn_connect_save`, `btn_new_session`, `input_chat_message`, `btn_send_message`, `btn_approval_once`）；
-     - 完整闭环走完：输入服务器与公开测试账号凭据 -> 连接保存认证成功 -> 新建独立真实会话 -> 中文输入命令发出 -> 界面捕捉到审批卡片并点击【允许一次】 -> 服务端执行 `python3 -c "print(1)"` -> 界面回显包含 `'1'` 且生成停止 -> 切前后台（`appScenePhase`）断线重连 -> 会话历史回填验证完好无损；
-     - 测试退出码：0，`Tests run: 3, Failure: 0, Error: 0, Pass: 3, Ignore: 0`。
-  2. **官方 RemoteCommunicationKit 原生 RCP PATCH 动词主机实机证据 (F11 - REVIEW_DEVICE_14 审查项 3)**：
-     - 在 `ChatApprovalUi.test.ets` 中加入 `testRcpNativePatchEcho`，通过真实业务类 `HermesKanbanClient.updateCardStatus` 触发 HarmonyOS 原生 `@kit.RemoteCommunicationKit` (`rcp.Request`)；
-     - 经由设备反向映射端口 9198，在宿主机回显服务中捕获到确定性的请求凭证：
-       `{"timestamp":"2026-10-20T18:27:49.553Z","method":"PATCH","url":"/api/plugins/kanban/tasks/card-patch-007?board=kanban-board-echo","headers":{"host":"127.0.0.1:9198","user-agent":"libcurl-agent/1.0",...},"body":"{\"status\":\"done\"}"}`；
-     - 证实 HarmonyOS 官方 RCP 确实完整支持 HTTP `PATCH` 动词，无临时探针滞留生产 `EntryAbility`。
-  3. **手机附件与语音录音真实网络管道对齐 (REVIEW_DEVICE_14 审查项 1)**：
-     - `toggleVoiceRecording` 录音完成后读取二进制转为 Base64 dataURL，经由真实 Gateway RPC `file.attach` 附加到会话中，杜绝手机沙箱 `/data/...` 裸露路径；
-     - 消息列表增加交互式语音播放按钮（`▶ 播放语音` / `⏹ 停止播放`），驱动 `VoiceUtils.playAudio`；
-     - `handleInboundShare` 区分图片与文件，分别经由 `HermesFileClient.uploadImage` 或 `chatVm.attachDocument` 上传与附加，失败保留重试提示，取消不发假链接。
-  4. **深链连接归一化与待认证平滑恢复 (REVIEW_DEVICE_14 审查项 2)**：
-     - `findMatchingConnection` 实现稳定 ID、规范化 URL、名称三级递进精确匹配；
-     - 当深链指定的服务器未预置时，自动为用户填入待配置服务器地址并打开连接设置弹窗，实现平滑待认证恢复。
-  5. **环境与依赖纯净化**：
-     - 恢复 `harmonyos/entry/oh-package.json5` 中 `@ohos/hypium` 为标准语义版本 `"1.0.19"`，消除本机绝对文件依赖；
-     - 保持 `harmonyos/build-profile.json5` 的 `skip-worktree` 状态，严禁签名字段泄漏与修改。
-- 更新时间：2026-10-21 02:30
+- 状态：**阶段五（Run 15 完善）官方模拟器 Hypium 端到端 UI 审批流、精确终态回复、真实系统生命周期与真实网络扰动断线同会话重连全线通过 (Stage 5 Full Official Hypium E2E UiTest, Exact Reply, Real Lifecycle & Real Network Drop/Reconnect Verified)**
+- 当前阶段：Run 15 工作块已全部落实：
+  1. **核心 UI 精确正文与状态机断言 (落实 REVIEW_UI_14.md 审查项 1)**：
+     - 在 `harmonyos/entry/src/ohosTest/ets/test/ChatApprovalUi.test.ets` 中，将弱断言 `ON.text('1')` 彻底替换为对 stub 模型真实终态回复 `"The command returned: 1."` 的精确文本断言；
+     - 指令输入引入毫秒级动态唯一标识 `【RUN15_${timestamp}】请执行命令: python3 -c 'print(1)'`，严密防范多轮测试历史消息脏数据污染；
+     - 严格断言审批卡片（`btn_approval_once`）彻底销毁、生成状态（`btn_stop_generating`）彻底终止、发送入口（`btn_send_message`）恢复可用、助手消息气泡（`msg_bubble_assistant`）成功渲染。
+  2. **真实系统生命周期前后台切换 (落实 REVIEW_UI_14.md 审查项 2)**：
+     - 废除单测内部篡改 `AppStorage.setOrCreate('appScenePhase', ...)` 的假前后台逻辑；
+     - 改用真实系统级操作：通过 `driver.pressHome()` 真实退出至系统桌面，触发 EntryAbility 真实 `onBackground`，随后通过 `delegator.startAbility({ bundleName, abilityName: 'EntryAbility' })` 真实唤醒应用触发 `onForeground`；
+     - 切回前台后严格验证同一会话历史记录与精确正文无损回填。
+  3. **真实网络扰动与同会话重连 (落实 REVIEW_UI_14.md 审查项 3)**：
+     - 编写宿主机协调器脚本 `harmonyos/tests/run-e2e-with-network-test.js`，通过实时监听 hilog 事件阶段：
+       - 在测试发出 `PHASE: DISCONNECT_TRIGGER_READY` 时，宿主机执行 `hdc fport rm tcp:9199 tcp:9199` 真实切断端口；
+       - UI 状态栏组件 `txt_connection_status` 真实感知网络中断并显示为 `"已断开"`（红灯）；
+       - 在测试发出 `PHASE: DISCONNECT_VERIFIED_NOW_RECONNECT` 时，宿主机执行 `hdc rport tcp:9199 tcp:9199` 恢复反向端口；
+       - 点击状态栏重新连接按钮 `btn_reconnect_status`，触发 `chatVm.attachSession` 经由 `session.resume` 恢复到同一会话 (`storedSessionId`)；
+       - 状态栏正确变为 `"会话已恢复"`，历史消息完整保留，终态回复 `"The command returned: 1."` 完好无损。
+  4. **六大阶段真实屏幕与布局树快照留档**：
+     - `snap_01_approval_card.jpeg` / `layout_01_approval_card.json`
+     - `snap_02_exact_reply.jpeg` / `layout_02_exact_reply.json`
+     - `snap_03_after_real_lifecycle.jpeg` / `layout_03_after_real_lifecycle.json`
+     - `snap_04_before_disconnect.jpeg` / `layout_04_before_disconnect.json`
+     - `snap_05_during_disconnect.jpeg` / `layout_05_during_disconnect.json`
+     - `snap_06_reconnected_history.jpeg` / `layout_06_reconnected_history.json`
+  5. **官方 Hypium UiTest + RCP PATCH 全量通过**：
+     - `Tests run: 3, Failure: 0, Error: 0, Pass: 3, Ignore: 0` (退出码 0)
+  6. **安全与协议合规（落实 INCIDENT_IME_14.md）**：
+     - 严禁且无任何自动勾选、自动同意隐私协议或输入法协议的违规行为；
+     - 严禁且未通过 shell 命令预先绕过授权或授予敏感系统权限；
+     - `harmonyos/build-profile.json5` 持续保持 `skip-worktree` (`S`)，签名字段安全无泄漏。
+- 更新时间：2026-10-21 02:55
 - 当前分支：`harmonyos/native-port`
 - 实施者：AntiGravity
-- 监督审查参考：`REVIEW_DEVICE_14.md`, `RESUME_RUN14.md`
+- 监督审查参考：`REVIEW_UI_14.md`, `INCIDENT_IME_14.md`, `RESUME_RUN15.md`
 
 ## 监督意见落实与本次核心重构详单
 

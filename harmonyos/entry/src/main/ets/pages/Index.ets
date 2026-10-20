@@ -908,6 +908,7 @@ struct Index {
       Row() {
         Column() {
           Text(this.currentSessionTitle)
+            .id('txt_current_session_title')
             .fontSize(16)
             .fontWeight(FontWeight.Bold)
             .maxLines(1)
@@ -917,10 +918,23 @@ struct Index {
               .fill(this.isConnected ? '#34C759' : '#FF3B30')
               .margin({ right: 4 })
             Text(this.connectionStatusText)
+              .id('txt_connection_status')
               .fontSize(11)
               .fontColor('#8E8E93')
               .maxLines(1)
           }
+          .id('btn_reconnect_status')
+          .onClick(async () => {
+            const cur = this.connVm.getCurrentConnection();
+            hilog.info(DOMAIN, TAG, 'btn_reconnect_status clicked: isConnected=%{public}s cur=%{public}s sess=%{public}s',
+              String(this.isConnected), cur ? cur.id : 'null', this.currentSessionId);
+            if (!this.isConnected) {
+              if (cur && this.currentSessionId) {
+                this.showToast('正在重新连接...');
+                await this.chatVm.attachSession(cur, this.currentSessionId);
+              }
+            }
+          })
         }
         .alignItems(HorizontalAlign.Start)
         .layoutWeight(1)
@@ -1047,6 +1061,7 @@ struct Index {
           .width('100%')
           .margin({ top: 6 })
         }
+        .id('card_approval_container')
         .width('92%')
         .padding(12)
         .margin({ top: 8 })
@@ -1080,6 +1095,7 @@ struct Index {
             })
           }
         }
+        .id('card_clarify_container')
         .width('92%')
         .padding(12)
         .margin({ top: 8 })
@@ -1247,6 +1263,7 @@ struct Index {
                       })
                   }
                 }
+                .id(msg.role === 'assistant' ? 'msg_bubble_assistant' : 'msg_bubble_user')
                 .padding(12)
                 .backgroundColor(msg.role === 'user' ? '#007AFF' : '#F2F2F7')
                 .borderRadius(12)
@@ -2526,6 +2543,7 @@ struct Index {
             }
           }
         }
+        .id('dialog_tools_container')
         .width('92%')
         .padding(16)
         .backgroundColor('#FFFFFF')
