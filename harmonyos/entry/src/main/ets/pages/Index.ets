@@ -12,7 +12,7 @@ import { ChatMessage, ToolCallItem } from '../model/ChatMessage';
 import { ModelOption } from '../model/Approval';
 import { WorkspaceFileEntry } from '../network/HermesWorkspaceClient';
 import { HermesFileClient } from '../network/HermesFileClient';
-import { CronJobItem } from '../network/HermesCronClient';
+import { CronJobItem, CronRunItem } from '../network/HermesCronClient';
 import { SkillSummary } from '../network/HermesSkillsClient';
 import { ModelUsageItem } from '../network/HermesInsightsClient';
 import { GitBranchInfo } from '../network/HermesProjectClient';
@@ -81,6 +81,23 @@ struct Index {
   @State isKanbanReadOnly: boolean = false;
   @State kanbanSnapshot: KanbanBoardSnapshot | null = null;
   @State newCardTitleInput: string = '';
+
+  // Cron States (F08)
+  @State cronJobs: CronJobItem[] = [];
+  @State isCronLoading: boolean = false;
+  @State isCronOperating: boolean = false;
+  @State cronStatusMessage: string = '';
+  @State showCreateCronDialog: boolean = false;
+  @State showEditCronDialog: boolean = false;
+  @State showCronHistoryDialog: boolean = false;
+  @State cronInputName: string = '';
+  @State cronInputSchedule: string = '0 8 * * *';
+  @State cronInputPrompt: string = '';
+  @State cronEditTargetJob: CronJobItem | null = null;
+  @State cronEditName: string = '';
+  @State cronEditSchedule: string = '';
+  @State cronHistoryRuns: CronRunItem[] = [];
+  @State cronHistoryTargetJobName: string = '';
 
   // App Lifecycle & Platform Listeners
   @StorageProp('appScenePhase') @Watch('onScenePhaseChanged') scenePhase: string = 'active';
@@ -155,6 +172,15 @@ struct Index {
         this.selectedKanbanName = this.kanbanVm.selectedBoardName;
         this.isKanbanReadOnly = this.kanbanVm.isReadOnly;
         this.kanbanSnapshot = this.kanbanVm.currentSnapshot;
+      }
+    });
+
+    this.cronVm.setListener({
+      onStateChanged: () => {
+        this.cronJobs = this.cronVm.jobs.slice();
+        this.isCronLoading = this.cronVm.isLoading;
+        this.isCronOperating = this.cronVm.isOperating;
+        this.cronStatusMessage = this.cronVm.statusMessage;
       }
     });
 
@@ -713,6 +739,7 @@ struct Index {
     try {
       if (this.selectedToolsTab === 0) {
         await this.cronVm.loadJobs(cur);
+        this.cronJobs = this.cronVm.jobs.slice();
         this.toolsStatusText = this.cronVm.statusMessage;
       } else if (this.selectedToolsTab === 1 || this.selectedToolsTab === 2) {
         await this.skillsVm.loadSkillsAndMemory(cur);
@@ -733,6 +760,74 @@ struct Index {
     } finally {
       this.isToolsLoading = false;
     }
+  }
+
+  // Cron Operations (F08)
+  private openCreateCronDialog() {
+    this.cronInputName = '';
+    this.cronInputSchedule = '0 8 * * *';
+    this.cronInputPrompt = 'echo "cron task"';
+    this.showCreateCronDialog = true;
+  }
+
+  private async confirmCreateCron() {
+    const cur = this.connVm.getCurrentConnection();
+    if (!cur) return;
+    const name = this.cronInputName.trim();
+    const sched = this.cronInputSchedule.trim();
+    const prompt = this.cronInputPrompt.trim();
+    if (!name || !sched || !prompt) {
+      this.showToast('任务名称、Cron表达式与提示词均为必填项');
+      return;
+    }
+    const res = await this.cronVm.createJob(cur, name, sched, prompt);
+    if (res) {
+      this.cronJobs = this.cronVm.jobs.slice();
+      if (res.warning) {
+        this.showToast(`已保存任务(警告: ${res.warning})`);
+      } else {
+        this.showToast('定时任务已成功创建');
+      }
+      this.showCreateCronDialog = false;
+      this.cronInputName = '';
+      this.cronInputSchedule = '';
+      this.cronInputPrompt = '';
+    } else {
+      this.showToast(this.cronVm.actionError || '创建任务失败');
+    }
+  }
+
+  private openEditCronDialog(job: CronJobItem) {
+    this.cronEditTargetJob = job;
+    this.cronEditName = job.name;
+    this.cronEditSchedule = job.schedule;
+    this.showEditCronDialog = true;
+  }
+
+  private async confirmEditCron() {
+    if (!this.cronEditTargetJob) return;
+    const cur = this.connVm.getCurrentConnection();
+    if (!cur) return;
+    const res = await this.cronVm.updateJob(cur, this.cronEditTargetJob.id, {
+      name: this.cronEditName.trim(),
+      schedule: this.cronEditSchedule.trim()
+    });
+    if (res) {
+      this.cronJobs = this.cronVm.jobs.slice();
+      this.showToast('定时任务已成功更新');
+      this.showEditCronDialog = false;
+      this.cronEditTargetJob = null;
+    } else {
+      this.showToast(this.cronVm.actionError || '更新任务失败');
+    }
+  }
+
+  private async openCronHistoryDialog(job: CronJobItem) {
+    const cur = this.connVm.getCurrentConnection();
+    if (!cur) return;
+    this.cronHistoryTargetJobName = job.name;
+    this.cronHistoryRuns = await this.cronVm.loadRuns(cur, job.id);
+    this.showCronHistoryDialog = true;
   }
 
   /**
@@ -1073,6 +1168,7 @@ struct Index {
           })
 
         Button('功能')
+          .id('btn_tools_dialog')
           .fontSize(11)
           .height(32)
           .backgroundColor('#E5E5EA')
@@ -1583,7 +1679,7 @@ struct Index {
 
           // 搜索栏与清除按钮
           Row() {
-            TextInput({ text: this.sessionSearchQuery, placeholder: '搜索会话标题、预览或ID...' })
+            TextInput({ text: $$this.sessionSearchQuery, placeholder: '搜索会话标题、预览或ID...' })
               .id('input_session_search')
               .fontSize(13)
               .layoutWeight(1)
@@ -1691,6 +1787,7 @@ struct Index {
                   }
 
                   Text(`Profile: ${s.profile || 'default'} | ID: ${s.id}`)
+                    .id(`txt_session_id_label_${s.id}`)
                     .fontSize(10)
                     .fontColor('#9CA3AF')
                     .margin({ top: 2 })
@@ -2172,6 +2269,7 @@ struct Index {
               .fontWeight(FontWeight.Bold)
             Blank()
             Button('关闭')
+              .id('btn_close_tools_dialog')
               .fontSize(12)
               .backgroundColor('#E5E5EA')
               .fontColor('#374151')
@@ -2185,6 +2283,7 @@ struct Index {
           // 选项卡切换
           Row() {
             Button('任务')
+              .id('tab_tools_cron')
               .fontSize(11)
               .height(30)
               .backgroundColor(this.selectedToolsTab === 0 ? '#007AFF' : '#F2F2F7')
@@ -2266,7 +2365,20 @@ struct Index {
                     .fontSize(13)
                     .fontWeight(FontWeight.Bold)
                     .layoutWeight(1)
+
+                  Button('+ 新建')
+                    .id('btn_new_cron_job')
+                    .fontSize(11)
+                    .height(26)
+                    .backgroundColor('#007AFF')
+                    .fontColor('#FFFFFF')
+                    .margin({ right: 6 })
+                    .onClick(() => {
+                      this.openCreateCronDialog();
+                    })
+
                   Button('刷新')
+                    .id('btn_refresh_cron_jobs')
                     .fontSize(11)
                     .height(26)
                     .backgroundColor('#E5E5EA')
@@ -2279,21 +2391,23 @@ struct Index {
                 .width('100%')
                 .margin({ bottom: 8 })
 
-                if (this.cronVm.jobs.length === 0) {
-                  Text('暂无配置的定时任务')
+                if (this.cronJobs.length === 0) {
+                  Text(this.isCronLoading ? '正在加载定时任务...' : '暂无配置的定时任务')
                     .fontSize(12)
                     .fontColor('#9CA3AF')
                     .margin({ top: 20 })
                 } else {
                   List({ space: 6 }) {
-                    ForEach(this.cronVm.jobs, (job: CronJobItem) => {
+                    ForEach(this.cronJobs, (job: CronJobItem) => {
                       ListItem() {
                         Row() {
                           Column() {
                             Text(job.name)
+                              .id(`txt_cron_name_${job.id}`)
                               .fontSize(13)
                               .fontWeight(FontWeight.Medium)
-                            Text(`表达式: ${job.schedule || '无'} | 状态: ${job.enabled ? '运行中' : '已暂停'}`)
+                            Text(`ID: ${job.id} | 表达式: ${job.schedule || '无'} | 状态: ${job.enabled ? '运行中' : '已暂停'}`)
+                              .id(`txt_cron_schedule_${job.id}`)
                               .fontSize(10)
                               .fontColor('#8E8E93')
                               .margin({ top: 2 })
@@ -2302,6 +2416,7 @@ struct Index {
                           .layoutWeight(1)
 
                           Button('运行')
+                            .id(`btn_trigger_cron_${job.id}`)
                             .fontSize(11)
                             .height(26)
                             .backgroundColor('#E0E7FF')
@@ -2310,21 +2425,45 @@ struct Index {
                             .onClick(async () => {
                               const cur = this.connVm.getCurrentConnection();
                               if (cur) {
-                                await this.cronVm.runJob(cur, job.id);
+                                await this.cronVm.triggerJob(cur, job.id);
                                 this.showToast(this.cronVm.statusMessage);
                               }
                             })
 
                           Button(job.enabled ? '暂停' : '恢复')
+                            .id(`btn_toggle_cron_${job.id}`)
                             .fontSize(11)
                             .height(26)
                             .backgroundColor(job.enabled ? '#FEE2E2' : '#DCFCE7')
                             .fontColor(job.enabled ? '#B91C1C' : '#15803D')
+                            .margin({ right: 4 })
                             .onClick(async () => {
                               const cur = this.connVm.getCurrentConnection();
                               if (cur) {
                                 await this.cronVm.toggleJob(cur, job);
+                                this.showToast(this.cronVm.statusMessage);
                               }
+                            })
+
+                          Button('编辑')
+                            .id(`btn_edit_cron_${job.id}`)
+                            .fontSize(11)
+                            .height(26)
+                            .backgroundColor('#F3F4F6')
+                            .fontColor('#374151')
+                            .margin({ right: 4 })
+                            .onClick(() => {
+                              this.openEditCronDialog(job);
+                            })
+
+                          Button('历史')
+                            .id(`btn_history_cron_${job.id}`)
+                            .fontSize(11)
+                            .height(26)
+                            .backgroundColor('#F3F4F6')
+                            .fontColor('#374151')
+                            .onClick(async () => {
+                              await this.openCronHistoryDialog(job);
                             })
                         }
                         .width('100%')
@@ -2332,8 +2471,10 @@ struct Index {
                         .backgroundColor('#F9FAFB')
                         .borderRadius(6)
                       }
-                    })
+                      .id(`item_cron_job_${job.id}`)
+                    }, (job: CronJobItem) => `${job.id}_${job.name}_${job.schedule}_${job.enabled}`)
                   }
+                  .id('list_cron_jobs')
                   .height(220)
                   .width('100%')
                 }
@@ -2892,6 +3033,249 @@ struct Index {
         .borderRadius(16)
         .shadow({ radius: 20, color: '#40000000' })
         .position({ x: '4%', y: '10%' })
+      }
+
+      // 10. 创建定时任务弹窗 (F08)
+      if (this.showCreateCronDialog) {
+        Column() {
+          Text('新建定时任务')
+            .fontSize(16)
+            .fontWeight(FontWeight.Bold)
+            .margin({ bottom: 12 })
+
+          Text('任务名称')
+            .fontSize(12)
+            .fontColor('#4B5563')
+            .alignSelf(ItemAlign.Start)
+            .margin({ bottom: 4 })
+          TextInput({ text: this.cronInputName, placeholder: '请输入任务名称' })
+            .id('input_cron_name')
+            .fontSize(13)
+            .height(38)
+            .backgroundColor('#F3F4F6')
+            .borderRadius(8)
+            .onChange((val: string) => {
+              this.cronInputName = val;
+            })
+            .margin({ bottom: 10 })
+
+          Text('Cron 表达式')
+            .fontSize(12)
+            .fontColor('#4B5563')
+            .alignSelf(ItemAlign.Start)
+            .margin({ bottom: 4 })
+          TextInput({ text: this.cronInputSchedule, placeholder: '0 8 * * *' })
+            .id('input_cron_schedule')
+            .fontSize(13)
+            .height(38)
+            .backgroundColor('#F3F4F6')
+            .borderRadius(8)
+            .onChange((val: string) => {
+              this.cronInputSchedule = val;
+            })
+            .margin({ bottom: 10 })
+
+          Text('执行提示词 (Prompt)')
+            .fontSize(12)
+            .fontColor('#4B5563')
+            .alignSelf(ItemAlign.Start)
+            .margin({ bottom: 4 })
+          TextInput({ text: this.cronInputPrompt, placeholder: '输入执行内容或指令' })
+            .id('input_cron_prompt')
+            .fontSize(13)
+            .height(38)
+            .backgroundColor('#F3F4F6')
+            .borderRadius(8)
+            .onChange((val: string) => {
+              this.cronInputPrompt = val;
+            })
+            .margin({ bottom: 16 })
+
+          Row({ space: 12 }) {
+            Button('取消')
+              .id('btn_cancel_create_cron')
+              .fontSize(13)
+              .layoutWeight(1)
+              .height(36)
+              .backgroundColor('#E5E7EB')
+              .fontColor('#374151')
+              .onClick(() => {
+                this.showCreateCronDialog = false;
+              })
+
+            Button('创建')
+              .id('btn_confirm_create_cron')
+              .fontSize(13)
+              .layoutWeight(1)
+              .height(36)
+              .backgroundColor('#007AFF')
+              .fontColor('#FFFFFF')
+              .onClick(() => {
+                this.confirmCreateCron();
+              })
+          }
+          .width('100%')
+        }
+        .width('85%')
+        .padding(16)
+        .backgroundColor('#FFFFFF')
+        .borderRadius(14)
+        .shadow({ radius: 20, color: '#40000000' })
+        .position({ x: '7.5%', y: '20%' })
+      }
+
+      // 11. 编辑定时任务弹窗 (F08)
+      if (this.showEditCronDialog) {
+        Column() {
+          Text('编辑定时任务')
+            .fontSize(16)
+            .fontWeight(FontWeight.Bold)
+            .margin({ bottom: 12 })
+
+          Text('任务名称')
+            .fontSize(12)
+            .fontColor('#4B5563')
+            .alignSelf(ItemAlign.Start)
+            .margin({ bottom: 4 })
+          TextInput({ text: this.cronEditName, placeholder: '请输入任务名称' })
+            .id('input_edit_cron_name')
+            .fontSize(13)
+            .height(38)
+            .backgroundColor('#F3F4F6')
+            .borderRadius(8)
+            .onChange((val: string) => {
+              this.cronEditName = val;
+            })
+            .margin({ bottom: 10 })
+
+          Text('Cron 表达式')
+            .fontSize(12)
+            .fontColor('#4B5563')
+            .alignSelf(ItemAlign.Start)
+            .margin({ bottom: 4 })
+          TextInput({ text: this.cronEditSchedule, placeholder: '0 8 * * *' })
+            .id('input_edit_cron_schedule')
+            .fontSize(13)
+            .height(38)
+            .backgroundColor('#F3F4F6')
+            .borderRadius(8)
+            .onChange((val: string) => {
+              this.cronEditSchedule = val;
+            })
+            .margin({ bottom: 16 })
+
+          Row({ space: 12 }) {
+            Button('取消')
+              .id('btn_cancel_edit_cron')
+              .fontSize(13)
+              .layoutWeight(1)
+              .height(36)
+              .backgroundColor('#E5E7EB')
+              .fontColor('#374151')
+              .onClick(() => {
+                this.showEditCronDialog = false;
+                this.cronEditTargetJob = null;
+              })
+
+            Button('保存')
+              .id('btn_confirm_edit_cron')
+              .fontSize(13)
+              .layoutWeight(1)
+              .height(36)
+              .backgroundColor('#007AFF')
+              .fontColor('#FFFFFF')
+              .onClick(() => {
+                this.confirmEditCron();
+              })
+          }
+          .width('100%')
+        }
+        .width('85%')
+        .padding(16)
+        .backgroundColor('#FFFFFF')
+        .borderRadius(14)
+        .shadow({ radius: 20, color: '#40000000' })
+        .position({ x: '7.5%', y: '25%' })
+      }
+
+      // 12. 任务执行历史弹窗 (F08)
+      if (this.showCronHistoryDialog) {
+        Column() {
+          Row() {
+            Text(`执行记录: ${this.cronHistoryTargetJobName}`)
+              .fontSize(15)
+              .fontWeight(FontWeight.Bold)
+              .layoutWeight(1)
+
+            Button('✕')
+              .id('btn_close_cron_history')
+              .fontSize(14)
+              .width(28)
+              .height(28)
+              .backgroundColor('#F3F4F6')
+              .fontColor('#374151')
+              .onClick(() => {
+                this.showCronHistoryDialog = false;
+              })
+          }
+          .width('100%')
+          .margin({ bottom: 12 })
+
+          if (this.cronHistoryRuns.length === 0) {
+            Column() {
+              Text('暂无执行记录')
+                .fontSize(13)
+                .fontColor('#9CA3AF')
+                .margin({ top: 20, bottom: 20 })
+            }
+            .width('100%')
+          } else {
+            List({ space: 8 }) {
+              ForEach(this.cronHistoryRuns, (r: CronRunItem) => {
+                ListItem() {
+                  Column() {
+                    Row() {
+                      Text(r.id)
+                        .fontSize(12)
+                        .fontWeight(FontWeight.Bold)
+                        .fontColor('#1F2937')
+                        .layoutWeight(1)
+
+                      Text(r.endReason ? (r.endReason === 'success' || r.endReason === 'ok' ? '成功' : r.endReason) : '运行中')
+                        .fontSize(11)
+                        .fontColor(r.endReason === 'success' || r.endReason === 'ok' ? '#16A34A' : '#EF4444')
+                        .backgroundColor(r.endReason === 'success' || r.endReason === 'ok' ? '#DCFCE7' : '#FEE2E2')
+                        .padding({ left: 6, right: 6, top: 2, bottom: 2 })
+                        .borderRadius(4)
+                    }
+                    .width('100%')
+
+                    Text(`启动: ${r.startedAt || '未知'} ${r.endedAt ? '| 结束: ' + r.endedAt : ''}`)
+                      .fontSize(11)
+                      .fontColor('#6B7280')
+                      .margin({ top: 4 })
+                  }
+                  .id(`item_cron_run_${r.id}`)
+                  .width('100%')
+                  .padding(10)
+                  .backgroundColor('#F9FAFB')
+                  .borderRadius(8)
+                  .borderWidth(1)
+                  .borderColor('#E5E7EB')
+                }
+              })
+            }
+            .height(220)
+            .width('100%')
+          }
+        }
+        .id('dialog_cron_history')
+        .width('90%')
+        .padding(16)
+        .backgroundColor('#FFFFFF')
+        .borderRadius(14)
+        .shadow({ radius: 20, color: '#40000000' })
+        .position({ x: '5%', y: '15%' })
       }
     }
     .width('100%')

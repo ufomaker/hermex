@@ -1014,6 +1014,18 @@ async function runTestSuite() {
 
       // 活跃会话流 (archived=exclude)
       if (limit === 20) {
+        const pinnedSession = {
+          id: 'sess_f02_pinned_global',
+          title: '全局置顶会话 (服务端多页回填)',
+          preview: '多页重复置顶项',
+          profile: prof,
+          running: false,
+          archived: false,
+          pinned: true,
+          created_at: Date.now() - 100000,
+          updated_at: Date.now() - 100000
+        };
+
         const mockList = [];
         for (let i = 1; i <= 35; i++) {
           mockList.push({
@@ -1023,15 +1035,25 @@ async function runTestSuite() {
             profile: prof,
             running: false,
             archived: false,
+            pinned: false,
             created_at: Date.now() - (35 - i) * 1000,
             updated_at: Date.now() - (35 - i) * 1000
           });
         }
-        const paged = mockList.slice(offset, offset + limit);
+
+        let paged = [];
+        if (offset === 0) {
+          // 第 1 页：1 条置顶 + 19 条普通 = 20 条
+          paged = [pinnedSession, ...mockList.slice(0, 19)];
+        } else {
+          // 第 2 页 (offset 20)：模拟服务端再次回填置顶项 + 剩余 16 条普通 = 17 条
+          paged = [pinnedSession, ...mockList.slice(19)];
+        }
+
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           sessions: paged,
-          total: mockList.length
+          total: 36
         }));
         return;
       }
@@ -1119,7 +1141,130 @@ async function runTestSuite() {
       return;
     }
 
-    if (req.url.startsWith('/api/cron/jobs') && req.method === 'GET') {
+    // Cron 任务执行历史 (GET /api/cron/jobs/:id/runs)
+    if (parsedUrl.pathname.match(/\/api\/cron\/jobs\/([^\/]+)\/runs/) && req.method === 'GET') {
+      const match = parsedUrl.pathname.match(/\/api\/cron\/jobs\/([^\/]+)\/runs/);
+      const jobId = match ? match[1] : 'job_daily_1';
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        runs: [
+          {
+            id: `run_${jobId}_001`,
+            started_at: Date.now() - 3600000,
+            ended_at: Date.now() - 3590000,
+            is_active: false,
+            end_reason: 'ok',
+            last_status: 'ok',
+            title: '定时任务日常执行'
+          }
+        ]
+      }));
+      return;
+    }
+
+    // Cron 触发执行 (POST /api/cron/jobs/:id/trigger 或 /run)
+    if (parsedUrl.pathname.match(/\/api\/cron\/jobs\/([^\/]+)\/(trigger|run)/) && req.method === 'POST') {
+      const match = parsedUrl.pathname.match(/\/api\/cron\/jobs\/([^\/]+)\/(trigger|run)/);
+      const jobId = match ? match[1] : '';
+      if (jobId === 'job_conflict') {
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ detail: 'Task already active in background' }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, status: 'ok' }));
+      return;
+    }
+
+    // Cron 暂停 (POST /api/cron/jobs/:id/pause)
+    if (parsedUrl.pathname.match(/\/api\/cron\/jobs\/([^\/]+)\/pause/) && req.method === 'POST') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, state: 'paused' }));
+      return;
+    }
+
+    // Cron 恢复 (POST /api/cron/jobs/:id/resume)
+    if (parsedUrl.pathname.match(/\/api\/cron\/jobs\/([^\/]+)\/resume/) && req.method === 'POST') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, state: 'active' }));
+      return;
+    }
+
+    // Cron 编辑更新 (PUT /api/cron/jobs/:id)
+    if (parsedUrl.pathname.startsWith('/api/cron/jobs/') && req.method === 'PUT') {
+      const jobId = parsedUrl.pathname.replace('/api/cron/jobs/', '');
+      let bodyStr = '';
+      req.on('data', chunk => { bodyStr += chunk; });
+      req.on('end', () => {
+        let updates = {};
+        try {
+          const parsedBody = JSON.parse(bodyStr);
+          updates = parsedBody.updates || parsedBody;
+        } catch (_) {}
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: true,
+          job: {
+            id: jobId,
+            name: updates.name || '已更新任务',
+            schedule: updates.schedule || '0 9 * * *',
+            prompt: updates.prompt || '',
+            enabled: true,
+            state: 'active'
+          }
+        }));
+      });
+      return;
+    }
+
+    // Cron 创建任务 (POST /api/cron/jobs)
+    if (parsedUrl.pathname === '/api/cron/jobs' && req.method === 'POST') {
+      let bodyStr = '';
+      req.on('data', chunk => { bodyStr += chunk; });
+      req.on('end', () => {
+        let payload = {};
+        try {
+          payload = JSON.parse(bodyStr);
+        } catch (_) {}
+        if (payload.name === 'trigger-424') {
+          res.writeHead(424, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ detail: { error: 'Scheduler registration failed' } }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: true,
+          job: {
+            id: 'job_created_888',
+            name: payload.name || '新创建任务',
+            schedule: payload.schedule || '* * * * *',
+            prompt: payload.prompt || '',
+            enabled: true,
+            state: 'active',
+            profile: parsedUrl.searchParams.get('profile') || 'default'
+          }
+        }));
+      });
+      return;
+    }
+
+    // Cron 任务列表 (GET /api/cron/jobs)
+    if (parsedUrl.pathname === '/api/cron/jobs' && req.method === 'GET') {
+      const prof = parsedUrl.searchParams.get('profile') || 'default';
+      if (prof === 'fast_profile') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify([
+          {
+            id: 'job_fast_1',
+            name: 'Fast Profile 快速任务',
+            schedule: '*/15 * * * *',
+            enabled: true,
+            profile: 'fast_profile'
+          }
+        ]));
+        return;
+      }
+
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         jobs: [
@@ -1132,24 +1277,6 @@ async function runTestSuite() {
           }
         ]
       }));
-      return;
-    }
-
-    if (req.url.includes('/api/cron/jobs/job_daily_1/run') && req.method === 'POST') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true }));
-      return;
-    }
-
-    if (req.url.includes('/api/cron/jobs/job_daily_1/pause') && req.method === 'POST') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true }));
-      return;
-    }
-
-    if (req.url.includes('/api/cron/jobs/job_daily_1/resume') && req.method === 'POST') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true }));
       return;
     }
 
@@ -2840,14 +2967,14 @@ export const test = true;
     // 1. 测试首次分页加载 (第 1 页，limit 20)
     await sessionVm.loadSessions(conn);
     assert(sessionVm.getSessions().length === 20, `第 1 页应呈现 20 条会话，实际为 ${sessionVm.getSessions().length}`);
-    assert(sessionVm.getTotalCount() === 35, `服务端总数应为 35，实际为 ${sessionVm.getTotalCount()}`);
+    assert(sessionVm.getTotalCount() === 36, `服务端总数应为 36，实际为 ${sessionVm.getTotalCount()}`);
     assert(sessionVm.getHasMore() === true, '应标记 hasMore 为 true');
     console.log('  -> 第 1 页分页加载与总数核验通过');
 
-    // 2. 测试分页加载更多 (第 2 页，追加至 35)
+    // 2. 测试分页加载更多 (第 2 页，追加至 36，含重复置顶回填去重)
     const loadMoreOk = await sessionVm.loadMoreSessions(conn);
     assert(loadMoreOk === true, 'loadMoreSessions 应返回 true');
-    assert(sessionVm.getSessions().length === 35, `追加后应呈现 35 条会话，实际为 ${sessionVm.getSessions().length}`);
+    assert(sessionVm.getSessions().length === 36, `追加后应呈现 36 条会话，实际为 ${sessionVm.getSessions().length}`);
     assert(sessionVm.getHasMore() === false, '第 2 页加载完毕后 hasMore 应为 false');
     console.log('  -> 分页加载更多与去重合并通过');
 
@@ -2857,11 +2984,12 @@ export const test = true;
     assert(sessionVm.getSessions().every(s => (s.title && s.title.includes('第 10')) || (s.preview && s.preview.includes('第 10')) || s.id.includes('10')), '搜索结果匹配');
 
     sessionVm.clearSearch();
-    assert(sessionVm.getSessions().length === 35, '清除搜索后应完整恢复全量 35 条会话');
+    assert(sessionVm.getSessions().length === 36, '清除搜索后应完整恢复全量 36 条会话');
     console.log('  -> 会话即时检索与搜索清除无损恢复通过');
 
     // 4. 测试置顶 (togglePinSession)
     const targetSession = sessionVm.getSessions()[15];
+    targetSession.updated_at = Date.now();
     const pinOk = await sessionVm.togglePinSession(conn, targetSession);
     assert(pinOk === true, '置顶操作应成功');
     assert(targetSession.is_pinned === true, '会话属性标记为置顶');
@@ -2869,7 +2997,7 @@ export const test = true;
 
     // 切换到置顶 Tab
     sessionVm.setFilterTab('pinned');
-    assert(sessionVm.getSessions().length === 1 && sessionVm.getSessions()[0].id === targetSession.id, '置顶 Tab 仅展示置顶项');
+    assert(sessionVm.getSessions().length === 2, `置顶 Tab 应包含 2 个置顶项，实际为: ${sessionVm.getSessions().length}`);
     sessionVm.setFilterTab('all');
     console.log('  -> 会话置顶与置顶前置排序通过');
 
@@ -3008,11 +3136,125 @@ export const test = true;
     console.log('[PASS 33] SessionListViewModel & HermesRESTClient F02 会话管理全生命周期通过');
   }
 
+  // --- 测试用例 34: F08 定时任务调度管理完整生命周期 (Client+ViewModel+契约+隔离+历史) ---
+  console.log('\n[TEST 34] 测试 HermesCronClient & CronViewModel F08 任务管理完整生命周期:');
+  {
+    const cronConn = {
+      id: 'conn-cron',
+      name: 'Cron Test Server',
+      url: baseUrl,
+      serverVersion: 'hermes',
+      token: 'cron-token',
+      cookies: 'cron_cookie=1',
+      activeProfile: 'default'
+    };
+
+    const cronVm = new CronViewModel();
+
+    // 1. 测试 CronViewModel.loadJobs
+    await cronVm.loadJobs(cronConn);
+    assert(cronVm.jobs.length === 1, `应加载 1 个初始任务，实际为: ${cronVm.jobs.length}`);
+    assert(cronVm.jobs[0].id === 'job_daily_1', '任务 ID 匹配');
+    assert(cronVm.jobs[0].name === '每日健康检查', '任务名称匹配');
+    assert(cronVm.jobs[0].schedule === '0 8 * * *', 'Cron 表达式匹配');
+    console.log('  -> 定时任务列表加载与属性解析通过');
+
+    // 2. 测试 CronViewModel.createJob 必填项空值拒绝与正常新建
+    const emptyJob = await cronVm.createJob(cronConn, '   ', '', '');
+    assert(emptyJob === null, '空字段必须拒绝创建');
+    assert(cronVm.actionError && cronVm.actionError.includes('必填'), '必填字段报错提示');
+
+    // 2b. 测试 HTTP 424 警告语义 (任务已持久化但调度注册失败，上游 HermesCronClient.swift:32-49)
+    const warnJob = await cronVm.createJob(cronConn, 'trigger-424', '0 3 * * *', 'echo warn');
+    assert(warnJob !== null && warnJob.state === 'warning', '424 状态应成功返回并标记 warning 状态');
+    assert(cronVm.statusMessage.includes('警告'), '状态消息应展示警告说明');
+
+    const createdJob = await cronVm.createJob(cronConn, '自动化构建与巡检', '0 2 * * *', 'run build-check');
+    assert(createdJob !== null && createdJob.id.length > 0, '创建任务应成功返回任务实例');
+    assert(createdJob.name === '自动化构建与巡检', '新任务名称匹配');
+    assert(createdJob.schedule === '0 2 * * *', '新任务表达式匹配');
+    console.log('  -> 定时任务必填校验、424 调度警告语义与正常新建通过');
+
+    // 3. 测试 CronViewModel.updateJob (PUT /api/cron/jobs/:id)
+    const updatedJob = await cronVm.updateJob(cronConn, 'job_daily_1', {
+      name: '每日健康巡检 (更新)',
+      schedule: '0 9 * * *'
+    });
+    assert(updatedJob !== null, '更新任务应成功');
+    assert(updatedJob.name === '每日健康巡检 (更新)', '更新后任务名称匹配');
+    assert(updatedJob.schedule === '0 9 * * *', '更新后 Cron 表达式匹配');
+    console.log('  -> 定时任务编辑与 PUT 契约通过');
+
+    // 4. 测试 CronViewModel.triggerJob (POST /api/cron/jobs/:id/trigger) 与 409 冲突
+    const triggerOk = await cronVm.triggerJob(cronConn, 'job_daily_1');
+    assert(triggerOk === true, '手动触发任务应返回 true');
+
+    const conflictOk = await cronVm.triggerJob(cronConn, 'job_conflict');
+    assert(conflictOk === false, '409 冲突任务应返回 false');
+    assert(cronVm.actionError && cronVm.actionError.includes('Task already active'), '409 冲突详情捕获');
+    console.log('  -> 定时任务手动触发 (/trigger) 与 409 运行冲突捕获通过');
+
+    // 5. 测试 CronViewModel.toggleJob (暂停与恢复: POST /pause & POST /resume)
+    const toggleTarget = cronVm.jobs[0];
+    const pauseOk = await cronVm.toggleJob(cronConn, toggleTarget);
+    assert(pauseOk === true, '暂停任务应成功');
+
+    toggleTarget.enabled = false;
+    const resumeOk = await cronVm.toggleJob(cronConn, toggleTarget);
+    assert(resumeOk === true, '恢复任务应成功');
+    console.log('  -> 定时任务状态切换 (暂停/恢复) 通过');
+
+    // 6. 测试 CronViewModel.loadRuns (GET /api/cron/jobs/:id/runs?profile=...&limit=100)
+    const runs = await cronVm.loadRuns(cronConn, 'job_daily_1');
+    assert(Array.isArray(runs) && runs.length >= 1, '应成功拉取任务执行历史');
+    assert(runs[0].id.includes('job_daily_1'), '历史运行 ID 与目标任务关联');
+    assert(runs[0].endReason === 'ok', '执行结果状态解析匹配');
+    console.log('  -> 定时任务运行历史拉取与解析通过');
+
+    // 7. 测试切服与代次隔离 (requestSerial 保护)
+    const slowConn = { id: 'conn-slow', name: 'Slow Server', url: baseUrl, serverVersion: 'hermes', activeProfile: 'default' };
+    const fastConn = { id: 'conn-fast', name: 'Fast Server', url: baseUrl, serverVersion: 'hermes', activeProfile: 'fast_profile' };
+
+    const slowPromise = cronVm.loadJobs(slowConn);
+    const fastPromise = cronVm.loadJobs(fastConn);
+    await Promise.all([slowPromise, fastPromise]);
+    assert(cronVm.jobs.every(j => j.profile === 'fast_profile'), '滞后返回的 Slow Server 任务绝不可覆盖活跃 Fast Server');
+    console.log('  -> 切服代次隔离与竞态保护通过');
+
+    // 8. 测试 Legacy WebUI 严格保护 (旧版 WebUI 不支持 cron，必须直接拦截并报错)
+    const legacyCronConn = {
+      id: 'conn-leg-cron',
+      name: 'Legacy Server',
+      url: baseUrl,
+      serverVersion: 'legacy-webui',
+      token: 'leg-token'
+    };
+
+    await cronVm.loadJobs(legacyCronConn);
+    assert(cronVm.jobs.length === 0, 'Legacy WebUI 下任务列表必须清空');
+    assert(cronVm.actionError && cronVm.actionError.includes('不支持定时任务'), 'Legacy WebUI loadJobs 应设置错误提示');
+
+    const legCreate = await cronVm.createJob(legacyCronConn, '测试', '* * * * *', 'prompt');
+    assert(legCreate === null, 'Legacy WebUI createJob 必须返回 null');
+
+    const legUpdate = await cronVm.updateJob(legacyCronConn, 'job_1', { name: '新' });
+    assert(legUpdate === null, 'Legacy WebUI updateJob 必须返回 null');
+
+    const legTrigger = await cronVm.triggerJob(legacyCronConn, 'job_1');
+    assert(legTrigger === false, 'Legacy WebUI triggerJob 必须返回 false');
+
+    const legRuns = await cronVm.loadRuns(legacyCronConn, 'job_1');
+    assert(legRuns.length === 0, 'Legacy WebUI loadRuns 必须返回空数组');
+    console.log('  -> Legacy WebUI 拦截与无副作用保护通过');
+
+    console.log('[PASS 34] HermesCronClient & CronViewModel F08 任务管理全生命周期通过');
+  }
+
   vm.disconnect();
   server.close();
 
   console.log('\n======================================================');
-  console.log('✅ 所有 33 项端到端生产代码行为回归测试全部通过 (退出码 0)');
+  console.log('✅ 所有 34 项端到端生产代码行为回归测试全部通过 (退出码 0)');
   console.log('覆盖真实生产业务类：');
   console.log('  - HermesHistoryNormalizer.ets (轮次边界用户隔离、运行态工具声明保留、多工具、乱序、失败、非JSON与证据 fixture 回归)');
   console.log('  - SessionListViewModel.ets (F02 分页加载、去重、检索清除恢复、分类 Tab、置顶、归档、分支克隆、导出与切服竞态隔离)');

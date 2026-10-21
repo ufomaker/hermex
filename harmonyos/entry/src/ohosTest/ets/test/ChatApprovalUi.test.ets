@@ -3,9 +3,12 @@ import { describe, beforeAll, beforeEach, afterEach, afterAll, it, expect } from
 import { Driver, ON, Component, MatchPattern } from '@ohos.UiTest';
 import abilityDelegatorRegistry from '@ohos.app.ability.abilityDelegatorRegistry';
 import { HermesKanbanClient } from '../../../main/ets/network/HermesKanbanClient';
+import { HermesCronClient, CronJobItem } from '../../../main/ets/network/HermesCronClient';
+import { HermesRESTClient } from '../../../main/ets/network/HermesRESTClient';
 
 const DOMAIN = 0x0000;
 const TAG = 'ChatApprovalUiTest';
+let currentRunSessionPromptTag: string = '';
 
 export default function chatApprovalUiTest() {
   describe('ChatApprovalUiTest', () => {
@@ -96,6 +99,7 @@ export default function chatApprovalUiTest() {
       // 5. 中文输入并发出（携带唯一标记，防止混淆）
       const testTag = 'RUN16_' + Date.now().toString(36);
       const uniquePrompt = `【${testTag}】请执行命令: python3 -c 'print(1)'`;
+      currentRunSessionPromptTag = testTag;
       hilog.info(DOMAIN, TAG, 'PROMPT_TAG: %{public}s', testTag);
       hilog.info(DOMAIN, TAG, 'Step 5: Sending unique command prompt: %{public}s', uniquePrompt);
 
@@ -306,30 +310,29 @@ export default function chatApprovalUiTest() {
       const inputSearch = await driver.findComponent(ON.id('input_session_search'));
       expect(inputSearch !== null).assertTrue();
 
-      // 3. 测试搜索框输入与检索 (使用真实服务端存在的词 "python3")
-      hilog.info(DOMAIN, TAG, 'Step SM2: Entering search query "python3" in input_session_search...');
-      if (inputSearch) {
-        await inputSearch.inputText('python3');
+      // 3. 锁定当前运行产生的唯一会话行 ID (通过 promptTag 精确检索当前测试创建的全新会话)
+      hilog.info(DOMAIN, TAG, 'Step SM2: Locking exact target session ID using currentRunSessionPromptTag: %{public}s...', currentRunSessionPromptTag);
+      if (inputSearch && currentRunSessionPromptTag.length > 0) {
+        await inputSearch.inputText(currentRunSessionPromptTag);
         await driver.delayMs(1500);
       }
-      // 验证检索结果中包含对应会话项
-      const matchedComp = await driver.findComponent(ON.text('python3', MatchPattern.CONTAINS));
-      expect(matchedComp !== null).assertTrue();
+      const idLabels = await driver.findComponents(ON.text('ID: ', MatchPattern.CONTAINS));
+      expect(idLabels !== null && idLabels.length > 0).assertTrue();
+      const firstIdLabel = idLabels[0];
+      const labelText = await firstIdLabel.getText();
+      const idMatch = labelText.match(/ID:\s*([a-zA-Z0-9_-]+)/);
+      expect(idMatch !== null && idMatch[1].length > 0).assertTrue();
+      const targetId = idMatch![1];
+      hilog.info(DOMAIN, TAG, 'Locked exact target session row ID: %{public}s', targetId);
 
-      // 检查清空按钮出现并点击清空
-      const btnClear = await driver.findComponent(ON.id('btn_clear_session_search'));
-      expect(btnClear !== null).assertTrue();
-      if (btnClear) {
-        await btnClear.click();
+      // 4. 测试精准改名弹窗交互与保存 (严格基于 targetId 的按钮)
+      hilog.info(DOMAIN, TAG, 'Step SM3: Testing session rename on targetId %{public}s...', targetId);
+      const btnRenameTarget = await driver.findComponent(ON.id(`btn_rename_session_${targetId}`));
+      expect(btnRenameTarget !== null).assertTrue();
+      if (btnRenameTarget) {
+        await btnRenameTarget.click();
         await driver.delayMs(1000);
       }
-
-      // 4. 测试改名弹窗交互与保存 (严格断言改名按钮存在)
-      hilog.info(DOMAIN, TAG, 'Step SM3: Testing session rename dialog...');
-      const allRenameBtns = await driver.findComponents(ON.text('改名'));
-      expect(allRenameBtns !== null && allRenameBtns.length > 0).assertTrue();
-      await allRenameBtns[0].click();
-      await driver.delayMs(1000);
 
       const inputRename = await driver.findComponent(ON.id('input_rename_session'));
       expect(inputRename !== null).assertTrue();
@@ -349,28 +352,32 @@ export default function chatApprovalUiTest() {
       // 验证改名在界面生效
       const renamedTitleComp = await driver.findComponent(ON.text(newTitle, MatchPattern.CONTAINS));
       expect(renamedTitleComp !== null).assertTrue();
-      hilog.info(DOMAIN, TAG, 'Session rename verified on UI with title: %{public}s', newTitle);
+      hilog.info(DOMAIN, TAG, 'Session rename verified on UI for %{public}s: %{public}s', targetId, newTitle);
 
-      // 5. 测试置顶操作与置顶 Tab 筛选
-      hilog.info(DOMAIN, TAG, 'Step SM4: Testing pin session...');
-      const allPinBtns = await driver.findComponents(ON.text('置顶'));
-      expect(allPinBtns !== null && allPinBtns.length > 0).assertTrue();
-      await allPinBtns[0].click();
-      await driver.delayMs(1500);
+      // 5. 测试精准置顶操作与置顶 Tab 筛选 (严格基于 targetId 的置顶按钮)
+      hilog.info(DOMAIN, TAG, 'Step SM4: Testing pin on targetId %{public}s...', targetId);
+      const btnPinTarget = await driver.findComponent(ON.id(`btn_pin_session_${targetId}`));
+      expect(btnPinTarget !== null).assertTrue();
+      if (btnPinTarget) {
+        await btnPinTarget.click();
+        await driver.delayMs(1500);
+      }
 
-      // 验证页面出现取消置顶按钮
-      const unpinBtn = await driver.findComponent(ON.text('取消置顶'));
-      expect(unpinBtn !== null).assertTrue();
+      // 验证该目标行的置顶按钮变为取消置顶
+      const unpinBtnTarget = await driver.findComponent(ON.id(`btn_pin_session_${targetId}`));
+      expect(unpinBtnTarget !== null).assertTrue();
+      const pinBtnText = await unpinBtnTarget.getText();
+      expect(pinBtnText === '取消置顶').assertTrue();
 
-      // 切换到置顶 Tab
+      // 切换到置顶 Tab 验证目标项存在
       const tabPinned = await driver.findComponent(ON.id('tab_session_pinned'));
       expect(tabPinned !== null).assertTrue();
       if (tabPinned) {
         await tabPinned.click();
         await driver.delayMs(1000);
       }
-      const pinnedInTab = await driver.findComponent(ON.text('取消置顶'));
-      expect(pinnedInTab !== null).assertTrue();
+      const pinnedTargetInTab = await driver.findComponent(ON.id(`btn_pin_session_${targetId}`));
+      expect(pinnedTargetInTab !== null).assertTrue();
 
       // 切回全部 Tab
       const tabAll = await driver.findComponent(ON.id('tab_session_all'));
@@ -380,12 +387,34 @@ export default function chatApprovalUiTest() {
         await driver.delayMs(1000);
       }
 
-      // 6. 测试归档与解归档闭环 (归档 -> 切换归档Tab -> 验证 -> 恢复 -> 切回全部Tab -> 验证)
-      hilog.info(DOMAIN, TAG, 'Step SM5: Testing archive and unarchive roundtrip...');
-      const allArchiveBtns = await driver.findComponents(ON.text('归档'));
-      expect(allArchiveBtns !== null && allArchiveBtns.length > 0).assertTrue();
-      await allArchiveBtns[0].click();
-      await driver.delayMs(1500);
+      // 取消置顶恢复原状 (对齐 Reverse states 规范)
+      const btnUnpinRestore = await driver.findComponent(ON.id(`btn_pin_session_${targetId}`));
+      expect(btnUnpinRestore !== null).assertTrue();
+      if (btnUnpinRestore) {
+        await btnUnpinRestore.click();
+        await driver.delayMs(1000);
+      }
+      const restoredPinBtn = await driver.findComponent(ON.id(`btn_pin_session_${targetId}`));
+      expect(restoredPinBtn !== null).assertTrue();
+      const restoredPinText = await restoredPinBtn.getText();
+      expect(restoredPinText === '置顶').assertTrue();
+      if (tabAll) {
+        await tabAll.click();
+        await driver.delayMs(1000);
+      }
+
+      // 6. 测试精准归档与解归档闭环 (归档 -> 切换归档Tab -> 验证 -> 恢复 -> 切回全部Tab -> 验证)
+      hilog.info(DOMAIN, TAG, 'Step SM5: Testing archive and unarchive roundtrip on targetId %{public}s...', targetId);
+      const btnArchiveTarget = await driver.findComponent(ON.id(`btn_archive_session_${targetId}`));
+      expect(btnArchiveTarget !== null).assertTrue();
+      if (btnArchiveTarget) {
+        await btnArchiveTarget.click();
+        await driver.delayMs(1500);
+      }
+
+      // 验证在全部 Tab 中，已归档目标已被隐藏
+      const archivedGoneInAll = await driver.findComponent(ON.id(`btn_archive_session_${targetId}`));
+      expect(archivedGoneInAll === null).assertTrue();
 
       // 切换到已归档 Tab
       const tabArchived = await driver.findComponent(ON.id('tab_session_archived'));
@@ -395,32 +424,260 @@ export default function chatApprovalUiTest() {
         await driver.delayMs(2000);
       }
 
-      // 验证归档列表中呈现“恢复”按钮
-      const unarchiveBtn = await driver.findComponent(ON.text('恢复'));
-      expect(unarchiveBtn !== null).assertTrue();
-      if (unarchiveBtn) {
-        await unarchiveBtn.click();
-        await driver.delayMs(1500);
-      }
+      // 验证已归档 Tab 中目标项呈现“恢复”
+      const unarchiveTargetBtn = await driver.findComponent(ON.id(`btn_archive_session_${targetId}`));
+      expect(unarchiveTargetBtn !== null).assertTrue();
+      const archiveBtnText = await unarchiveTargetBtn.getText();
+      expect(archiveBtnText === '恢复').assertTrue();
 
-      // 切回全部 Tab 并验证已恢复项存在
+      // 点击恢复 (解归档)
+      await unarchiveTargetBtn.click();
+      await driver.delayMs(1500);
+
+      // 验证已归档 Tab 中目标项已移除
+      const unarchiveGoneInArchived = await driver.findComponent(ON.id(`btn_archive_session_${targetId}`));
+      expect(unarchiveGoneInArchived === null).assertTrue();
+
+      // 切回全部 Tab 并验证已恢复项重现
       if (tabAll) {
         await tabAll.click();
         await driver.delayMs(1000);
       }
-      const restoredArchiveBtn = await driver.findComponent(ON.text('归档'));
-      expect(restoredArchiveBtn !== null).assertTrue();
+      const restoredTargetBtn = await driver.findComponent(ON.id(`btn_archive_session_${targetId}`));
+      expect(restoredTargetBtn !== null).assertTrue();
 
-      // 7. 关闭会话管理抽屉
-      hilog.info(DOMAIN, TAG, 'Step SM6: Closing session list drawer...');
-      const btnClose = await driver.findComponent(ON.id('btn_close_sessions'));
+      // 7. 测试分支克隆与导出
+      hilog.info(DOMAIN, TAG, 'Step SM6: Testing duplicate and export on targetId %{public}s...', targetId);
+      const btnDuplicateTarget = await driver.findComponent(ON.id(`btn_duplicate_session_${targetId}`));
+      expect(btnDuplicateTarget !== null).assertTrue();
+      if (btnDuplicateTarget) {
+        await btnDuplicateTarget.click();
+        await driver.delayMs(1200);
+      }
+
+      const btnExportTarget = await driver.findComponent(ON.id(`btn_export_session_${targetId}`));
+      expect(btnExportTarget !== null).assertTrue();
+      if (btnExportTarget) {
+        await btnExportTarget.click();
+        await driver.delayMs(1500);
+        // 系统分享面板弹出，先按返回键关闭系统分享面板，恢复会话管理抽屉
+        await driver.pressBack();
+        await driver.delayMs(1000);
+      }
+
+      // 8. 清空搜索框恢复全量会话列表并断言
+      hilog.info(DOMAIN, TAG, 'Step SM7: Clearing search input and verifying full session restoration...');
+      const btnClearFinal = await driver.findComponent(ON.id('btn_clear_session_search'));
+      expect(btnClearFinal !== null).assertTrue();
+      if (btnClearFinal) {
+        await btnClearFinal.click();
+        await driver.delayMs(1000);
+      }
+      const allRestoredSessions = await driver.findComponents(ON.text('ID: ', MatchPattern.CONTAINS));
+      hilog.info(DOMAIN, TAG, 'Found restored session count: %{public}d', allRestoredSessions ? allRestoredSessions.length : 0);
+      expect(allRestoredSessions !== null && allRestoredSessions.length >= 1).assertTrue();
+
+      // 9. 关闭会话管理抽屉
+      hilog.info(DOMAIN, TAG, 'Step SM8: Closing session list drawer...');
+      let btnClose = await driver.findComponent(ON.id('btn_close_sessions'));
+      if (!btnClose) {
+        await driver.pressBack();
+        await driver.delayMs(1000);
+        btnClose = await driver.findComponent(ON.id('btn_close_sessions'));
+      }
       expect(btnClose !== null).assertTrue();
       if (btnClose) {
         await btnClose.click();
         await driver.delayMs(1000);
       }
 
-      hilog.info(DOMAIN, TAG, 'Step SM PASS: Session management UI flow fully verified on device!');
+      hilog.info(DOMAIN, TAG, 'Step SM PASS: Exact row session management UI flow fully verified on device!');
+    });
+
+    it('testCronManagementUserFlow', 0, async () => {
+      hilog.info(DOMAIN, TAG, 'Beginning testCronManagementUserFlow (F08)...');
+      const driver = Driver.create();
+      await driver.delayMs(1500);
+
+      // 1. 打开功能弹窗
+      hilog.info(DOMAIN, TAG, 'Step CRON1: Locating and opening tools dialog...');
+      const btnTools = await driver.findComponent(ON.id('btn_tools_dialog'));
+      expect(btnTools !== null).assertTrue();
+      if (btnTools) {
+        await btnTools.click();
+        await driver.delayMs(1500);
+      }
+
+      // 2. 切换至任务 (Cron) 选项卡 (Tab 0)
+      hilog.info(DOMAIN, TAG, 'Step CRON2: Selecting cron tab...');
+      const tabCron = await driver.findComponent(ON.id('tab_tools_cron'));
+      expect(tabCron !== null).assertTrue();
+      if (tabCron) {
+        await tabCron.click();
+        await driver.delayMs(1500);
+      }
+
+      // 3. 点击“+ 新建”打开新建 Cron 对话框
+      hilog.info(DOMAIN, TAG, 'Step CRON3: Clicking btn_new_cron_job...');
+      const btnNewCron = await driver.findComponent(ON.id('btn_new_cron_job'));
+      expect(btnNewCron !== null).assertTrue();
+      if (btnNewCron) {
+        await btnNewCron.click();
+        await driver.delayMs(1000);
+      }
+
+      // 4. 输入任务名称、表达式和提示词
+      hilog.info(DOMAIN, TAG, 'Step CRON4: Filling cron creation inputs...');
+      const cronTestName = `巡检任务_${Date.now().toString(36)}`;
+      const inputName = await driver.findComponent(ON.id('input_cron_name'));
+      expect(inputName !== null).assertTrue();
+      if (inputName) {
+        await inputName.inputText(cronTestName);
+        await driver.delayMs(500);
+      }
+
+      const inputSchedule = await driver.findComponent(ON.id('input_cron_schedule'));
+      expect(inputSchedule !== null).assertTrue();
+      if (inputSchedule) {
+        await inputSchedule.inputText('0 3 * * *');
+        await driver.delayMs(500);
+      }
+
+      const inputPrompt = await driver.findComponent(ON.id('input_cron_prompt'));
+      expect(inputPrompt !== null).assertTrue();
+      if (inputPrompt) {
+        await inputPrompt.inputText('echo "cron e2e check"');
+        await driver.delayMs(500);
+      }
+
+      // 5. 点击“创建”保存任务
+      hilog.info(DOMAIN, TAG, 'Step CRON5: Submitting cron job creation...');
+      const btnConfirmCreate = await driver.findComponent(ON.id('btn_confirm_create_cron'));
+      expect(btnConfirmCreate !== null).assertTrue();
+      if (btnConfirmCreate) {
+        await btnConfirmCreate.click();
+        await driver.delayMs(2000);
+      }
+
+      // 6. 验证新任务在列表中呈现并锁定其唯一 targetJobId (通过只读服务回读与原生UI双重锁定)
+      hilog.info(DOMAIN, TAG, 'Step CRON6: Verifying created cron job on UI and locking targetJobId...');
+      await driver.delayMs(1500);
+
+      // 通过只读后端服务回读核验锁定该唯一名称对应的真实 ID (RESUME_RUN20: 独立只读服务核验锁job)
+      const loginRes = await HermesRESTClient.login('http://127.0.0.1:9199', 'hermex', 'hermex-local');
+      const serverJobs = await HermesCronClient.listCronJobs('http://127.0.0.1:9199', 'default', loginRes.token, loginRes.cookies);
+      const targetJob = serverJobs.find((j: CronJobItem) => j.name === cronTestName);
+      expect(targetJob !== undefined && targetJob !== null).assertTrue();
+      const targetJobId = targetJob!.id;
+      hilog.info(DOMAIN, TAG, 'Locked exact target cron job ID from server readback: %{public}s', targetJobId);
+
+      // 验证原生 UI 上该任务的稳定组件与排期文本均完整呈现
+      const cronList = await driver.findComponent(ON.id('list_cron_jobs'));
+      let createdJobText = await driver.findComponent(ON.text(cronTestName));
+      if (!createdJobText && cronList) {
+        createdJobText = await cronList.scrollSearch(ON.text(cronTestName));
+      }
+      expect(createdJobText !== null).assertTrue();
+
+      const jobNameComp = await driver.findComponent(ON.id(`txt_cron_name_${targetJobId}`));
+      expect(jobNameComp !== null).assertTrue();
+      const jobScheduleComp = await driver.findComponent(ON.id(`txt_cron_schedule_${targetJobId}`));
+      expect(jobScheduleComp !== null).assertTrue();
+
+      // 7. 测试精准触发执行指定任务 (强断言 targetJobId 运行按钮)
+      hilog.info(DOMAIN, TAG, 'Step CRON7: Triggering exact cron job %{public}s...', targetJobId);
+      const btnTriggerTarget = await driver.findComponent(ON.id(`btn_trigger_cron_${targetJobId}`));
+      expect(btnTriggerTarget !== null).assertTrue();
+      if (btnTriggerTarget) {
+        await btnTriggerTarget.click();
+        await driver.delayMs(2500);
+      }
+
+      // 8. 测试精准编辑任务并保存与回读
+      hilog.info(DOMAIN, TAG, 'Step CRON8: Editing exact cron job %{public}s...', targetJobId);
+      const btnEditTarget = await driver.findComponent(ON.id(`btn_edit_cron_${targetJobId}`));
+      expect(btnEditTarget !== null).assertTrue();
+      if (btnEditTarget) {
+        await btnEditTarget.click();
+        await driver.delayMs(1000);
+      }
+      const updatedCronName = `巡检_${Date.now().toString(36)}`;
+      const inputEditName = await driver.findComponent(ON.id('input_edit_cron_name'));
+      expect(inputEditName !== null).assertTrue();
+      if (inputEditName) {
+        await inputEditName.inputText(updatedCronName);
+        await driver.delayMs(500);
+      }
+      const btnConfirmEdit = await driver.findComponent(ON.id('btn_confirm_edit_cron'));
+      expect(btnConfirmEdit !== null).assertTrue();
+      if (btnConfirmEdit) {
+        await btnConfirmEdit.click();
+        await driver.delayMs(1500);
+      }
+      // 验证编辑后名称已在界面呈现
+      let editedComp = await driver.findComponent(ON.text(updatedCronName));
+      if (!editedComp && cronList) {
+        editedComp = await cronList.scrollSearch(ON.text(updatedCronName));
+      }
+      expect(editedComp !== null).assertTrue();
+
+      // 服务端只读回读确认编辑成功已生效
+      const updatedServerJobs = await HermesCronClient.listCronJobs('http://127.0.0.1:9199', 'default', loginRes.token, loginRes.cookies);
+      const updatedJobOnServer = updatedServerJobs.find((j: CronJobItem) => j.id === targetJobId);
+      expect(updatedJobOnServer !== undefined && updatedJobOnServer!.name === updatedCronName).assertTrue();
+
+      // 9. 测试任务历史弹窗
+      hilog.info(DOMAIN, TAG, 'Step CRON9: Opening cron run history for %{public}s...', targetJobId);
+      const btnHistoryTarget = await driver.findComponent(ON.id(`btn_history_cron_${targetJobId}`));
+      expect(btnHistoryTarget !== null).assertTrue();
+      if (btnHistoryTarget) {
+        await btnHistoryTarget.click();
+        await driver.delayMs(1500);
+
+        const dialogHistory = await driver.findComponent(ON.id('dialog_cron_history'));
+        expect(dialogHistory !== null).assertTrue();
+
+        // 强断言：历史记录必须非空且包含本任务的 run ID 或终态 (RESUME_RUN20: 历史必须非空且对应实际run ID/终态)
+        const runItemComp = await driver.findComponent(ON.text(targetJobId, MatchPattern.CONTAINS));
+        expect(runItemComp !== null).assertTrue();
+
+        const btnCloseHistory = await driver.findComponent(ON.id('btn_close_cron_history'));
+        expect(btnCloseHistory !== null).assertTrue();
+        if (btnCloseHistory) {
+          await btnCloseHistory.click();
+          await driver.delayMs(1000);
+        }
+      }
+
+      // 10. 暂停测试任务避免后续自动运行 (强断言 targetJobId 暂停按钮，严禁删除任务)
+      hilog.info(DOMAIN, TAG, 'Step CRON10: Pausing exact cron job %{public}s...', targetJobId);
+      let btnToggleTarget = await driver.findComponent(ON.id(`btn_toggle_cron_${targetJobId}`));
+      if (!btnToggleTarget && cronList) {
+        btnToggleTarget = await cronList.scrollSearch(ON.id(`btn_toggle_cron_${targetJobId}`));
+      }
+      expect(btnToggleTarget !== null).assertTrue();
+      if (btnToggleTarget) {
+        const toggleText = await btnToggleTarget.getText();
+        if (toggleText === '暂停') {
+          await btnToggleTarget.click();
+          await driver.delayMs(1500);
+        }
+      }
+      // 服务端只读核验暂停生效
+      const pausedServerJobs = await HermesCronClient.listCronJobs('http://127.0.0.1:9199', 'default', loginRes.token, loginRes.cookies);
+      const pausedJobOnServer = pausedServerJobs.find((j: CronJobItem) => j.id === targetJobId);
+      expect(pausedJobOnServer !== undefined && pausedJobOnServer!.enabled === false).assertTrue();
+
+      // 11. 关闭功能弹窗
+      hilog.info(DOMAIN, TAG, 'Step CRON11: Closing tools dialog...');
+      const btnCloseTools = await driver.findComponent(ON.id('btn_close_tools_dialog'));
+      expect(btnCloseTools !== null).assertTrue();
+      if (btnCloseTools) {
+        await btnCloseTools.click();
+        await driver.delayMs(1000);
+      }
+
+      hilog.info(DOMAIN, TAG, 'Step CRON PASS: Cron management UI flow fully verified on device!');
     });
   });
 }

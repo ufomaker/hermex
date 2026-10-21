@@ -71,6 +71,7 @@ export class SessionStreamState {
     if (this.identities.has(id)) {
       this.identities.delete(id);
       this.total = Math.max(0, this.total - 1);
+      this.nextOffset = Math.max(0, this.nextOffset - 1);
     }
     const nextList: HermesSession[] = [];
     for (let i = 0; i < this.sessions.length; i++) {
@@ -405,6 +406,8 @@ export class SessionListViewModel {
       return false;
     }
 
+    const thisSerial = this.requestSerial;
+
     try {
       const payload: SessionUpdatePayload = { title: trimmed };
       await HermesRESTClient.updateSession(
@@ -416,7 +419,7 @@ export class SessionListViewModel {
         conn.cookies
       );
 
-      if (!this.isMatchingOwner(conn)) {
+      if (thisSerial !== this.requestSerial || !this.isMatchingOwner(conn)) {
         return false;
       }
 
@@ -456,6 +459,7 @@ export class SessionListViewModel {
       return false;
     }
 
+    const thisSerial = this.requestSerial;
     const targetState = !session.is_pinned;
     try {
       const payload: SessionUpdatePayload = { pinned: targetState };
@@ -468,7 +472,7 @@ export class SessionListViewModel {
         conn.cookies
       );
 
-      if (!this.isMatchingOwner(conn)) {
+      if (thisSerial !== this.requestSerial || !this.isMatchingOwner(conn)) {
         return false;
       }
 
@@ -508,6 +512,7 @@ export class SessionListViewModel {
       return false;
     }
 
+    const thisSerial = this.requestSerial;
     const targetState = !session.is_archived;
     try {
       const payload: SessionUpdatePayload = { archived: targetState };
@@ -520,7 +525,7 @@ export class SessionListViewModel {
         conn.cookies
       );
 
-      if (!this.isMatchingOwner(conn)) {
+      if (thisSerial !== this.requestSerial || !this.isMatchingOwner(conn)) {
         return false;
       }
 
@@ -553,6 +558,7 @@ export class SessionListViewModel {
     if (!this.isMatchingOwner(conn)) {
       throw new Error('连接状态已变更');
     }
+    const thisSerial = this.requestSerial;
     const newSession = await HermesRESTClient.duplicateSession(
       conn.url,
       session.id,
@@ -562,7 +568,7 @@ export class SessionListViewModel {
       conn.cookies
     );
 
-    if (this.isMatchingOwner(conn)) {
+    if (thisSerial === this.requestSerial && this.isMatchingOwner(conn)) {
       this.activeStream.add(newSession);
       this.applyFilterAndSearch();
     }
@@ -579,13 +585,18 @@ export class SessionListViewModel {
     if (!this.isMatchingOwner(conn)) {
       throw new Error('连接状态已变更');
     }
-    return await HermesRESTClient.exportSession(
+    const thisSerial = this.requestSerial;
+    const result = await HermesRESTClient.exportSession(
       conn.url,
       session.id,
       session.profile || this.currentProfile,
       conn.token,
       conn.cookies
     );
+    if (thisSerial !== this.requestSerial || !this.isMatchingOwner(conn)) {
+      throw new Error('连接状态已变更');
+    }
+    return result;
   }
 
   /**

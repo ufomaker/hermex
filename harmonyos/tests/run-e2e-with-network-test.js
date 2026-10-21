@@ -233,7 +233,7 @@ hilogProc.stdout.on('data', (data) => {
 
 // 5. 执行真实设备 aa test 命令
 console.log('[COORDINATOR] Launching aa test on device...');
-const testCmd = 'aa test -b com.uzairansaruzi.hermex.harmony -m entry_test -s unittest OpenHarmonyTestRunner -s timeout 120000';
+const testCmd = 'aa test -b com.uzairansaruzi.hermex.harmony -m entry_test -s unittest OpenHarmonyTestRunner -s timeout 180000';
 testProc = spawn(HDC, ['-t', TARGET, 'shell', testCmd]);
 
 let testOutput = '';
@@ -271,7 +271,7 @@ testProc.on('close', (code) => {
     ];
     const missingStages = expectedStages.filter(s => !capturedStages.has(s));
 
-    if (failures === 0 && errors === 0 && passed >= 3 && total >= 3 && hasDisconnected && hasReconnected && missingStages.length === 0) {
+    if (failures === 0 && errors === 0 && passed >= 4 && total >= 4 && hasDisconnected && hasReconnected && missingStages.length === 0) {
       console.log('✅ ALL TEST SCENARIOS PASSED WITH ZERO FAILURES, ZERO ERRORS, ALL PHASES AND VERIFIED ARTIFACTS!');
       process.exit(0);
     } else {

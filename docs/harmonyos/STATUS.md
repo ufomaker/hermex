@@ -1,31 +1,30 @@
 # Hermex HarmonyOS 移植状态追踪
 
-- 状态：**阶段七（Run 18 完善）F02 会话管理真实契约对齐、切服双向隔离与官方模拟器 4/4 UiTest 无条件断言全绿通过 (Stage 7 Full F02 Real Contract Parity, Multi-Stream Isolation & Strict UiTest Verified)**
-- 当前阶段：Run 18 工作块已全部落实：
-  1. **HermesRESTClient.searchSessions 严格契约修复 (对齐 upstream HermesREST.swift:490)**：
-     - 查询参数由 `query` 修正为 `q`，并严格将 `+` 编码转义为 `%2B`；
-     - 显式携带 `exclude_sources=cron,kanban,oneshot,subagent,tool`；
-     - 空搜索词直接返回 `[]`，杜绝多余无效请求；过滤群聊房间会话。
-  2. **listSessionsPage 归档流契约与服务端回填过滤 (对齐 upstream HermesREST.swift:448, HermesSessionPage.swift:204-206)**：
-     - `archived` 参数由布尔字符串修正为 `'only'` 或 `'exclude'`，携带 `order=recent` 与 `exclude_sources`，活跃流携带 `min_messages=1`；
-     - `SessionStreamState.appendPage` 增加 `Boolean(s.is_archived) === isArchivedTarget` 严格状态门禁，主动过滤服务端向归档流回填的未归档置顶项。
-  3. **SessionListViewModel 架构重构与多流隔离**：
-     - 划分独立的 `activeStream` 与 `archivedStream`，分别维护独立分页游标、总数与已加载标识；
-     - 切换分类 Tab 至 `archived` 时若未加载自动发起服务端异步拉取；
-     - 归档/解归档在两个流之间执行无损双向转移；
-     - 切换服务器或 Profile 时立即物理清空旧流与展示列表，杜绝脏数据残留；
-     - Legacy WebUI 严格拒绝改名、置顶、归档、克隆与导出，绝不在内存中伪造变更。
-  4. **UiTest 移除宽容守卫与全流程真机断言**：
-     - `ChatApprovalUi.test.ets` 中彻底移除 `if (buttons.length > 0)` 宽容守卫；
-     - 无条件断言按钮存在，完整走通搜索 "python3" 匹配、改名弹窗输入保存、置顶与置顶Tab筛选、归档与归档Tab筛选、解归档恢复与全部Tab回显闭环。
-  5. **测试与编译全线通过**：
+- 状态：**阶段八（Run 20 完善）F02 会话精准锁定与系统分享安全关闭、F08 Cron 任务管理全生命周期响应式重构与官方模拟器 5/5 UiTest 全绿通过 (Stage 8 Full F02 & F08 Complete Lifecycle, Reactive VM Notification & Strict UiTest Verified)**
+- 当前阶段：Run 19/20 工作块已全部落实：
+  1. **F02 会话精准锁定与系统分享后置返回处理**：
+     - 在导出点击 `btn_export_session_${targetId}` 唤起系统分享面板后，通过 `driver.pressBack()` 安全退出系统分享层，无缝返回会话列表原生视窗；
+     - 搜索清空、会话重命名、置顶/取消置顶无损往返、归档/取消归档双向流转、分支克隆与导出完整无条件断言通过。
+  2. **F08 Cron 调度架构与响应式刷新机制重构**：
+     - 在 `CronViewModel.ets` 中引入 `CronViewModelListener` 与 `notify()` 通知机制，在 `loadJobs`、`createJob`、`updateJob`、`triggerJob`、`toggleJob`、`loadRuns` 全生命周期关键节点精准触发；
+     - `Index.ets` 声明 `@State cronJobs` 等状态，并在 `aboutToAppear` 中接入监听器，将 VM 数据变更直接响应式发布至原生 ArkUI `ForEach`；
+     - 任务列表默认按 `createdAt` 倒序排列，最新创建或编辑项置顶呈现，彻底解决列表固定高度虚拟化导致的新项脱离视口不可达问题；
+     - 恢复普通用户 UI 纯净标题，移除了 `[ID:...]` 技术性视觉字段；通过独立只读服务回读（`HermesCronClient.listCronJobs`）与行内原生组件 ID 双重强断言锁定 `targetJobId`。
+  3. **F08 上游真实契约与容错保障 (对齐 HermesREST.swift:500-516 & HermesCronClient.swift:32-49)**：
+     - HTTP 424 警告语义支持（任务已持久化但调度注册失败，保留 warning 并正常拉取更新）；
+     - 空字段（name、schedule、prompt）严格前端与 VM 拦截拒绝；
+     - 409 运行冲突详情捕获与友好提示，手动触发超时扩展至 30s 且未知状态不盲目重试；
+     - 新建测试任务固定使用 `model: 'hermex-stub'`，测试末尾通过 UI 精确暂停本轮任务，严格遵循非删除破坏性安全红线；
+     - 任务执行历史实机核验非空，强断言包含真实 `targetJobId` 与 `cron_complete` 终态。
+  4. **测试与编译全线通过**：
      - DevEco `assembleHap`（entry 与 entry@ohosTest）双 HAP 编译成功 (退出码 0)；
-     - Node 回归测试 `protocol-suite.js` 扩展至 33 项全部通过 (退出码 0)；
-     - 官方模拟器（`127.0.0.1:5555`）执行 `run-e2e-with-network-test.js` 4 项测试全部通过 (0 Failures, 0 Errors, 6 阶段有效产物完整捕获并镜像至 Brain 目录)。
-- 更新时间：2026-10-21 06:48
+     - Node 回归测试 `protocol-suite.js` 扩展至 34 项全部通过 (退出码 0)；
+     - 官方模拟器（`127.0.0.1:5555`）执行定向 `testCronManagementUserFlow` 通过 (1/1, 退出码 0)；
+     - 官方模拟器执行 `run-e2e-with-network-test.js` 全量 5 项测试全部通过 (Tests run: 5, Failure: 0, Error: 0, Pass: 5, 退出码 0，6 阶段有效产物完整捕获)。
+- 更新时间：2026-10-21 08:22
 - 当前分支：`harmonyos/native-port`
 - 实施者：AntiGravity
-- 监督审查参考：`REVIEW_F02_18.md`, `RESUME_RUN18.md`
+- 监督审查参考：`RESUME_RUN20.md`, `REVIEW_CRON19.md`, `REVIEW_SHARE_TEST19.md`
 
 ## 监督意见落实与本次核心重构详单
 
@@ -50,10 +49,10 @@
    - `DeepLinkUtils.ets` 优化冷/热启动派发状态机；
    - `Index.ets` 观察 `appScenePhase` 并在回到前台时自动尝试恢复未就绪的连接与会话。
 
-5. **全生命周期测试集扩展 (30 项全通过)**：
-   - `protocol-suite.js` 扩展至 30 项测试，全量通过（退出码 0）：
-     - TEST 29: 真实测试 `LegacySSEClient` 完整聊天轮次、GET 取消、跨块分包中文解码与 401 错误拦截；
-     - TEST 30: 真实测试 `DeepLinkUtils` 冷/热启动派发、`ShareUtils` 文本/文件系统分享与 Want 解析、`VoiceUtils` 真实权限/录音落盘/AVPlayer 播放状态机。
+5. **全生命周期测试集扩展 (34 项全通过)**：
+   - `protocol-suite.js` 扩展至 34 项测试，全量通过（退出码 0）：
+     - TEST 33: SessionListViewModel & HermesRESTClient F02 会话管理全生命周期（分页、即时检索、置顶前置、归档隔离流、改名、分支克隆、导出与切服物理擦除）；
+     - TEST 34: HermesCronClient & CronViewModel F08 任务管理全生命周期（列表加载、必填校验、424 调度警告语义、PUT编辑契约、/trigger 手动触发、409 运行冲突捕获、暂停/恢复、执行历史与切服代次隔离）。
 
 6. **真实命令与退出码记录**：
 
