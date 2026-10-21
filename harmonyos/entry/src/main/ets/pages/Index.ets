@@ -13,6 +13,7 @@ import { ModelOption } from '../model/Approval';
 import { ModelCatalogGroup, ModelCatalogOption, REASONING_EFFORT_LEVELS } from '../model/ModelCatalog';
 import { WorkspaceFileEntry } from '../network/HermesWorkspaceClient';
 import { HermesFileClient } from '../network/HermesFileClient';
+import { HermesRESTClient } from '../network/HermesRESTClient';
 import { CronJobItem, CronRunItem } from '../network/HermesCronClient';
 import { SkillSummary } from '../network/HermesSkillsClient';
 import { ModelUsageItem } from '../network/HermesInsightsClient';
@@ -115,6 +116,9 @@ struct Index {
   @State availableModelGroups: ModelCatalogGroup[] = [];
   @State serverProfiles: string[] = ['default'];
   @State activeProfile: string = 'default';
+  @State showCreateProfileForm: boolean = false;
+  @State newProfileNameInput: string = '';
+  @State newProfileDescInput: string = '';
   @State messages: ChatMessage[] = [];
   @State sessions: HermesSession[] = [];
   @State availableModels: ModelOption[] = [];
@@ -595,6 +599,64 @@ struct Index {
     } catch (e) {
       // ignore
     }
+  }
+
+  private async refreshServerProfiles() {
+    const cur = this.connVm.getCurrentConnection();
+    if (!cur) {
+      return;
+    }
+    try {
+      const gw = this.chatVm.getGateway();
+      let profiles: string[] = [];
+      if (gw && gw.isGatewayConnected()) {
+        profiles = await gw.listProfiles();
+      }
+      if (profiles.length === 0) {
+        profiles = await HermesRESTClient.listProfiles(cur.url, cur.token, cur.cookies);
+      }
+      if (profiles && profiles.length > 0) {
+        const set = new Set<string>(profiles);
+        if (this.activeProfile) {
+          set.add(this.activeProfile);
+        }
+        this.serverProfiles = Array.from(set);
+      }
+    } catch (_e) {
+      // ignore
+    }
+  }
+
+  private async switchProfile(prof: string) {
+    if (this.activeProfile === prof) {
+      return;
+    }
+    hilog.info(DOMAIN, TAG, 'switchProfile: switching to profile %{public}s', prof);
+    this.activeProfile = prof;
+    const cur = this.connVm.getCurrentConnection();
+    if (cur) {
+      cur.activeProfile = prof;
+      await AuthStore.getInstance().saveConnection(cur);
+    }
+    // 严格状态隔离：重置当前会话与标题、清空工作区浏览状态与详情
+    this.currentSessionId = '';
+    this.currentSessionTitle = '新对话';
+    this.workspaceEntries = [];
+    this.workspacePath = '/';
+    this.viewingFileText = '';
+
+    // 通知 ChatViewModel 执行代次升级与状态重置
+    this.chatVm.switchProfile(prof);
+
+    // 重新拉取新 Profile 范围下的会话、定时任务、技能与记忆
+    await this.refreshSessions();
+    if (cur) {
+      await this.cronVm.loadJobs(cur);
+      await this.skillsVm.loadSkillsAndMemory(cur);
+      this.editingSoulText = this.skillsVm.soulText;
+      this.toolsStatusText = this.skillsVm.statusMessage;
+    }
+    this.showToast(`已切换至 Profile: ${prof}`);
   }
 
   private async onSessionSearchChanged(q: string) {
@@ -1165,8 +1227,10 @@ struct Index {
           .backgroundColor('#F2F2F7')
           .fontColor('#007AFF')
           .margin({ right: 4 })
-          .onClick(() => {
+          .onClick(async () => {
             this.showModelDialog = true;
+            await this.refreshServerProfiles();
+            await this.chatVm.refreshReasoningEffortGating();
           })
 
         Button('会话')
@@ -1986,33 +2050,125 @@ struct Index {
           .margin({ bottom: 8 })
 
           // Profile 切换
-          Row() {
-            Text('Profile:')
-              .fontSize(12)
-              .fontWeight(FontWeight.Medium)
-              .margin({ right: 6 })
-            ForEach(this.serverProfiles, (prof: string) => {
-              Button(prof)
-                .id(`btn_profile_select_${prof}`)
+          Column({ space: 4 }) {
+            Row() {
+              Text('Profile:')
+                .fontSize(12)
+                .fontWeight(FontWeight.Medium)
+                .margin({ right: 6 })
+              Blank()
+              Text(this.activeProfile)
+                .id('txt_active_profile_name')
                 .fontSize(11)
+                .fontColor('#007AFF')
+                .fontWeight(FontWeight.Bold)
+            }
+            .width('100%')
+
+            Row() {
+              ForEach(this.serverProfiles, (prof: string) => {
+                Button(prof)
+                  .id(`btn_profile_select_${prof}`)
+                  .fontSize(11)
+                  .height(26)
+                  .padding({ left: 8, right: 8 })
+                  .margin({ right: 4 })
+                  .backgroundColor(this.activeProfile === prof ? '#007AFF' : '#F2F2F7')
+                  .fontColor(this.activeProfile === prof ? '#FFFFFF' : '#374151')
+                  .onClick(async () => {
+                    await this.switchProfile(prof);
+                  })
+              })
+
+              Button('+ 新建')
+                .id('btn_new_profile')
+                .fontSize(10)
                 .height(26)
-                .padding({ left: 8, right: 8 })
-                .margin({ right: 4 })
-                .backgroundColor(this.activeProfile === prof ? '#007AFF' : '#F2F2F7')
-                .fontColor(this.activeProfile === prof ? '#FFFFFF' : '#374151')
-                .onClick(async () => {
-                  if (this.activeProfile !== prof) {
-                    this.activeProfile = prof;
-                    const cur = this.connVm.getCurrentConnection();
-                    if (cur) {
-                      cur.activeProfile = prof;
-                    }
-                    this.chatVm.switchProfile(prof);
-                    await this.refreshSessions();
-                    this.showToast(`已切换至 Profile: ${prof}`);
-                  }
+                .padding({ left: 6, right: 6 })
+                .backgroundColor('#E5E7EB')
+                .fontColor('#4B5563')
+                .onClick(() => {
+                  this.showCreateProfileForm = !this.showCreateProfileForm;
                 })
-            })
+            }
+            .width('100%')
+
+            if (this.showCreateProfileForm) {
+              Column({ space: 6 }) {
+                TextInput({ placeholder: 'Profile 名称 (必填)', text: this.newProfileNameInput })
+                  .id('input_profile_name')
+                  .fontSize(12)
+                  .height(32)
+                  .backgroundColor('#FFFFFF')
+                  .border({ width: 1, color: '#D1D5DB', radius: 4 })
+                  .onChange((val: string) => {
+                    this.newProfileNameInput = val;
+                  })
+
+                TextInput({ placeholder: 'Profile 描述 (可选)', text: this.newProfileDescInput })
+                  .id('input_profile_desc')
+                  .fontSize(12)
+                  .height(32)
+                  .backgroundColor('#FFFFFF')
+                  .border({ width: 1, color: '#D1D5DB', radius: 4 })
+                  .onChange((val: string) => {
+                    this.newProfileDescInput = val;
+                  })
+
+                Row({ space: 8 }) {
+                  Button('提交创建')
+                    .id('btn_submit_create_profile')
+                    .fontSize(11)
+                    .height(28)
+                    .backgroundColor('#007AFF')
+                    .fontColor('#FFFFFF')
+                    .onClick(async () => {
+                      const name = this.newProfileNameInput.trim();
+                      if (!name) {
+                        this.showToast('Profile 名称不能为空');
+                        return;
+                      }
+                      const desc = this.newProfileDescInput.trim();
+                      try {
+                        const gw = this.chatVm.getGateway();
+                        if (gw && gw.isGatewayConnected()) {
+                          await gw.createProfile(name, desc, 'default');
+                        } else {
+                          throw new Error('当前网关未就绪');
+                        }
+                        this.showToast(`Profile ${name} 创建成功`);
+                        this.showCreateProfileForm = false;
+                        this.newProfileNameInput = '';
+                        this.newProfileDescInput = '';
+
+                        // 重新拉取服务目录并自动切换
+                        await this.refreshServerProfiles();
+                        await this.switchProfile(name);
+                      } catch (err) {
+                        this.showToast(`创建 Profile 失败: ${err}`);
+                      }
+                    })
+
+                  Button('取消')
+                    .id('btn_cancel_create_profile')
+                    .fontSize(11)
+                    .height(28)
+                    .backgroundColor('#F3F4F6')
+                    .fontColor('#4B5563')
+                    .onClick(() => {
+                      this.showCreateProfileForm = false;
+                      this.newProfileNameInput = '';
+                      this.newProfileDescInput = '';
+                    })
+                }
+                .width('100%')
+              }
+              .width('100%')
+              .padding(8)
+              .backgroundColor('#F9FAFB')
+              .borderRadius(6)
+              .margin({ top: 4 })
+            }
           }
           .width('100%')
           .margin({ bottom: 8 })
@@ -2024,28 +2180,44 @@ struct Index {
                 .fontSize(12)
                 .fontWeight(FontWeight.Medium)
               Blank()
-              Text(this.currentReasoningEffort)
-                .fontSize(12)
-                .fontColor('#007AFF')
-                .fontWeight(FontWeight.Bold)
+              if (this.chatVm.supportsReasoningEffort) {
+                Text(this.currentReasoningEffort)
+                  .id('txt_current_reasoning_effort')
+                  .fontSize(12)
+                  .fontColor('#007AFF')
+                  .fontWeight(FontWeight.Bold)
+              } else {
+                Text('当前模型不支持')
+                  .id('txt_reasoning_unsupported')
+                  .fontSize(11)
+                  .fontColor('#9CA3AF')
+              }
             }
             .width('100%')
 
-            Row({ space: 4 }) {
-              ForEach(['none', 'low', 'medium', 'high', 'max'], (level: string) => {
-                Button(level)
-                  .id(`btn_effort_${level}`)
-                  .fontSize(11)
-                  .height(24)
-                  .layoutWeight(1)
-                  .backgroundColor(this.currentReasoningEffort === level ? '#34C759' : '#F2F2F7')
-                  .fontColor(this.currentReasoningEffort === level ? '#FFFFFF' : '#374151')
-                  .onClick(async () => {
-                    await this.chatVm.switchReasoningEffort(level);
-                  })
-              })
+            if (this.chatVm.supportsReasoningEffort) {
+              Row({ space: 4 }) {
+                ForEach(this.chatVm.supportedReasoningEfforts, (level: string) => {
+                  Button(level)
+                    .id(`btn_effort_${level}`)
+                    .fontSize(11)
+                    .height(24)
+                    .layoutWeight(1)
+                    .backgroundColor(this.currentReasoningEffort === level ? '#34C759' : '#F2F2F7')
+                    .fontColor(this.currentReasoningEffort === level ? '#FFFFFF' : '#374151')
+                    .onClick(async () => {
+                      this.currentReasoningEffort = level;
+                      await this.chatVm.switchReasoningEffort(level);
+                    })
+                })
+              }
+              .width('100%')
+            } else {
+              Text('当前选定模型/Provider未开放推理强度调节')
+                .fontSize(11)
+                .fontColor('#9CA3AF')
+                .padding({ top: 4, bottom: 4 })
             }
-            .width('100%')
           }
           .width('100%')
           .padding(8)
@@ -2094,7 +2266,7 @@ struct Index {
 
                         Blank()
 
-                        if (m.id === this.currentModel) {
+                        if (m.id === this.currentModel && (!this.currentModelProvider || m.providerId === this.currentModelProvider)) {
                           Text('当前生效')
                             .fontSize(11)
                             .fontColor('#059669')
@@ -2102,12 +2274,14 @@ struct Index {
                         }
 
                         Button('应用')
-                          .id(`btn_apply_model_${m.id}`)
+                          .id(`btn_apply_model_${m.providerId}_${m.id}`)
                           .fontSize(12)
                           .height(28)
-                          .backgroundColor(m.id === this.currentModel ? '#34C759' : '#007AFF')
+                          .backgroundColor((m.id === this.currentModel && (!this.currentModelProvider || m.providerId === this.currentModelProvider)) ? '#34C759' : '#007AFF')
                           .fontColor('#FFFFFF')
                           .onClick(async () => {
+                            this.currentModel = m.id;
+                            this.currentModelProvider = m.providerId;
                             this.showModelDialog = false;
                             await this.chatVm.switchModel(m.id, m.providerId);
                           })
@@ -2121,7 +2295,7 @@ struct Index {
                   .width('100%')
                 }
               })
-            } else {
+            } else if (this.availableModels.length > 0) {
               ForEach(this.availableModels, (m: ModelOption) => {
                 ListItem() {
                   Row() {
@@ -2129,13 +2303,21 @@ struct Index {
                       .fontSize(13)
                       .fontWeight(FontWeight.Medium)
                     Blank()
+                    if (m.id === this.currentModel && (!this.currentModelProvider || (m.provider || 'default') === this.currentModelProvider)) {
+                      Text('当前生效')
+                        .fontSize(11)
+                        .fontColor('#059669')
+                        .margin({ right: 6 })
+                    }
                     Button('应用')
-                      .id(`btn_apply_model_${m.id}`)
+                      .id(`btn_apply_model_${m.provider || 'default'}_${m.id}`)
                       .fontSize(12)
                       .height(28)
-                      .backgroundColor('#007AFF')
+                      .backgroundColor((m.id === this.currentModel && (!this.currentModelProvider || (m.provider || 'default') === this.currentModelProvider)) ? '#34C759' : '#007AFF')
                       .fontColor('#FFFFFF')
                       .onClick(async () => {
+                        this.currentModel = m.id;
+                        this.currentModelProvider = m.provider || 'default';
                         this.showModelDialog = false;
                         await this.chatVm.switchModel(m.id, m.provider);
                       })
@@ -2146,6 +2328,47 @@ struct Index {
                   .borderRadius(6)
                 }
               })
+            } else {
+              ListItem() {
+                Row() {
+                  Column({ space: 2 }) {
+                    Text('hermex-stub')
+                      .fontSize(13)
+                      .fontWeight(FontWeight.Medium)
+                      .fontColor('#1F2937')
+                    Text('default:hermex-stub (本地环境)')
+                      .fontSize(10)
+                      .fontColor('#9CA3AF')
+                  }
+                  .alignItems(HorizontalAlign.Start)
+
+                  Blank()
+
+                  if (this.currentModel === 'hermex-stub' && (!this.currentModelProvider || this.currentModelProvider === 'default')) {
+                    Text('当前生效')
+                      .fontSize(11)
+                      .fontColor('#059669')
+                      .margin({ right: 6 })
+                  }
+
+                  Button('应用')
+                    .id('btn_apply_model_default_hermex-stub')
+                    .fontSize(12)
+                    .height(28)
+                    .backgroundColor((this.currentModel === 'hermex-stub' && (!this.currentModelProvider || this.currentModelProvider === 'default')) ? '#34C759' : '#007AFF')
+                    .fontColor('#FFFFFF')
+                    .onClick(async () => {
+                      this.currentModel = 'hermex-stub';
+                      this.currentModelProvider = 'default';
+                      this.showModelDialog = false;
+                      await this.chatVm.switchModel('hermex-stub', 'default');
+                    })
+                }
+                .width('100%')
+                .padding(8)
+                .backgroundColor('#F9FAFB')
+                .borderRadius(6)
+              }
             }
           }
           .height(240)

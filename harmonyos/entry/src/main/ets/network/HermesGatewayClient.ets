@@ -767,17 +767,61 @@ export class HermesGatewayClient {
    * 获取 Profile 列表：profiles.list (HermesCall.swift:25, 278, 348)
    */
   public async listProfiles(includeSessions: boolean = false): Promise<string[]> {
-    try {
-      const res = await this.call('profiles.list', { 'include_sessions': includeSessions });
-      if (Array.isArray(res)) {
-        return res.map((item: Object) => typeof item === 'string' ? item : String((item as Record<string, Object>)['name'] || ''));
-      }
-      if (Array.isArray(res['profiles'])) {
-        return (res['profiles'] as Array<Object>).map((item: Object) => typeof item === 'string' ? item : String((item as Record<string, Object>)['name'] || ''));
-      }
-      return ['default'];
-    } catch (_e) {
-      return ['default'];
+    const res = await this.call('profiles.list', { 'include_sessions': includeSessions });
+    if (Array.isArray(res)) {
+      return res.map((item: Object) => typeof item === 'string' ? item : String((item as Record<string, Object>)['name'] || '')).filter((n: string) => n.length > 0);
     }
+    if (Array.isArray(res['profiles'])) {
+      return (res['profiles'] as Array<Object>).map((item: Object) => typeof item === 'string' ? item : String((item as Record<string, Object>)['name'] || '')).filter((n: string) => n.length > 0);
+    }
+    return [];
+  }
+
+  /**
+   * 创建 Profile：profiles.create (HermesCall.swift:283, 642-658)
+   */
+  public async createProfile(
+    name: string,
+    description?: string,
+    cloneFrom?: string
+  ): Promise<Record<string, Object>> {
+    const params: Record<string, Object> = {
+      'name': name,
+      'no_alias': true,
+      'clone_channels': false,
+      'mirror_credentials': false
+    };
+    if (description && description.trim().length > 0) {
+      params['description'] = description.trim();
+    }
+    if (cloneFrom && cloneFrom.trim().length > 0) {
+      params['clone_from'] = cloneFrom.trim();
+    }
+    return await this.call('profiles.create', params);
+  }
+
+  /**
+   * 配置 Profile：profiles.configure (HermesCall.swift:282, 613-640)
+   */
+  public async configureProfile(
+    name: string,
+    description?: string,
+    soul?: string
+  ): Promise<Record<string, Object>> {
+    const params: Record<string, Object> = { 'name': name };
+    if (description !== undefined) {
+      params['description'] = description;
+    }
+    if (soul !== undefined) {
+      params['soul'] = soul;
+    }
+    return await this.call('profiles.configure', params);
+  }
+
+  /**
+   * 查询 Profile 描述：profiles.describe (HermesCall.swift:279, methods_profiles.py:450)
+   */
+  public async describeProfile(name: string): Promise<Record<string, Object>> {
+    return await this.call('profiles.describe', { 'name': name });
   }
 }

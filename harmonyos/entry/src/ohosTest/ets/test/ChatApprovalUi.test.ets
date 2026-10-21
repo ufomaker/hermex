@@ -687,62 +687,111 @@ export default function chatApprovalUiTest() {
 
       // 1. 点击主界面的模型按钮打开模型与推理配置弹窗
       hilog.info(DOMAIN, TAG, 'Step MODEL1: Locating btn_model_picker...');
-      let btnModel = await driver.findComponent(ON.id('btn_model_picker'));
+      const btnModel = await driver.findComponent(ON.id('btn_model_picker'));
       expect(btnModel !== null).assertTrue();
-      if (btnModel) {
-        await btnModel.click();
-        await driver.delayMs(1000);
-      }
+      await btnModel.click();
+      await driver.delayMs(1200);
 
       // 2. 校验弹窗已打开并显示配置标题与关闭按钮
       hilog.info(DOMAIN, TAG, 'Step MODEL2: Verifying model dialog content...');
       const btnCloseModel = await driver.findComponent(ON.id('btn_close_model_dialog'));
       expect(btnCloseModel !== null).assertTrue();
 
-      // 3. 校验并切换推理参数 (Reasoning Effort)
-      hilog.info(DOMAIN, TAG, 'Step MODEL3: Testing reasoning effort selection...');
-      const btnEffortLow = await driver.findComponent(ON.id('btn_effort_low'));
-      if (btnEffortLow) {
-        await btnEffortLow.click();
-        await driver.delayMs(800);
-      }
+      // 3. 校验推理参数状态约束 (在 9199 hermex-stub 下返回 404，UI 显式展示当前模型不支持)
+      hilog.info(DOMAIN, TAG, 'Step MODEL3: Testing reasoning effort gating...');
+      const txtReasoningUnsupported = await driver.findComponent(ON.id('txt_reasoning_unsupported'));
+      const txtReasoningEffort = await driver.findComponent(ON.id('txt_current_reasoning_effort'));
+      expect(txtReasoningUnsupported !== null || txtReasoningEffort !== null).assertTrue();
 
-      const btnEffortMedium = await driver.findComponent(ON.id('btn_effort_medium'));
-      if (btnEffortMedium) {
-        await btnEffortMedium.click();
-        await driver.delayMs(800);
-      }
-
-      // 4. 应用模型 (在隔离 9199 服务端下为 hermex-stub 或活跃模型)
+      // 4. 应用模型 (联合身份: provider + modelId)
       hilog.info(DOMAIN, TAG, 'Step MODEL4: Applying model in dialog...');
-      let btnApplyModel = await driver.findComponent(ON.id('btn_apply_model_hermex-stub'));
-      if (btnApplyModel) {
-        await btnApplyModel.click();
-        await driver.delayMs(1000);
-      } else {
-        const anyApply = await driver.findComponent(ON.text('应用'));
-        if (anyApply) {
-          await anyApply.click();
-          await driver.delayMs(1000);
-        }
+      let btnApplyModel = await driver.findComponent(ON.id('btn_apply_model_custom_hermex-stub'));
+      if (!btnApplyModel) {
+        btnApplyModel = await driver.findComponent(ON.id('btn_apply_model_default_hermex-stub'));
       }
+      if (!btnApplyModel) {
+        btnApplyModel = await driver.findComponent(ON.id('btn_apply_model_hermex-stub'));
+      }
+      if (!btnApplyModel) {
+        btnApplyModel = await driver.findComponent(ON.text('应用'));
+      }
+      expect(btnApplyModel !== null).assertTrue();
+      await btnApplyModel.click();
+      await driver.delayMs(1200);
 
-      // 5. 重新打开并核验 Profile 选项卡及关闭
-      hilog.info(DOMAIN, TAG, 'Step MODEL5: Reopening model dialog to verify profile pills...');
-      btnModel = await driver.findComponent(ON.id('btn_model_picker'));
-      if (btnModel) {
-        await btnModel.click();
-        await driver.delayMs(1000);
-      }
+      // 校验应用后弹窗自动关闭
+      const closedCheck = await driver.findComponent(ON.id('btn_close_model_dialog'));
+      expect(closedCheck === null).assertTrue();
+
+      // 5. 重新打开并核验 Profile 原生创建、服务生效及双向隔离往返
+      hilog.info(DOMAIN, TAG, 'Step MODEL5: Reopening model dialog to verify native profile management...');
+      const btnModelReopen = await driver.findComponent(ON.id('btn_model_picker'));
+      expect(btnModelReopen !== null).assertTrue();
+      await btnModelReopen.click();
+      await driver.delayMs(1000);
 
       const profileDefault = await driver.findComponent(ON.id('btn_profile_select_default'));
       expect(profileDefault !== null).assertTrue();
 
-      const btnCloseFinal = await driver.findComponent(ON.id('btn_close_model_dialog'));
-      if (btnCloseFinal) {
-        await btnCloseFinal.click();
-        await driver.delayMs(800);
+      // 查找通用新建 Profile 按钮 (非硬编码测试按钮)
+      const btnNewProfile = await driver.findComponent(ON.id('btn_new_profile'));
+      expect(btnNewProfile !== null).assertTrue();
+
+      // 如果 test_prof_native 尚未创建，通过原生表单真实创建并服务生效
+      let btnTestProf = await driver.findComponent(ON.id('btn_profile_select_test_prof_native'));
+      if (!btnTestProf) {
+        await btnNewProfile.click();
+        await driver.delayMs(600);
+        const inputName = await driver.findComponent(ON.id('input_profile_name'));
+        expect(inputName !== null).assertTrue();
+        await inputName.inputText('test_prof_native');
+        await driver.delayMs(400);
+
+        const btnSubmitCreate = await driver.findComponent(ON.id('btn_submit_create_profile'));
+        expect(btnSubmitCreate !== null).assertTrue();
+        await btnSubmitCreate.click();
+        await driver.delayMs(1500);
+      } else {
+        await btnTestProf.click();
+        await driver.delayMs(1000);
       }
+
+      // 核验当前活跃 Profile 已真实切换为 test_prof_native
+      const txtActiveProfile = await driver.findComponent(ON.id('txt_active_profile_name'));
+      expect(txtActiveProfile !== null).assertTrue();
+      const activeName = await txtActiveProfile.getText();
+      expect(activeName).assertEqual('test_prof_native');
+
+      // 往返切回 default 并确认会话状态完全隔离
+      const btnDefaultBack = await driver.findComponent(ON.id('btn_profile_select_default'));
+      expect(btnDefaultBack !== null).assertTrue();
+      await btnDefaultBack.click();
+      await driver.delayMs(1000);
+      const txtActiveProfileBack = await driver.findComponent(ON.id('txt_active_profile_name'));
+      expect(txtActiveProfileBack !== null).assertTrue();
+      const activeNameBack = await txtActiveProfileBack.getText();
+      expect(activeNameBack).assertEqual('default');
+
+      // 再次切回 test_prof_native 确认双向往返稳定性
+      btnTestProf = await driver.findComponent(ON.id('btn_profile_select_test_prof_native'));
+      expect(btnTestProf !== null).assertTrue();
+      await btnTestProf.click();
+      await driver.delayMs(1000);
+      const txtActiveProfileRound2 = await driver.findComponent(ON.id('txt_active_profile_name'));
+      expect(txtActiveProfileRound2 !== null).assertTrue();
+      const round2Name = await txtActiveProfileRound2.getText();
+      expect(round2Name).assertEqual('test_prof_native');
+
+      // 最终切回 default 恢复初始纯净状态
+      const btnDefaultFinal = await driver.findComponent(ON.id('btn_profile_select_default'));
+      expect(btnDefaultFinal !== null).assertTrue();
+      await btnDefaultFinal.click();
+      await driver.delayMs(1000);
+
+      const btnCloseFinal = await driver.findComponent(ON.id('btn_close_model_dialog'));
+      expect(btnCloseFinal !== null).assertTrue();
+      await btnCloseFinal.click();
+      await driver.delayMs(800);
 
       hilog.info(DOMAIN, TAG, 'Step MODEL PASS: Model and profile user flow verified successfully!');
     });

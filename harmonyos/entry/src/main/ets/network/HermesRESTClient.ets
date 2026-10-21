@@ -35,6 +35,17 @@ export interface SessionImportResult {
   errors: string[];
 }
 
+export interface ReasoningStatusResponse {
+  ok?: boolean;
+  showReasoning?: boolean;
+  reasoningEffort?: string;
+  effort?: string;
+  supportedEfforts?: string[];
+  supportsReasoningEffort?: boolean;
+  effectiveEffort?: string;
+  error?: string;
+}
+
 /**
  * Hermes REST 客户端
  * 严格对齐 HermesREST.swift 与后端公开接口契约，支持 Cookie Jar 与 auth/me 核验
@@ -653,6 +664,192 @@ export class HermesRESTClient {
       const parsed = JSON.parse(dataStr) as Record<string, Object>;
       const rawMsgs = Array.isArray(parsed['messages']) ? (parsed['messages'] as Array<Record<string, Object>>) : [];
       return HermesHistoryNormalizer.normalize(rawMsgs);
+    } finally {
+      client.destroy();
+    }
+  }
+
+  /**
+   * 获取指定模型/Provider的推理配置状态
+   * 严格对齐 upstream Endpoints.swift:566-574 & APIClient+ServerPanels.swift:36-38:
+   * GET /api/reasoning?model={model}&provider={provider}
+   */
+  public static async getReasoningStatus(
+    baseUrl: string,
+    model?: string,
+    provider?: string,
+    token?: string,
+    cookies?: string
+  ): Promise<ReasoningStatusResponse> {
+    const cleanUrl = HermesRESTClient.sanitizeUrl(baseUrl);
+    const client = http.createHttp();
+    try {
+      const headers: Record<string, string> = {
+        'Accept': 'application/json'
+      };
+      if (token && token.length > 0) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+      if (cookies && cookies.length > 0) {
+        headers['Cookie'] = cookies;
+      }
+      const params: string[] = [];
+      if (model && model.trim().length > 0) {
+        params.push(`model=${encodeURIComponent(model.trim())}`);
+      }
+      if (provider && provider.trim().length > 0) {
+        params.push(`provider=${encodeURIComponent(provider.trim())}`);
+      }
+      const qs = params.length > 0 ? `?${params.join('&')}` : '';
+      const response = await client.request(`${cleanUrl}/api/reasoning${qs}`, {
+        method: http.RequestMethod.GET,
+        connectTimeout: 8000,
+        readTimeout: 8000,
+        header: headers
+      });
+
+      if (response.responseCode !== 200) {
+        const errResp: ReasoningStatusResponse = {
+          ok: false,
+          error: `HTTP ${response.responseCode}`
+        };
+        return errResp;
+      }
+
+      const dataStr = typeof response.result === 'string' ? response.result : JSON.stringify(response.result);
+      const parsed = JSON.parse(dataStr) as Record<string, Object>;
+
+      let normalizedEfforts: string[] | undefined = undefined;
+      if (Array.isArray(parsed['supported_efforts'])) {
+        const rawList = parsed['supported_efforts'] as Object[];
+        const seen = new Set<string>();
+        normalizedEfforts = [];
+        for (let i = 0; i < rawList.length; i++) {
+          const item = String(rawList[i] || '').trim().toLowerCase();
+          if (item.length > 0 && !seen.has(item)) {
+            seen.add(item);
+            normalizedEfforts.push(item);
+          }
+        }
+      }
+
+      const eff = (parsed['reasoning_effort'] ? String(parsed['reasoning_effort']) : '') ||
+                  (parsed['effort'] ? String(parsed['effort']) : '');
+
+      const statusResp: ReasoningStatusResponse = {
+        ok: parsed['ok'] !== undefined ? Boolean(parsed['ok']) : true,
+        showReasoning: parsed['show_reasoning'] !== undefined ? Boolean(parsed['show_reasoning']) : undefined,
+        reasoningEffort: parsed['reasoning_effort'] ? String(parsed['reasoning_effort']) : undefined,
+        effort: parsed['effort'] ? String(parsed['effort']) : undefined,
+        supportedEfforts: normalizedEfforts,
+        supportsReasoningEffort: parsed['supports_reasoning_effort'] !== undefined ? Boolean(parsed['supports_reasoning_effort']) : undefined,
+        effectiveEffort: eff.length > 0 ? eff : undefined,
+        error: parsed['error'] ? String(parsed['error']) : undefined
+      };
+      return statusResp;
+    } catch (_e) {
+      const fallback: ReasoningStatusResponse = { ok: false };
+      return fallback;
+    } finally {
+      client.destroy();
+    }
+  }
+
+  /**
+   * 获取服务器 Profile 列表
+   * 对应 GET /api/profiles
+   */
+  public static async listProfiles(baseUrl: string, token?: string, cookies?: string): Promise<string[]> {
+    const cleanUrl = HermesRESTClient.sanitizeUrl(baseUrl);
+    const client = http.createHttp();
+    try {
+      const headers: Record<string, string> = { 'Accept': 'application/json' };
+      if (token && token.length > 0) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+      if (cookies && cookies.length > 0) {
+        headers['Cookie'] = cookies;
+      }
+      const response = await client.request(`${cleanUrl}/api/profiles`, {
+        method: http.RequestMethod.GET,
+        connectTimeout: 8000,
+        readTimeout: 8000,
+        header: headers
+      });
+      if (response.responseCode === 200) {
+        const dataStr = typeof response.result === 'string' ? response.result : JSON.stringify(response.result);
+        const parsed = JSON.parse(dataStr) as Record<string, Object>;
+        if (Array.isArray(parsed['profiles'])) {
+          return (parsed['profiles'] as Object[]).map((p: Object) => {
+            if (typeof p === 'string') {
+              return p;
+            }
+            if (typeof p === 'object' && p !== null) {
+              return String((p as Record<string, Object>)['name'] || '');
+            }
+            return '';
+          }).filter((n: string) => n.length > 0);
+        } else if (Array.isArray(parsed)) {
+          return (parsed as Object[]).map((p: Object) => {
+            if (typeof p === 'string') {
+              return p;
+            }
+            if (typeof p === 'object' && p !== null) {
+              return String((p as Record<string, Object>)['name'] || '');
+            }
+            return '';
+          }).filter((n: string) => n.length > 0);
+        }
+      }
+      return [];
+    } catch (_e) {
+      return [];
+    } finally {
+      client.destroy();
+    }
+  }
+
+  /**
+   * 真实在服务端创建 Profile：POST /api/profiles (Hermes web_routers/profiles.py:705)
+   */
+  public static async createProfile(
+    baseUrl: string,
+    name: string,
+    description?: string,
+    cloneFrom?: string,
+    token?: string,
+    cookies?: string
+  ): Promise<boolean> {
+    const cleanUrl = HermesRESTClient.sanitizeUrl(baseUrl);
+    const client = http.createHttp();
+    try {
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json'
+      };
+      if (token && token.length > 0) {
+        headers['Authorization'] = `Bearer ${token}`;
+      }
+      if (cookies && cookies.length > 0) {
+        headers['Cookie'] = cookies;
+      }
+      const payload: Record<string, Object> = {
+        'name': name,
+        'description': description || '',
+        'clone_from': cloneFrom || 'default',
+        'clone_channels': false,
+        'no_skills': false
+      };
+      const response = await client.request(`${cleanUrl}/api/profiles`, {
+        method: http.RequestMethod.POST,
+        connectTimeout: 8000,
+        readTimeout: 8000,
+        header: headers,
+        extraData: JSON.stringify(payload)
+      });
+      return response.responseCode === 200 || response.responseCode === 201;
+    } catch (_e) {
+      return false;
     } finally {
       client.destroy();
     }

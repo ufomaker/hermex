@@ -1429,6 +1429,38 @@ async function runTestSuite() {
       return;
     }
 
+    if (parsedUrl.pathname === '/api/reasoning' && req.method === 'GET') {
+      const model = parsedUrl.searchParams.get('model');
+      if (model === 'unsupported-model') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: true,
+          supports_reasoning_effort: false,
+          supported_efforts: [],
+          show_reasoning: false
+        }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        supports_reasoning_effort: true,
+        supported_efforts: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+        show_reasoning: true,
+        reasoning_effort: 'high',
+        effort: 'high'
+      }));
+      return;
+    }
+
+    if (parsedUrl.pathname === '/api/profiles' && req.method === 'GET') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        profiles: ['default', 'isolated-test', 'work']
+      }));
+      return;
+    }
+
     res.writeHead(404);
     res.end();
   });
@@ -1559,6 +1591,42 @@ async function runTestSuite() {
               { name: 'work' },
               { name: 'research' }
             ]
+          }
+        }));
+      } else if (frame.method === 'profiles.create') {
+        serverStats.profilesCreateCalls = (serverStats.profilesCreateCalls || 0) + 1;
+        assert(frame.params.name, 'profiles.create 必须包含 name');
+        assert(frame.params.no_alias === true, 'profiles.create 必须携带 no_alias: true');
+        assert(frame.params.clone_channels === false, 'profiles.create 必须 clone_channels: false');
+        assert(frame.params.mirror_credentials === false, 'profiles.create 必须 mirror_credentials: false');
+        ws.send(JSON.stringify({
+          id: frame.id,
+          result: {
+            ok: true,
+            name: frame.params.name,
+            path: `/mock/profiles/${frame.params.name}`
+          }
+        }));
+      } else if (frame.method === 'profiles.describe') {
+        serverStats.profilesDescribeCalls = (serverStats.profilesDescribeCalls || 0) + 1;
+        assert(frame.params.name, 'profiles.describe 必须包含 name');
+        ws.send(JSON.stringify({
+          id: frame.id,
+          result: {
+            name: frame.params.name,
+            description: 'Mock profile description',
+            soul: 'Mock soul',
+            model: { provider: 'custom', default: 'hermex-stub' }
+          }
+        }));
+      } else if (frame.method === 'profiles.configure') {
+        serverStats.profilesConfigureCalls = (serverStats.profilesConfigureCalls || 0) + 1;
+        assert(frame.params.name, 'profiles.configure 必须包含 name');
+        ws.send(JSON.stringify({
+          id: frame.id,
+          result: {
+            ok: true,
+            applied: { description: true }
           }
         }));
       } else if (frame.method === 'approval.respond') {
@@ -3394,6 +3462,38 @@ export const test = true;
     assert(parsedCatalog.activeModel.providerId === 'anthropic', '当前活跃模型 Provider 匹配');
     console.log('  -> 多 Provider 目录解析、未认证/不可用过滤、同名模型隔离与能力映射通过');
 
+    // 1.1 严格门禁：providers 键明确存在时，严禁因全未认证或全不可用而复活平铺模型 (REVIEW_F05_22 第1项)
+    const suppressedPayload = {
+      providers: [
+        { slug: 'bad', name: 'Bad', authenticated: false, models: ['m1'] },
+        { slug: 'unavailable', name: 'Unavail', authenticated: true, models: ['m2'], unavailable_models: ['m2'] }
+      ],
+      models: ['flat-should-not-appear']
+    };
+    const suppressedCatalog = parseModelCatalog(suppressedPayload);
+    assert(suppressedCatalog.groups.length === 0, 'providers 明确存在时，严禁因未认证/不可用而回退复活平铺模型');
+
+    // 1.2 严格门禁：仅在真正缺失 providers 键时允许平铺模型 fallback，并按真实 provider 分组
+    const legacyFlatPayload = {
+      models: [
+        'simple-model-1',
+        { id: 'custom-model-2', name: 'Custom Model 2', provider: 'other-provider' },
+        { id: 'custom-model-3', name: 'Custom Model 3', provider: 'other-provider' }
+      ],
+      provider: 'default'
+    };
+    const flatCatalog = parseModelCatalog(legacyFlatPayload);
+    assert(flatCatalog.groups.length === 2, '完全缺失 providers 键时平铺模型按 provider 正确分组');
+    const defaultGrp = flatCatalog.groups.find(g => g.providerId === 'default');
+    const otherGrp = flatCatalog.groups.find(g => g.providerId === 'other-provider');
+    assert(defaultGrp && defaultGrp.models.length === 1 && defaultGrp.models[0].id === 'simple-model-1', 'default 分组平铺模型匹配');
+    assert(otherGrp && otherGrp.models.length === 2, 'other-provider 分组包含 2 个模型');
+
+    // 1.3 严格门禁：平铺模型中 null/undefined/空项必须安全过滤防御崩溃
+    const nullCatalog = parseModelCatalog({ models: [null, undefined, 'valid-m', { id: '' }] });
+    assert(nullCatalog.groups[0].models.length === 1 && nullCatalog.groups[0].models[0].id === 'valid-m', '模型平铺中的 null/undefined 必须安全过滤');
+    console.log('  -> Fallback 门禁（防平铺复活/多Provider分组/null防御）严格通过');
+
     // 2. Token 安全校验与参数防注入
     assert(isSafeToken('gpt-4o') === true, '常规模型名合法');
     assert(isSafeToken('claude-3-5-sonnet') === true, '带横杠合法');
@@ -3464,13 +3564,65 @@ export const test = true;
     console.log('  -> Profile 列表拉取与 switchProfile 代次隔离清空通过');
 
     console.log('[PASS 35] F05 生产模型目录解析、Provider 分组、Token 安全校验、推理选项与 Profile 状态隔离通过');
+
+    // --- 测试用例 36: F05 推理能力约束与读回、REST profiles.list 及代次防乱序拦截 ---
+    console.log('\n[TEST 36] 测试 F05 GET /api/reasoning 约束读回、REST profiles.list 及代次防乱序拦截:');
+
+    // 1. HermesRESTClient.getReasoningStatus 支持模型能力与参数读回 (REVIEW_F05_22 第2项)
+    const reasoningRes = await HermesRESTClient.getReasoningStatus(baseUrl, 'claude-3-5-sonnet', 'anthropic');
+    assert(reasoningRes.ok === true, 'GET /api/reasoning ok 字段为 true');
+    assert(reasoningRes.supportsReasoningEffort === true, 'supportsReasoningEffort 读回 true');
+    assert(Array.isArray(reasoningRes.supportedEfforts), 'supportedEfforts 必须是数组');
+    assert(reasoningRes.supportedEfforts.includes('minimal') && reasoningRes.supportedEfforts.includes('xhigh'), 'supportedEfforts 完整包含扩展级别 minimal / xhigh');
+    assert(reasoningRes.effectiveEffort === 'high', 'effectiveEffort 真实读回 high');
+
+    // 2. 不支持模型能力与参数
+    const unsuppRes = await HermesRESTClient.getReasoningStatus(baseUrl, 'unsupported-model', 'default');
+    assert(unsuppRes.supportsReasoningEffort === false, '不支持模型返回 supportsReasoningEffort: false');
+    assert(unsuppRes.supportedEfforts.length === 0, '不支持模型 supportedEfforts 为空');
+
+    // 3. ChatViewModel.refreshReasoningEffortGating 驱动视图模型更新
+    await vm.refreshReasoningEffortGating('claude-3-5-sonnet', 'anthropic');
+    assert(vm.supportsReasoningEffort === true, 'ChatViewModel supportsReasoningEffort 更新为 true');
+    assert(vm.supportedReasoningEfforts.includes('minimal'), 'ChatViewModel supportedReasoningEfforts 包含 minimal');
+    assert(vm.currentReasoningEffort === 'high', 'ChatViewModel currentReasoningEffort 读回服务端有效值');
+
+    // 4. REST profiles.list (GET /api/profiles)
+    const restProfiles = await HermesRESTClient.listProfiles(baseUrl);
+    assert(Array.isArray(restProfiles) && restProfiles.includes('default') && restProfiles.includes('isolated-test'), 'GET /api/profiles 返回 Profile 列表');
+
+    // 5. 代次保护：在异步 switchModel / switchReasoningEffort 过程中发生 profile 切换，丢弃旧回执 (REVIEW_F05_22 第4项)
+    await vm.attachSession(botConn, 'sess_prod_1');
+    assert(vm.isConnected === true && vm.getRuntimeSessionId() !== '', '重新连接至活跃会话');
+
+    // 6. Gateway profiles.create, describe, configure (REVIEW_PROFILE22.md 规范)
+    const gw = vm.getGateway();
+    assert(gw !== null, '当前会话已建立 Gateway 连接');
+    const createdProf = await gw.createProfile('test_prof_native', 'native test profile', 'default');
+    assert(createdProf.ok === true && createdProf.name === 'test_prof_native', 'profiles.create 真实响应成功且包含 name');
+
+    const descProf = await gw.describeProfile('test_prof_native');
+    assert(descProf.name === 'test_prof_native' && descProf.description === 'Mock profile description', 'profiles.describe 字段核验正确');
+
+    const confProf = await gw.configureProfile('test_prof_native', 'updated desc');
+    assert(confProf.ok === true && confProf.applied && confProf.applied.description === true, 'profiles.configure applied.description 为 true');
+
+    const pendingSwitch = vm.switchModel('claude-3-5-sonnet', 'openrouter');
+    vm.switchProfile('isolated-profile');
+    await pendingSwitch;
+    assert(vm.currentProfile === 'isolated-profile', '当前 Profile 正确锁定为 isolated-profile');
+    assert(vm.currentModel === '', '旧会话 switchModel 回执被代次拦截丢弃，不污染新 Profile 状态');
+    assert(vm.supportsReasoningEffort === false, 'Profile 切换后 supportsReasoningEffort 必须清空重置为 false');
+    assert(vm.supportedReasoningEfforts.length === 0, 'Profile 切换后 supportedReasoningEfforts 必须清空为 []');
+
+    console.log('[PASS 36] F05 推理能力约束读回、Profile 管理(create/describe/configure)及代次防乱序拦截通过');
   }
 
   vm.disconnect();
   server.close();
 
   console.log('\n======================================================');
-  console.log('✅ 所有 35 项端到端生产代码行为回归测试全部通过 (退出码 0)');
+  console.log('✅ 所有 36 项端到端生产代码行为回归测试全部通过 (退出码 0)');
   console.log('覆盖真实生产业务类：');
   console.log('  - ModelCatalog.ets (F05 模型目录解析、多Provider分组、authenticated/unavailable过滤、isSafeToken防注入、sessionModelValue生成)');
   console.log('  - HermesHistoryNormalizer.ets (轮次边界用户隔离、运行态工具声明保留、多工具、乱序、失败、非JSON与证据 fixture 回归)');

@@ -161,17 +161,21 @@ export function parseModelCatalog(payload: Record<string, Object>): ModelCatalog
     }
   }
 
-  // Fallback 兼容顶层 models 简单结构（如隔离测试环境 stub）
-  if (groups.length === 0 && Array.isArray(payload['models'])) {
+  // Fallback 兼容仅在真正缺失现代 providers 键时触发：严防在 providers 明确存在但全部 unauthenticated 或 unavailable 时复活平铺模型
+  const hasModernProviders = Object.keys(payload).includes('providers') && payload['providers'] !== null && payload['providers'] !== undefined;
+  if (!hasModernProviders && Array.isArray(payload['models'])) {
     const rawFlatModels = payload['models'] as Object[];
     const defaultProvider = String(payload['provider'] || 'default');
-    const options: ModelCatalogOption[] = [];
+    const groupMap = new Map<string, ModelCatalogOption[]>();
     const seenFlat = new Set<string>();
 
     for (let i = 0; i < rawFlatModels.length; i++) {
       const m = rawFlatModels[i];
-      const id = typeof m === 'string' ? m : String((m as Record<string, Object>)['id'] || (m as Record<string, Object>)['name'] || '');
-      const name = typeof m === 'string' ? m : String((m as Record<string, Object>)['name'] || (m as Record<string, Object>)['id'] || '');
+      if (!m) {
+        continue;
+      }
+      const id = typeof m === 'string' ? m : (typeof m === 'object' ? String((m as Record<string, Object>)['id'] || (m as Record<string, Object>)['name'] || '') : '');
+      const name = typeof m === 'string' ? m : (typeof m === 'object' ? String((m as Record<string, Object>)['name'] || (m as Record<string, Object>)['id'] || '') : '');
       const prov = (typeof m === 'object' && (m as Record<string, Object>)['provider']) ? String((m as Record<string, Object>)['provider']) : defaultProvider;
       if (id && !seenFlat.has(`${prov}:${id}`)) {
         seenFlat.add(`${prov}:${id}`);
@@ -181,19 +185,26 @@ export function parseModelCatalog(payload: Record<string, Object>): ModelCatalog
           providerId: prov,
           isDefault: typeof m === 'object' ? Boolean((m as Record<string, Object>)['is_default']) : false
         };
-        options.push(flatOpt);
+        let list = groupMap.get(prov);
+        if (!list) {
+          list = [];
+          groupMap.set(prov, list);
+        }
+        list.push(flatOpt);
       }
     }
 
-    if (options.length > 0) {
-      const group: ModelCatalogGroup = {
-        id: defaultProvider,
-        name: defaultProvider,
-        providerId: defaultProvider,
-        models: options
-      };
-      groups.push(group);
-    }
+    groupMap.forEach((models, prov) => {
+      if (models.length > 0) {
+        const group: ModelCatalogGroup = {
+          id: prov,
+          name: prov,
+          providerId: prov,
+          models: models
+        };
+        groups.push(group);
+      }
+    });
   }
 
   let activeModel: ModelCatalogOption | undefined = undefined;

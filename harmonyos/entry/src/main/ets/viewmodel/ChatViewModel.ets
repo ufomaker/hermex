@@ -24,6 +24,7 @@ export class ChatViewModel {
   public currentModelProvider: string = '';
   public currentReasoningEffort: string = 'none';
   public supportedReasoningEfforts: string[] = REASONING_EFFORT_LEVELS;
+  public supportsReasoningEffort: boolean = true;
   public availableModels: ModelOption[] = [];
   public modelCatalog: ModelCatalog | null = null;
   public availableModelGroups: ModelCatalogGroup[] = [];
@@ -42,6 +43,8 @@ export class ChatViewModel {
   private listener: ChatUIStateListener | null = null;
   private sessionAttachGeneration: number = 0;
   private modelFetchGeneration: number = 0;
+  private reasoningGatingFetchToken: number = 0;
+  private configSetGeneration: number = 0;
   private baseUrl: string = '';
   private token?: string;
   private cookies?: string;
@@ -220,9 +223,10 @@ export class ChatViewModel {
             }
           }
 
-          // 5. 刷新模型列表
+          // 5. 刷新模型列表与推理参数能力约束
           if (this.sessionAttachGeneration === currentAttachGen && this.gateway === activeGateway) {
             this.refreshModels();
+            this.refreshReasoningEffortGating();
           }
         },
         onDisconnected: (reason: string) => {
@@ -687,39 +691,68 @@ export class ChatViewModel {
 
   /**
    * 真实切换模型并向服务端写回配置 (config.set)
-   * 支持指定 providerId，并更新当前会话状态
+   * 具备严格的 (server, profile, session, request) 代次防护，成功后联动更新推理参数约束
    */
   public async switchModel(modelId: string, providerId?: string): Promise<void> {
-    if (!this.gateway || !this.runtimeSessionId) {
-      this.toast('当前无活跃会话，无法配置模型');
-      return;
-    }
-    const oldModel = this.currentModel;
-    const oldProvider = this.currentModelProvider;
-    try {
-      let targetProvider = providerId;
-      if (!targetProvider && this.modelCatalog) {
-        for (let i = 0; i < this.modelCatalog.groups.length; i++) {
-          const g = this.modelCatalog.groups[i];
-          for (let j = 0; j < g.models.length; j++) {
-            if (g.models[j].id === modelId) {
-              targetProvider = g.models[j].providerId;
-              break;
-            }
-          }
-          if (targetProvider) {
+    let targetProvider = providerId;
+    if (!targetProvider && this.modelCatalog) {
+      for (let i = 0; i < this.modelCatalog.groups.length; i++) {
+        const g = this.modelCatalog.groups[i];
+        for (let j = 0; j < g.models.length; j++) {
+          if (g.models[j].id === modelId) {
+            targetProvider = g.models[j].providerId;
             break;
           }
         }
+        if (targetProvider) {
+          break;
+        }
       }
-      await this.gateway.setModelConfig(this.runtimeSessionId, this.currentProfile, modelId, targetProvider, false);
+    }
+
+    if (!this.gateway || !this.runtimeSessionId) {
+      this.currentModel = modelId;
+      if (targetProvider) {
+        this.currentModelProvider = targetProvider;
+      }
+      this.toast(`模型已暂存为: ${modelId}${targetProvider ? ' (' + targetProvider + ')' : ''}`);
+      this.notify();
+      return;
+    }
+    const currentGen = ++this.configSetGeneration;
+    const currentAttachGen = this.sessionAttachGeneration;
+    const currentSid = this.runtimeSessionId;
+    const currentProf = this.currentProfile;
+    const oldModel = this.currentModel;
+    const oldProvider = this.currentModelProvider;
+
+    try {
+      const res = await this.gateway.setModelConfig(currentSid, currentProf, modelId, targetProvider, false);
+      if (this.configSetGeneration !== currentGen || this.sessionAttachGeneration !== currentAttachGen ||
+          this.runtimeSessionId !== currentSid || this.currentProfile !== currentProf) {
+        return; // 过期调用，丢弃旧回执
+      }
+      if (res && res['confirm_required']) {
+        this.currentModel = oldModel;
+        this.currentModelProvider = oldProvider;
+        this.toast(`模型切换需确认: ${res['confirm_message'] || '高资费模型'}`);
+        this.notify();
+        return;
+      }
+
       this.currentModel = modelId;
       if (targetProvider) {
         this.currentModelProvider = targetProvider;
       }
       this.toast(`模型已切换为: ${modelId}${targetProvider ? ' (' + targetProvider + ')' : ''}`);
       this.notify();
+
+      // 切换模型后联动拉取并刷新推理能力约束与生效值
+      await this.refreshReasoningEffortGating(modelId, targetProvider);
     } catch (e) {
+      if (this.configSetGeneration !== currentGen || this.sessionAttachGeneration !== currentAttachGen) {
+        return;
+      }
       this.currentModel = oldModel;
       this.currentModelProvider = oldProvider;
       this.toast(`切换模型失败: ${e}`);
@@ -729,22 +762,122 @@ export class ChatViewModel {
 
   /**
    * 设置当前会话的推理强度 (config.set reasoning)
+   * 具备严格的 (server, profile, session, request) 代次防护，并从服务端读回生效值
    */
   public async switchReasoningEffort(effort: string): Promise<void> {
     if (!this.gateway || !this.runtimeSessionId) {
-      this.toast('当前无活跃会话，无法配置推理参数');
+      this.currentReasoningEffort = effort;
+      this.toast(`推理强度已暂存为: ${effort}`);
+      this.notify();
       return;
     }
+    const currentGen = ++this.configSetGeneration;
+    const currentAttachGen = this.sessionAttachGeneration;
+    const currentSid = this.runtimeSessionId;
+    const currentProf = this.currentProfile;
     const oldEffort = this.currentReasoningEffort;
+
     try {
-      await this.gateway.setReasoningConfig(this.runtimeSessionId, this.currentProfile, effort);
-      this.currentReasoningEffort = effort;
-      this.toast(`推理强度已更新为: ${effort}`);
+      const res = await this.gateway.setReasoningConfig(currentSid, currentProf, effort);
+      if (this.configSetGeneration !== currentGen || this.sessionAttachGeneration !== currentAttachGen ||
+          this.runtimeSessionId !== currentSid || this.currentProfile !== currentProf) {
+        return; // 过期响应，丢弃
+      }
+
+      const eff = String(res['value'] || effort);
+      this.currentReasoningEffort = eff;
+      this.toast(`推理强度已更新为: ${eff}`);
       this.notify();
+
+      // 向服务端只读回查真实生效值，不单单将请求值写本地
+      await this.refreshReasoningEffortGating(this.currentModel, this.currentModelProvider);
     } catch (e) {
+      if (this.configSetGeneration !== currentGen || this.sessionAttachGeneration !== currentAttachGen) {
+        return;
+      }
       this.currentReasoningEffort = oldEffort;
       this.toast(`配置推理参数失败: ${e}`);
       this.notify();
+    }
+  }
+
+  /**
+   * 刷新当前模型/Provider的推理强度约束及能力配置
+   * 严格对齐 upstream Endpoints.swift:566-574 & APIClient+ServerPanels.swift:36-38:
+   * GET /api/reasoning?model={model}&provider={provider}
+   */
+  public async refreshReasoningEffortGating(modelId?: string, providerId?: string): Promise<void> {
+    if (!this.baseUrl || this.isLegacyMode) {
+      return;
+    }
+    const currentToken = ++this.reasoningGatingFetchToken;
+    const currentAttachGen = this.sessionAttachGeneration;
+    const currentGateway = this.gateway;
+    const currentBaseUrl = this.baseUrl;
+    const currentProf = this.currentProfile;
+    const modelAtStart = this.currentModel;
+    const targetModel = modelId !== undefined ? modelId : this.currentModel;
+    const targetProvider = providerId !== undefined ? providerId : this.currentModelProvider;
+
+    try {
+      const res = await HermesRESTClient.getReasoningStatus(
+        this.baseUrl,
+        targetModel,
+        targetProvider,
+        this.token,
+        this.cookies
+      );
+      if (this.reasoningGatingFetchToken !== currentToken ||
+          this.sessionAttachGeneration !== currentAttachGen ||
+          this.gateway !== currentGateway ||
+          this.baseUrl !== currentBaseUrl ||
+          this.currentProfile !== currentProf) {
+        return; // 过期响应，丢弃
+      }
+      if (modelId === undefined && this.currentModel !== modelAtStart) {
+        return; // 用户在请求过程中更换了当前模型，丢弃旧响应
+      }
+      if (modelId !== undefined && this.currentModel !== '' && this.currentModel !== modelId) {
+        return; // 活跃会话模型已被更新为不同模型，丢弃过时响应
+      }
+
+      if (res.ok === false) {
+        // 服务端返回错误或 404 不支持，显式置为不支持并清空词表
+        this.supportsReasoningEffort = false;
+        this.supportedReasoningEfforts = [];
+        this.notify();
+        return;
+      }
+
+      if (res.supportsReasoningEffort !== undefined) {
+        this.supportsReasoningEffort = res.supportsReasoningEffort;
+      } else {
+        this.supportsReasoningEffort = false;
+      }
+
+      if (res.supportedEfforts && res.supportedEfforts.length > 0) {
+        this.supportedReasoningEfforts = res.supportedEfforts;
+      } else {
+        this.supportedReasoningEfforts = [];
+      }
+
+      if (res.effectiveEffort && res.effectiveEffort.length > 0) {
+        this.currentReasoningEffort = res.effectiveEffort;
+      } else if (res.reasoningEffort && res.reasoningEffort.length > 0) {
+        this.currentReasoningEffort = res.reasoningEffort;
+      } else if (res.effort && res.effort.length > 0) {
+        this.currentReasoningEffort = res.effort;
+      }
+
+      this.notify();
+    } catch (_e) {
+      if (this.reasoningGatingFetchToken === currentToken &&
+          this.sessionAttachGeneration === currentAttachGen &&
+          this.baseUrl === currentBaseUrl) {
+        this.supportsReasoningEffort = false;
+        this.supportedReasoningEfforts = [];
+        this.notify();
+      }
     }
   }
 
@@ -801,6 +934,8 @@ export class ChatViewModel {
     }
     this.modelFetchGeneration++;
     this.sessionAttachGeneration++;
+    this.configSetGeneration++;
+    this.reasoningGatingFetchToken++;
     this.currentProfile = newProfile;
     this.runtimeSessionId = '';
     this.storedSessionId = '';
@@ -808,6 +943,8 @@ export class ChatViewModel {
     this.currentModel = '';
     this.currentModelProvider = '';
     this.currentReasoningEffort = 'none';
+    this.supportsReasoningEffort = false;
+    this.supportedReasoningEfforts = [];
     this.modelCatalog = null;
     this.availableModelGroups = [];
     this.availableModels = [];
@@ -830,6 +967,8 @@ export class ChatViewModel {
 
   public disconnect(): void {
     this.sessionAttachGeneration += 1;
+    this.reasoningGatingFetchToken += 1;
+    this.configSetGeneration += 1;
     if (this.activeLegacyStreamHandle) {
       this.activeLegacyStreamHandle.cancel();
       this.activeLegacyStreamHandle = null;
@@ -847,5 +986,7 @@ export class ChatViewModel {
     this.currentClarify = null;
     this.isSubmittingApproval = false;
     this.isSubmittingClarify = false;
+    this.supportsReasoningEffort = false;
+    this.supportedReasoningEfforts = [];
   }
 }
