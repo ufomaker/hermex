@@ -679,5 +679,72 @@ export default function chatApprovalUiTest() {
 
       hilog.info(DOMAIN, TAG, 'Step CRON PASS: Cron management UI flow fully verified on device!');
     });
+
+    it('testModelAndProfileUserFlow', 0, async () => {
+      hilog.info(DOMAIN, TAG, 'Beginning testModelAndProfileUserFlow');
+      const driver = Driver.create();
+      await driver.delayMs(1500);
+
+      // 1. 点击主界面的模型按钮打开模型与推理配置弹窗
+      hilog.info(DOMAIN, TAG, 'Step MODEL1: Locating btn_model_picker...');
+      let btnModel = await driver.findComponent(ON.id('btn_model_picker'));
+      expect(btnModel !== null).assertTrue();
+      if (btnModel) {
+        await btnModel.click();
+        await driver.delayMs(1000);
+      }
+
+      // 2. 校验弹窗已打开并显示配置标题与关闭按钮
+      hilog.info(DOMAIN, TAG, 'Step MODEL2: Verifying model dialog content...');
+      const btnCloseModel = await driver.findComponent(ON.id('btn_close_model_dialog'));
+      expect(btnCloseModel !== null).assertTrue();
+
+      // 3. 校验并切换推理参数 (Reasoning Effort)
+      hilog.info(DOMAIN, TAG, 'Step MODEL3: Testing reasoning effort selection...');
+      const btnEffortLow = await driver.findComponent(ON.id('btn_effort_low'));
+      if (btnEffortLow) {
+        await btnEffortLow.click();
+        await driver.delayMs(800);
+      }
+
+      const btnEffortMedium = await driver.findComponent(ON.id('btn_effort_medium'));
+      if (btnEffortMedium) {
+        await btnEffortMedium.click();
+        await driver.delayMs(800);
+      }
+
+      // 4. 应用模型 (在隔离 9199 服务端下为 hermex-stub 或活跃模型)
+      hilog.info(DOMAIN, TAG, 'Step MODEL4: Applying model in dialog...');
+      let btnApplyModel = await driver.findComponent(ON.id('btn_apply_model_hermex-stub'));
+      if (btnApplyModel) {
+        await btnApplyModel.click();
+        await driver.delayMs(1000);
+      } else {
+        const anyApply = await driver.findComponent(ON.text('应用'));
+        if (anyApply) {
+          await anyApply.click();
+          await driver.delayMs(1000);
+        }
+      }
+
+      // 5. 重新打开并核验 Profile 选项卡及关闭
+      hilog.info(DOMAIN, TAG, 'Step MODEL5: Reopening model dialog to verify profile pills...');
+      btnModel = await driver.findComponent(ON.id('btn_model_picker'));
+      if (btnModel) {
+        await btnModel.click();
+        await driver.delayMs(1000);
+      }
+
+      const profileDefault = await driver.findComponent(ON.id('btn_profile_select_default'));
+      expect(profileDefault !== null).assertTrue();
+
+      const btnCloseFinal = await driver.findComponent(ON.id('btn_close_model_dialog'));
+      if (btnCloseFinal) {
+        await btnCloseFinal.click();
+        await driver.delayMs(800);
+      }
+
+      hilog.info(DOMAIN, TAG, 'Step MODEL PASS: Model and profile user flow verified successfully!');
+    });
   });
 }

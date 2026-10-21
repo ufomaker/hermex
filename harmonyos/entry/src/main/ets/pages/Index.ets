@@ -10,6 +10,7 @@ import { BotConnection, HermesStatus } from '../model/Connection';
 import { HermesSession } from '../model/Session';
 import { ChatMessage, ToolCallItem } from '../model/ChatMessage';
 import { ModelOption } from '../model/Approval';
+import { ModelCatalogGroup, ModelCatalogOption, REASONING_EFFORT_LEVELS } from '../model/ModelCatalog';
 import { WorkspaceFileEntry } from '../network/HermesWorkspaceClient';
 import { HermesFileClient } from '../network/HermesFileClient';
 import { CronJobItem, CronRunItem } from '../network/HermesCronClient';
@@ -109,6 +110,11 @@ struct Index {
   @State connectionStatusText: string = '未连接';
   @State isGenerating: boolean = false;
   @State currentModel: string = '默认模型';
+  @State currentModelProvider: string = '';
+  @State currentReasoningEffort: string = 'none';
+  @State availableModelGroups: ModelCatalogGroup[] = [];
+  @State serverProfiles: string[] = ['default'];
+  @State activeProfile: string = 'default';
   @State messages: ChatMessage[] = [];
   @State sessions: HermesSession[] = [];
   @State availableModels: ModelOption[] = [];
@@ -503,6 +509,9 @@ struct Index {
     this.connectionStatusText = this.chatVm.connectionStatusText;
     this.isGenerating = this.chatVm.isGenerating;
     this.currentModel = this.chatVm.currentModel;
+    this.currentModelProvider = this.chatVm.currentModelProvider;
+    this.currentReasoningEffort = this.chatVm.currentReasoningEffort;
+    this.availableModelGroups = this.chatVm.availableModelGroups.slice();
     this.messages = this.chatVm.messages.slice();
     this.availableModels = this.chatVm.availableModels.slice();
     this.isSubmittingApproval = this.chatVm.isSubmittingApproval;
@@ -536,6 +545,7 @@ struct Index {
       this.serverUrl = cur.url;
       this.usernameInput = cur.username || '';
       this.passwordInput = cur.password || '';
+      this.activeProfile = cur.activeProfile || 'default';
     }
   }
 
@@ -544,6 +554,9 @@ struct Index {
       this.statusProbeText = '正在探测服务...';
       const status: HermesStatus = await this.connVm.probeStatus(this.serverUrl);
       this.statusProbeText = `版本: ${status.version} | 认证: ${status.auth_required ? '需要' : '无需'} | Profiles: ${status.profiles.join(', ')}`;
+      if (status.profiles && status.profiles.length > 0) {
+        this.serverProfiles = status.profiles.slice();
+      }
     } catch (e) {
       this.statusProbeText = `探测失败: ${e}`;
     }
@@ -1146,6 +1159,7 @@ struct Index {
         .margin({ right: 6 })
 
         Button(this.currentModel)
+          .id('btn_model_picker')
           .fontSize(11)
           .height(32)
           .backgroundColor('#F2F2F7')
@@ -1946,53 +1960,203 @@ struct Index {
       // 8. 模型选择列表弹窗
       if (this.showModelDialog) {
         Column() {
-          Text('选择会话模型')
-            .fontSize(18)
-            .fontWeight(FontWeight.Bold)
-            .margin({ bottom: 12 })
+          Row() {
+            Column({ space: 2 }) {
+              Text('模型与推理配置')
+                .fontSize(17)
+                .fontWeight(FontWeight.Bold)
+              Text(`当前: ${this.currentModel}${this.currentModelProvider ? ' (' + this.currentModelProvider + ')' : ''}`)
+                .fontSize(11)
+                .fontColor('#4B5563')
+            }
+            .alignItems(HorizontalAlign.Start)
+            Blank()
+            Button('✕')
+              .id('btn_close_model_dialog')
+              .fontSize(13)
+              .backgroundColor('#E5E5EA')
+              .fontColor('#374151')
+              .height(28)
+              .width(28)
+              .onClick(() => {
+                this.showModelDialog = false;
+              })
+          }
+          .width('100%')
+          .margin({ bottom: 8 })
 
-          List({ space: 8 }) {
-            ForEach(this.availableModels, (m: ModelOption) => {
-              ListItem() {
-                Row() {
-                  Text(m.name)
-                    .fontSize(14)
-                    .fontWeight(FontWeight.Medium)
-                  Blank()
-                  Button('应用')
-                    .fontSize(12)
-                    .backgroundColor('#007AFF')
-                    .fontColor('#FFFFFF')
-                    .onClick(async () => {
-                      this.showModelDialog = false;
-                      await this.chatVm.switchModel(m.name);
-                    })
-                }
-                .width('100%')
-                .padding(10)
-                .backgroundColor('#F9FAFB')
-                .borderRadius(8)
-              }
+          // Profile 切换
+          Row() {
+            Text('Profile:')
+              .fontSize(12)
+              .fontWeight(FontWeight.Medium)
+              .margin({ right: 6 })
+            ForEach(this.serverProfiles, (prof: string) => {
+              Button(prof)
+                .id(`btn_profile_select_${prof}`)
+                .fontSize(11)
+                .height(26)
+                .padding({ left: 8, right: 8 })
+                .margin({ right: 4 })
+                .backgroundColor(this.activeProfile === prof ? '#007AFF' : '#F2F2F7')
+                .fontColor(this.activeProfile === prof ? '#FFFFFF' : '#374151')
+                .onClick(async () => {
+                  if (this.activeProfile !== prof) {
+                    this.activeProfile = prof;
+                    const cur = this.connVm.getCurrentConnection();
+                    if (cur) {
+                      cur.activeProfile = prof;
+                    }
+                    this.chatVm.switchProfile(prof);
+                    await this.refreshSessions();
+                    this.showToast(`已切换至 Profile: ${prof}`);
+                  }
+                })
             })
+          }
+          .width('100%')
+          .margin({ bottom: 8 })
+
+          // 推理强度配置 (Reasoning Effort)
+          Column({ space: 4 }) {
+            Row() {
+              Text('推理强度 (Reasoning Effort):')
+                .fontSize(12)
+                .fontWeight(FontWeight.Medium)
+              Blank()
+              Text(this.currentReasoningEffort)
+                .fontSize(12)
+                .fontColor('#007AFF')
+                .fontWeight(FontWeight.Bold)
+            }
+            .width('100%')
+
+            Row({ space: 4 }) {
+              ForEach(['none', 'low', 'medium', 'high', 'max'], (level: string) => {
+                Button(level)
+                  .id(`btn_effort_${level}`)
+                  .fontSize(11)
+                  .height(24)
+                  .layoutWeight(1)
+                  .backgroundColor(this.currentReasoningEffort === level ? '#34C759' : '#F2F2F7')
+                  .fontColor(this.currentReasoningEffort === level ? '#FFFFFF' : '#374151')
+                  .onClick(async () => {
+                    await this.chatVm.switchReasoningEffort(level);
+                  })
+              })
+            }
+            .width('100%')
+          }
+          .width('100%')
+          .padding(8)
+          .backgroundColor('#F9FAFB')
+          .borderRadius(8)
+          .margin({ bottom: 8 })
+
+          // 模型列表 (按 Provider 分组)
+          List({ space: 8 }) {
+            if (this.availableModelGroups.length > 0) {
+              ForEach(this.availableModelGroups, (group: ModelCatalogGroup) => {
+                ListItem() {
+                  Column({ space: 6 }) {
+                    // Provider 分组标题
+                    Row() {
+                      Text(group.name)
+                        .fontSize(13)
+                        .fontWeight(FontWeight.Bold)
+                        .fontColor('#111827')
+                      Text(' [已认证]')
+                        .fontSize(10)
+                        .fontColor('#059669')
+                      Blank()
+                      Text(group.providerId)
+                        .fontSize(10)
+                        .fontColor('#9CA3AF')
+                    }
+                    .width('100%')
+                    .padding({ top: 4, bottom: 2 })
+
+                    // 模型条目
+                    ForEach(group.models, (m: ModelCatalogOption) => {
+                      Row() {
+                        Column({ space: 2 }) {
+                          Text(m.displayName)
+                            .fontSize(13)
+                            .fontWeight(FontWeight.Medium)
+                            .fontColor('#1F2937')
+                          if (m.id !== m.displayName) {
+                            Text(m.id)
+                              .fontSize(10)
+                              .fontColor('#9CA3AF')
+                          }
+                        }
+                        .alignItems(HorizontalAlign.Start)
+
+                        Blank()
+
+                        if (m.id === this.currentModel) {
+                          Text('当前生效')
+                            .fontSize(11)
+                            .fontColor('#059669')
+                            .margin({ right: 6 })
+                        }
+
+                        Button('应用')
+                          .id(`btn_apply_model_${m.id}`)
+                          .fontSize(12)
+                          .height(28)
+                          .backgroundColor(m.id === this.currentModel ? '#34C759' : '#007AFF')
+                          .fontColor('#FFFFFF')
+                          .onClick(async () => {
+                            this.showModelDialog = false;
+                            await this.chatVm.switchModel(m.id, m.providerId);
+                          })
+                      }
+                      .width('100%')
+                      .padding(8)
+                      .backgroundColor('#F3F4F6')
+                      .borderRadius(6)
+                    })
+                  }
+                  .width('100%')
+                }
+              })
+            } else {
+              ForEach(this.availableModels, (m: ModelOption) => {
+                ListItem() {
+                  Row() {
+                    Text(m.name)
+                      .fontSize(13)
+                      .fontWeight(FontWeight.Medium)
+                    Blank()
+                    Button('应用')
+                      .id(`btn_apply_model_${m.id}`)
+                      .fontSize(12)
+                      .height(28)
+                      .backgroundColor('#007AFF')
+                      .fontColor('#FFFFFF')
+                      .onClick(async () => {
+                        this.showModelDialog = false;
+                        await this.chatVm.switchModel(m.id, m.provider);
+                      })
+                  }
+                  .width('100%')
+                  .padding(8)
+                  .backgroundColor('#F9FAFB')
+                  .borderRadius(6)
+                }
+              })
+            }
           }
           .height(240)
           .width('100%')
-
-          Button('关闭')
-            .fontSize(13)
-            .backgroundColor('#E5E5EA')
-            .fontColor('#374151')
-            .margin({ top: 12 })
-            .onClick(() => {
-              this.showModelDialog = false;
-            })
         }
-        .width('85%')
-        .padding(20)
+        .width('90%')
+        .padding(16)
         .backgroundColor('#FFFFFF')
         .borderRadius(16)
         .shadow({ radius: 20, color: '#40000000' })
-        .position({ x: '7.5%', y: '20%' })
+        .position({ x: '5%', y: '12%' })
       }
 
       // 9. 工作区文件浏览与下载弹窗

@@ -777,6 +777,9 @@ async function runTestSuite() {
     resumeCalls: 0,
     interruptCalls: 0,
     configSetCalls: 0,
+    modelOptionsCalls: 0,
+    profilesListCalls: 0,
+    lastConfigSetSetting: null,
     promptSubmitCalls: 0,
     approvalResponded: false,
     lastCloseCode: null,
@@ -1487,9 +1490,77 @@ async function runTestSuite() {
         ws.send(JSON.stringify({ id: frame.id, result: { ok: true } }));
       } else if (frame.method === 'config.set') {
         serverStats.configSetCalls++;
-        assert(frame.params.key === 'model', 'config.set key 必须是 model');
-        assert(frame.params.value.includes('--session'), '模型参数必须携带 --session 后缀');
+        serverStats.lastConfigSetSetting = frame.params;
+        assert(frame.params.key === 'model' || frame.params.key === 'reasoning', 'config.set key 必须是 model 或 reasoning');
+        if (frame.params.key === 'model') {
+          assert(frame.params.value.includes('--session'), '模型参数必须携带 --session 后缀');
+        }
         ws.send(JSON.stringify({ id: frame.id, result: { ok: true } }));
+      } else if (frame.method === 'model.options') {
+        serverStats.modelOptionsCalls++;
+        ws.send(JSON.stringify({
+          id: frame.id,
+          result: {
+            model: 'claude-3-5-sonnet',
+            provider: 'anthropic',
+            providers: [
+              {
+                slug: 'anthropic',
+                name: 'Anthropic',
+                authenticated: true,
+                models: ['claude-3-5-sonnet', 'claude-3-haiku', 'claude-3-5-sonnet'],
+                unavailable_models: ['claude-3-haiku'],
+                capabilities: {
+                  'claude-3-5-sonnet': { reasoning: true, vision: true }
+                },
+                unknown_future_field: 'future_val'
+              },
+              {
+                slug: 'openrouter',
+                name: 'OpenRouter',
+                authenticated: true,
+                models: ['claude-3-5-sonnet', 'qwen-2.5-coder'],
+                unavailable_models: [],
+                capabilities: {
+                  'claude-3-5-sonnet': { reasoning: false, vision: true },
+                  'qwen-2.5-coder': { reasoning: false, code: true }
+                }
+              },
+              {
+                slug: 'unauthenticated-provider',
+                name: 'Unauthed Provider',
+                authenticated: false,
+                models: ['secret-model'],
+                unavailable_models: []
+              },
+              {
+                slug: 'all-unavailable-provider',
+                name: 'All Unavailable',
+                authenticated: true,
+                models: ['bad-model'],
+                unavailable_models: ['bad-model']
+              },
+              {
+                slug: 'anthropic',
+                name: 'Anthropic Duplicate',
+                authenticated: true,
+                models: ['claude-3-5-sonnet']
+              }
+            ]
+          }
+        }));
+      } else if (frame.method === 'profiles.list') {
+        serverStats.profilesListCalls++;
+        ws.send(JSON.stringify({
+          id: frame.id,
+          result: {
+            profiles: [
+              { name: 'default' },
+              { name: 'work' },
+              { name: 'research' }
+            ]
+          }
+        }));
       } else if (frame.method === 'approval.respond') {
         serverStats.approvalResponded = true;
         assert(frame.params.session_id, 'approval.respond 必须包含 session_id');
@@ -3248,14 +3319,160 @@ export const test = true;
     console.log('  -> Legacy WebUI 拦截与无副作用保护通过');
 
     console.log('[PASS 34] HermesCronClient & CronViewModel F08 任务管理全生命周期通过');
+
+    // --- 测试用例 35: F05 生产模型目录解析、Provider 分组、Token 安全校验、推理选项与 Profile 状态隔离 ---
+    console.log('\n[TEST 35] 测试 F05 模型目录解析、Provider分组、Token安全防注入、推理选项与Profile代次隔离:');
+    const { parseModelCatalog, formatSessionModelValue, isSafeToken } = customRequire(__dirname, '../entry/src/main/ets/model/ModelCatalog.ets');
+
+    // 1. 上游真实复杂 payload fixture 解析验证
+    const rawFixture = {
+      model: 'claude-3-5-sonnet',
+      provider: 'anthropic',
+      providers: [
+        {
+          slug: 'anthropic',
+          name: 'Anthropic',
+          authenticated: true,
+          models: ['claude-3-5-sonnet', 'claude-3-haiku', 'claude-3-5-sonnet'],
+          unavailable_models: ['claude-3-haiku'],
+          capabilities: {
+            'claude-3-5-sonnet': { reasoning: true, vision: true }
+          },
+          future_field: 'unknown'
+        },
+        {
+          slug: 'openrouter',
+          name: 'OpenRouter',
+          authenticated: true,
+          models: ['claude-3-5-sonnet', 'qwen-2.5-coder'], // 同名模型不同 provider
+          unavailable_models: [],
+          capabilities: {
+            'claude-3-5-sonnet': { reasoning: false, vision: true },
+            'qwen-2.5-coder': { reasoning: false, code: true }
+          }
+        },
+        {
+          slug: 'unauthenticated-provider',
+          name: 'Unauthed Provider',
+          authenticated: false,
+          models: ['secret-model'],
+          unavailable_models: []
+        },
+        {
+          slug: 'all-unavailable-provider',
+          name: 'All Unavailable',
+          authenticated: true,
+          models: ['bad-model'],
+          unavailable_models: ['bad-model']
+        },
+        {
+          slug: 'anthropic',
+          name: 'Anthropic Duplicate',
+          authenticated: true,
+          models: ['claude-3-5-sonnet']
+        }
+      ]
+    };
+
+    const parsedCatalog = parseModelCatalog(rawFixture);
+    assert(parsedCatalog.groups.length === 2, `有效分组数必须为 2（排除未认证、全不可用和重复provider），实际为: ${parsedCatalog.groups.length}`);
+    assert(parsedCatalog.groups[0].providerId === 'anthropic', '第 1 个分组为 anthropic');
+    assert(parsedCatalog.groups[0].models.length === 1, 'anthropic 仅保留 claude-3-5-sonnet（去重且排除 unavailable）');
+    assert(parsedCatalog.groups[0].models[0].id === 'claude-3-5-sonnet', '模型 ID 匹配');
+    assert(parsedCatalog.groups[0].models[0].providerId === 'anthropic', '保留 providerId');
+
+    assert(parsedCatalog.groups[1].providerId === 'openrouter', '第 2 个分组为 openrouter');
+    assert(parsedCatalog.groups[1].models.length === 2, 'openrouter 包含 2 个模型');
+    assert(parsedCatalog.groups[1].models[0].id === 'claude-3-5-sonnet', '同名模型在 openrouter 正常存在');
+    assert(parsedCatalog.groups[1].models[0].providerId === 'openrouter', '同名模型 providerId 区分，绝不混淆碰撞');
+
+    assert(parsedCatalog.capabilities['anthropic:claude-3-5-sonnet'].reasoning === true, '能力字典正确绑定 anthropic:claude-3-5-sonnet');
+    assert(parsedCatalog.capabilities['openrouter:claude-3-5-sonnet'].reasoning === false, '能力字典正确绑定 openrouter:claude-3-5-sonnet');
+
+    assert(parsedCatalog.activeModel !== undefined, '当前活跃模型解析成功');
+    assert(parsedCatalog.activeModel.id === 'claude-3-5-sonnet', '当前活跃模型 ID 匹配');
+    assert(parsedCatalog.activeModel.providerId === 'anthropic', '当前活跃模型 Provider 匹配');
+    console.log('  -> 多 Provider 目录解析、未认证/不可用过滤、同名模型隔离与能力映射通过');
+
+    // 2. Token 安全校验与参数防注入
+    assert(isSafeToken('gpt-4o') === true, '常规模型名合法');
+    assert(isSafeToken('claude-3-5-sonnet') === true, '带横杠合法');
+    assert(isSafeToken('anthropic') === true, '常规 provider 合法');
+
+    assert(isSafeToken('') === false, '空字符串拒绝');
+    assert(isSafeToken('model with space') === false, '含空格拒绝');
+    assert(isSafeToken('model\n--session') === false, '含换行拒绝');
+    assert(isSafeToken('model--inject') === false, '含双破折号拒绝');
+    assert(isSafeToken('--global') === false, 'flag 前缀拒绝');
+    assert(isSafeToken('model–unicode') === false, 'Unicode 破折号 – 拒绝');
+    assert(isSafeToken('model—emdash') === false, 'Unicode 破折号 — 拒绝');
+
+    assert(formatSessionModelValue('claude-3-5-sonnet', 'anthropic') === 'claude-3-5-sonnet --provider anthropic --session', '标准 wireValue 格式正确');
+    assert(formatSessionModelValue('claude --flag', 'anthropic') === null, '非法模型名拒绝返回 null');
+    assert(formatSessionModelValue('claude', 'anthropic --inject') === null, '非法 provider 拒绝返回 null');
+    console.log('  -> sessionModelValue 安全防注入校验（空白/--/Unicode破折号拒绝）通过');
+
+    // 3. 生产 ChatViewModel.refreshModels 与 getModelCatalog 接口
+    assert(vm.gateway !== null, '当前网关必须处于连接状态');
+    await vm.refreshModels();
+    assert(vm.availableModelGroups.length === 2, 'ChatViewModel 成功同步 2 个 Provider 分组');
+    assert(vm.currentModel === 'claude-3-5-sonnet', 'ChatViewModel currentModel 同步活跃模型');
+    assert(vm.currentModelProvider === 'anthropic', 'ChatViewModel currentModelProvider 同步');
+    console.log('  -> ChatViewModel.refreshModels 真实拉取并同步分组模型通过');
+
+    // 4. 生产 ChatViewModel.switchModel (带 providerId)
+    await vm.switchModel('claude-3-5-sonnet', 'openrouter');
+    assert(serverStats.lastConfigSetSetting.key === 'model', 'config.set key 必须为 model');
+    assert(serverStats.lastConfigSetSetting.value === 'claude-3-5-sonnet --provider openrouter --session', 'config.set value 必须带 --provider 和 --session');
+    assert(serverStats.lastConfigSetSetting.scope === 'session', '必须限定 scope: session');
+    assert(serverStats.lastConfigSetSetting.confirm_expensive_model === false, '默认不代确认昂贵模型');
+    assert(vm.currentModel === 'claude-3-5-sonnet', 'currentModel 已更新');
+    assert(vm.currentModelProvider === 'openrouter', 'currentModelProvider 已更新为 openrouter');
+    console.log('  -> 带 Provider 的模型切换与 config.set RPC 验证通过');
+
+    // 5. 生产 ChatViewModel.switchReasoningEffort (推理强度参数)
+    await vm.switchReasoningEffort('high');
+    assert(serverStats.lastConfigSetSetting.key === 'reasoning', 'config.set key 必须为 reasoning');
+    assert(serverStats.lastConfigSetSetting.value === 'high', 'config.set value 必须为 high');
+    assert(serverStats.lastConfigSetSetting.scope === 'session', '必须限定 scope: session');
+    assert(vm.currentReasoningEffort === 'high', 'currentReasoningEffort 已更新');
+
+    let invalidEffortThrown = false;
+    try {
+      await vm.gateway.setReasoningConfig(vm.getRuntimeSessionId(), 'default', 'unsupported-extreme');
+    } catch (_e) {
+      invalidEffortThrown = true;
+    }
+    assert(invalidEffortThrown === true, '网关对不支持的推理参数必须抛出异常拒绝');
+
+    // ChatViewModel 层面容错：尝试设置非法值，当前状态保留且不改变
+    await vm.switchReasoningEffort('unsupported-extreme');
+    assert(vm.currentReasoningEffort === 'high', '非法推理强度设置失败后必须保留原值');
+    console.log('  -> 推理强度配置 (reasoning effort) 与合法性门禁通过');
+
+    // 6. Profile 列表与 Profile 切换状态隔离
+    const profiles = await vm.gateway.listProfiles();
+    assert(Array.isArray(profiles) && profiles.includes('default') && profiles.includes('work'), 'profiles.list 返回正确 Profile 列表');
+
+    // 测试 switchProfile 状态隔离
+    vm.switchProfile('work');
+    assert(vm.runtimeSessionId === '', '切换 Profile 必须清空上一会话的 runtimeSessionId');
+    assert(vm.messages.length === 0, '切换 Profile 必须清空上一会话的消息流');
+    assert(vm.modelCatalog === null, '切换 Profile 必须清空旧模型目录');
+    assert(vm.availableModelGroups.length === 0, '切换 Profile 必须清空旧分组');
+    assert(vm.currentProfile === 'work', '当前 Profile 正确更新');
+    console.log('  -> Profile 列表拉取与 switchProfile 代次隔离清空通过');
+
+    console.log('[PASS 35] F05 生产模型目录解析、Provider 分组、Token 安全校验、推理选项与 Profile 状态隔离通过');
   }
 
   vm.disconnect();
   server.close();
 
   console.log('\n======================================================');
-  console.log('✅ 所有 34 项端到端生产代码行为回归测试全部通过 (退出码 0)');
+  console.log('✅ 所有 35 项端到端生产代码行为回归测试全部通过 (退出码 0)');
   console.log('覆盖真实生产业务类：');
+  console.log('  - ModelCatalog.ets (F05 模型目录解析、多Provider分组、authenticated/unavailable过滤、isSafeToken防注入、sessionModelValue生成)');
   console.log('  - HermesHistoryNormalizer.ets (轮次边界用户隔离、运行态工具声明保留、多工具、乱序、失败、非JSON与证据 fixture 回归)');
   console.log('  - SessionListViewModel.ets (F02 分页加载、去重、检索清除恢复、分类 Tab、置顶、归档、分支克隆、导出与切服竞态隔离)');
   console.log('  - HermesRESTClient.ets (Cookie Jar、登录、/api/auth/me 核验、Ticket、会话分页、PATCH属性、导入、导出与历史)');

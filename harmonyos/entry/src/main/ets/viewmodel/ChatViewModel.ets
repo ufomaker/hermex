@@ -1,6 +1,12 @@
 import { BotConnection } from '../model/Connection';
 import { ChatMessage, ToolCallItem } from '../model/ChatMessage';
 import { ApprovalRequest, ClarifyRequest, ModelOption } from '../model/Approval';
+import {
+  ModelCatalog,
+  ModelCatalogOption,
+  ModelCatalogGroup,
+  REASONING_EFFORT_LEVELS
+} from '../model/ModelCatalog';
 import { HermesRESTClient } from '../network/HermesRESTClient';
 import { HermesGatewayClient, GatewayEventCallbacks } from '../network/HermesGatewayClient';
 import { LegacySSEClient, SSEStreamHandle } from '../network/legacy/LegacySSEClient';
@@ -15,7 +21,12 @@ export class ChatViewModel {
   public messages: ChatMessage[] = [];
   public isGenerating: boolean = false;
   public currentModel: string = '默认模型';
+  public currentModelProvider: string = '';
+  public currentReasoningEffort: string = 'none';
+  public supportedReasoningEfforts: string[] = REASONING_EFFORT_LEVELS;
   public availableModels: ModelOption[] = [];
+  public modelCatalog: ModelCatalog | null = null;
+  public availableModelGroups: ModelCatalogGroup[] = [];
   public currentApproval: ApprovalRequest | null = null;
   public currentClarify: ClarifyRequest | null = null;
   public connectionStatusText: string = '未连接';
@@ -30,6 +41,7 @@ export class ChatViewModel {
   private currentProfile: string = 'default';
   private listener: ChatUIStateListener | null = null;
   private sessionAttachGeneration: number = 0;
+  private modelFetchGeneration: number = 0;
   private baseUrl: string = '';
   private token?: string;
   private cookies?: string;
@@ -675,38 +687,131 @@ export class ChatViewModel {
 
   /**
    * 真实切换模型并向服务端写回配置 (config.set)
+   * 支持指定 providerId，并更新当前会话状态
    */
-  public async switchModel(modelName: string): Promise<void> {
+  public async switchModel(modelId: string, providerId?: string): Promise<void> {
     if (!this.gateway || !this.runtimeSessionId) {
       this.toast('当前无活跃会话，无法配置模型');
       return;
     }
     const oldModel = this.currentModel;
+    const oldProvider = this.currentModelProvider;
     try {
-      await this.gateway.setModelConfig(this.runtimeSessionId, this.currentProfile, modelName);
-      this.currentModel = modelName;
+      let targetProvider = providerId;
+      if (!targetProvider && this.modelCatalog) {
+        for (let i = 0; i < this.modelCatalog.groups.length; i++) {
+          const g = this.modelCatalog.groups[i];
+          for (let j = 0; j < g.models.length; j++) {
+            if (g.models[j].id === modelId) {
+              targetProvider = g.models[j].providerId;
+              break;
+            }
+          }
+          if (targetProvider) {
+            break;
+          }
+        }
+      }
+      await this.gateway.setModelConfig(this.runtimeSessionId, this.currentProfile, modelId, targetProvider, false);
+      this.currentModel = modelId;
+      if (targetProvider) {
+        this.currentModelProvider = targetProvider;
+      }
+      this.toast(`模型已切换为: ${modelId}${targetProvider ? ' (' + targetProvider + ')' : ''}`);
       this.notify();
     } catch (e) {
       this.currentModel = oldModel;
+      this.currentModelProvider = oldProvider;
       this.toast(`切换模型失败: ${e}`);
       this.notify();
     }
   }
 
   /**
-   * 刷新模型列表
+   * 设置当前会话的推理强度 (config.set reasoning)
+   */
+  public async switchReasoningEffort(effort: string): Promise<void> {
+    if (!this.gateway || !this.runtimeSessionId) {
+      this.toast('当前无活跃会话，无法配置推理参数');
+      return;
+    }
+    const oldEffort = this.currentReasoningEffort;
+    try {
+      await this.gateway.setReasoningConfig(this.runtimeSessionId, this.currentProfile, effort);
+      this.currentReasoningEffort = effort;
+      this.toast(`推理强度已更新为: ${effort}`);
+      this.notify();
+    } catch (e) {
+      this.currentReasoningEffort = oldEffort;
+      this.toast(`配置推理参数失败: ${e}`);
+      this.notify();
+    }
+  }
+
+  /**
+   * 刷新模型列表及结构化目录 (具备严格的 server/profile/session 代次隔离)
    */
   public async refreshModels(): Promise<void> {
     if (!this.gateway || !this.runtimeSessionId) {
       return;
     }
+    const currentGen = ++this.modelFetchGeneration;
+    const currentSid = this.runtimeSessionId;
+    const currentProf = this.currentProfile;
     try {
-      const models = await this.gateway.getModelOptions(this.runtimeSessionId, this.currentProfile);
-      this.availableModels = models;
+      const catalog = await this.gateway.getModelCatalog(currentSid, currentProf);
+      // 拦截代次乱序与跨会话/Profile响应
+      if (this.modelFetchGeneration !== currentGen || this.runtimeSessionId !== currentSid || this.currentProfile !== currentProf) {
+        return;
+      }
+      this.modelCatalog = catalog;
+      this.availableModelGroups = catalog.groups;
+      if (catalog.activeModel) {
+        this.currentModel = catalog.activeModel.id;
+        this.currentModelProvider = catalog.activeModel.providerId;
+      }
+      // 同步平铺列表供旧组件兼容
+      const flatList: ModelOption[] = [];
+      for (let i = 0; i < catalog.groups.length; i++) {
+        const g = catalog.groups[i];
+        for (let j = 0; j < g.models.length; j++) {
+          const m = g.models[j];
+          flatList.push({
+            id: m.id,
+            name: m.displayName,
+            provider: m.providerId,
+            isDefault: m.isDefault
+          });
+        }
+      }
+      this.availableModels = flatList;
       this.notify();
-    } catch (e) {
+    } catch (_e) {
       // ignore
     }
+  }
+
+  /**
+   * 切换 Profile 并严格隔离状态：
+   * 升级代次阻止旧异步响应、清空当前消息与模型目录
+   */
+  public switchProfile(newProfile: string): void {
+    if (this.currentProfile === newProfile) {
+      return;
+    }
+    this.modelFetchGeneration++;
+    this.sessionAttachGeneration++;
+    this.currentProfile = newProfile;
+    this.runtimeSessionId = '';
+    this.storedSessionId = '';
+    this.messages = [];
+    this.currentModel = '';
+    this.currentModelProvider = '';
+    this.currentReasoningEffort = 'none';
+    this.modelCatalog = null;
+    this.availableModelGroups = [];
+    this.availableModels = [];
+    this.notify();
   }
 
   /**

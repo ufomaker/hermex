@@ -1,5 +1,14 @@
 import webSocket from '@ohos.net.webSocket';
 import { ApprovalRequest, ClarifyRequest, ModelOption } from '../model/Approval';
+import {
+  ModelCatalog,
+  ModelCatalogOption,
+  ModelCatalogGroup,
+  parseModelCatalog,
+  formatSessionModelValue,
+  isSafeToken,
+  REASONING_EFFORT_LEVELS
+} from '../model/ModelCatalog';
 import { ToolCallItem } from '../model/ChatMessage';
 
 export interface GatewayEventCallbacks {
@@ -642,45 +651,133 @@ export class HermesGatewayClient {
   }
 
   /**
-   * 真实切换会话配置（如模型）：config.set (HermesCall.swift:307, 445)
+   * 真实切换会话模型配置：config.set (HermesCall.swift:245, 439-445, HermesModelCatalog.swift:41-48)
+   * 严格发送 value: `${modelId} --provider ${providerId} --session`
+   * 防注入校验：校验 token 不能含空白、-- 或 Unicode 破折号
    */
-  public async setModelConfig(sessionId: string, profile: string, modelName: string): Promise<Record<string, Object>> {
+  public async setModelConfig(
+    sessionId: string,
+    profile: string,
+    modelId: string,
+    providerId?: string,
+    confirmExpensive: boolean = false
+  ): Promise<Record<string, Object>> {
+    let wireValue: string;
+    if (providerId) {
+      const formatted = formatSessionModelValue(modelId, providerId);
+      if (!formatted) {
+        throw new Error(`Invalid model or provider token (must not contain whitespace, '--' or Unicode dashes): ${modelId}, ${providerId}`);
+      }
+      wireValue = formatted;
+    } else {
+      if (modelId.includes('--session')) {
+        const parts = modelId.split(/\s+/);
+        for (let i = 0; i < parts.length; i++) {
+          const p = parts[i];
+          if (p !== '--session' && p !== '--provider' && !isSafeToken(p)) {
+            throw new Error(`Invalid token in model config: ${p}`);
+          }
+        }
+        wireValue = modelId;
+      } else {
+        if (!isSafeToken(modelId)) {
+          throw new Error(`Invalid model token (must not contain whitespace, '--' or Unicode dashes): ${modelId}`);
+        }
+        wireValue = `${modelId} --session`;
+      }
+    }
+
     const params: Record<string, Object> = {
       'session_id': sessionId,
       'profile': profile,
       'scope': 'session',
       'key': 'model',
-      'value': `${modelName} --session`,
-      'confirm_expensive_model': false
+      'value': wireValue,
+      'confirm_expensive_model': confirmExpensive
     };
     return this.call('config.set', params);
   }
 
   /**
-   * 获取模型列表：model.options (HermesCall.swift:306, 434)
+   * 设置推理强度：config.set (HermesCall.swift:246, 447)
+   */
+  public async setReasoningConfig(sessionId: string, profile: string, effort: string): Promise<Record<string, Object>> {
+    if (!REASONING_EFFORT_LEVELS.includes(effort)) {
+      throw new Error(`Unsupported reasoning effort level: ${effort}`);
+    }
+    const params: Record<string, Object> = {
+      'session_id': sessionId,
+      'profile': profile,
+      'scope': 'session',
+      'key': 'reasoning',
+      'value': effort
+    };
+    return this.call('config.set', params);
+  }
+
+  /**
+   * 获取结构化模型目录：model.options (HermesCall.swift:312, 435, HermesModelCatalog.swift)
+   */
+  public async getModelCatalog(sessionId: string, profile: string): Promise<ModelCatalog> {
+    const params: Record<string, Object> = {
+      'session_id': sessionId,
+      'profile': profile
+    };
+    const res = await this.call('model.options', params);
+    return parseModelCatalog(res);
+  }
+
+  /**
+   * 获取 Profile 级别的模型目录 (无需会话ID)：model.options (HermesCall.swift:132, 438)
+   */
+  public async getProfileModelCatalog(profile: string): Promise<ModelCatalog> {
+    const params: Record<string, Object> = {
+      'profile': profile
+    };
+    const res = await this.call('model.options', params);
+    return parseModelCatalog(res);
+  }
+
+  /**
+   * 获取模型列表（保持旧接口兼容）：model.options
    */
   public async getModelOptions(sessionId: string, profile: string): Promise<ModelOption[]> {
     try {
-      const params: Record<string, Object> = {
-        'session_id': sessionId,
-        'profile': profile
-      };
-      const res = await this.call('model.options', params);
-      const rawModels = Array.isArray(res['models']) ? (res['models'] as Array<Record<string, Object>>) : [];
+      const catalog = await this.getModelCatalog(sessionId, profile);
       const list: ModelOption[] = [];
-      for (let i = 0; i < rawModels.length; i++) {
-        const m = rawModels[i];
-        const opt: ModelOption = {
-          id: String(m['id'] || m['name'] || ''),
-          name: String(m['name'] || m['id'] || ''),
-          provider: m['provider'] ? String(m['provider']) : undefined,
-          isDefault: Boolean(m['is_default'])
-        };
-        list.push(opt);
+      for (let i = 0; i < catalog.groups.length; i++) {
+        const g = catalog.groups[i];
+        for (let j = 0; j < g.models.length; j++) {
+          const m = g.models[j];
+          list.push({
+            id: m.id,
+            name: m.displayName,
+            provider: m.providerId,
+            isDefault: m.isDefault
+          });
+        }
       }
       return list;
     } catch (e) {
       return [];
+    }
+  }
+
+  /**
+   * 获取 Profile 列表：profiles.list (HermesCall.swift:25, 278, 348)
+   */
+  public async listProfiles(includeSessions: boolean = false): Promise<string[]> {
+    try {
+      const res = await this.call('profiles.list', { 'include_sessions': includeSessions });
+      if (Array.isArray(res)) {
+        return res.map((item: Object) => typeof item === 'string' ? item : String((item as Record<string, Object>)['name'] || ''));
+      }
+      if (Array.isArray(res['profiles'])) {
+        return (res['profiles'] as Array<Object>).map((item: Object) => typeof item === 'string' ? item : String((item as Record<string, Object>)['name'] || ''));
+      }
+      return ['default'];
+    } catch (_e) {
+      return ['default'];
     }
   }
 }

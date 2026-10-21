@@ -1,30 +1,35 @@
 # Hermex HarmonyOS 移植状态追踪
 
-- 状态：**阶段八（Run 20 完善）F02 会话精准锁定与系统分享安全关闭、F08 Cron 任务管理全生命周期响应式重构与官方模拟器 5/5 UiTest 全绿通过 (Stage 8 Full F02 & F08 Complete Lifecycle, Reactive VM Notification & Strict UiTest Verified)**
-- 当前阶段：Run 19/20 工作块已全部落实：
-  1. **F02 会话精准锁定与系统分享后置返回处理**：
-     - 在导出点击 `btn_export_session_${targetId}` 唤起系统分享面板后，通过 `driver.pressBack()` 安全退出系统分享层，无缝返回会话列表原生视窗；
-     - 搜索清空、会话重命名、置顶/取消置顶无损往返、归档/取消归档双向流转、分支克隆与导出完整无条件断言通过。
-  2. **F08 Cron 调度架构与响应式刷新机制重构**：
-     - 在 `CronViewModel.ets` 中引入 `CronViewModelListener` 与 `notify()` 通知机制，在 `loadJobs`、`createJob`、`updateJob`、`triggerJob`、`toggleJob`、`loadRuns` 全生命周期关键节点精准触发；
-     - `Index.ets` 声明 `@State cronJobs` 等状态，并在 `aboutToAppear` 中接入监听器，将 VM 数据变更直接响应式发布至原生 ArkUI `ForEach`；
-     - 任务列表默认按 `createdAt` 倒序排列，最新创建或编辑项置顶呈现，彻底解决列表固定高度虚拟化导致的新项脱离视口不可达问题；
-     - 恢复普通用户 UI 纯净标题，移除了 `[ID:...]` 技术性视觉字段；通过独立只读服务回读（`HermesCronClient.listCronJobs`）与行内原生组件 ID 双重强断言锁定 `targetJobId`。
-  3. **F08 上游真实契约与容错保障 (对齐 HermesREST.swift:500-516 & HermesCronClient.swift:32-49)**：
-     - HTTP 424 警告语义支持（任务已持久化但调度注册失败，保留 warning 并正常拉取更新）；
-     - 空字段（name、schedule、prompt）严格前端与 VM 拦截拒绝；
-     - 409 运行冲突详情捕获与友好提示，手动触发超时扩展至 30s 且未知状态不盲目重试；
-     - 新建测试任务固定使用 `model: 'hermex-stub'`，测试末尾通过 UI 精确暂停本轮任务，严格遵循非删除破坏性安全红线；
-     - 任务执行历史实机核验非空，强断言包含真实 `targetJobId` 与 `cron_complete` 终态。
-  4. **测试与编译全线通过**：
+- 状态：**阶段九（Run 21 落地）F05 真实模型/Provider目录解析、Reasoning推理参数、安全Token防注入、Profile切换隔离与官方模拟器 6/6 UiTest 全绿通过 (Stage 9 F05 Model & Provider Catalog, Reasoning Effort, Token Injection Guard, Profile Isolation & Official Emulator 6/6 Pass)**
+- 当前阶段：Run 21 工作块已全部落实：
+  1. **F05 真实模型与 Provider 目录上游契约对齐 (HermesModelCatalog.swift & HermesCall.swift)**：
+     - 新建 `ModelCatalog.ets`，严格解析 `providers[].slug/name/authenticated/models/unavailable_models/capabilities` 嵌套报文；
+     - 自动过滤 `authenticated === false` 的未认证 provider，过滤 `unavailable_models` 标记不可用模型，过滤同 provider 下重复模型；
+     - 无任何可用模型的 provider 自动剔除对应分组（无空 section）；
+     - 保留每个模型的 `providerId`，彻底解决同名模型（如 `claude-3-5-sonnet`）跨 provider 冲突碰撞问题；
+     - 正确映射并保留模型 capabilities 字典（如 `reasoning: true`, `vision: true`）；
+     - 针对单模型/隔离 stub 场景保留顶层 models 容错回退机制。
+  2. **Token 安全防注入与 Session 级模型参数构造 (严格对齐 HermesModelCatalog.sessionModelValue)**：
+     - 实现 `isSafeToken` 严格校验：拒绝空值、拒绝任何空白字符（`\s`）、拒绝双破折号（`--`）、拒绝 Unicode 破折号（`‒`, `–`, `—`, `―`）；
+     - `formatSessionModelValue` 生成安全参数 `${modelId} --provider ${providerId} --session`，阻断任意 flag 注入与 scope 篡改；
+     - `HermesGatewayClient.setModelConfig` 与 `setReasoningConfig` 限定 `scope: 'session'`，默认不代确认昂贵模型。
+  3. **Reasoning 推理参数配置与合法性门禁**：
+     - 支持上游合法推理强度级别：`none, minimal, low, medium, high, xhigh, max, ultra`；
+     - `setReasoningConfig` 拦截非法推理参数并安全报错，`ChatViewModel.switchReasoningEffort` 失败时优雅保留原状态并 toast 提示；
+     - 原生 UI 提供 `none, low, medium, high, max` 快捷切换胶囊按钮并实时高亮当前档位。
+  4. **Profile 列表与切换状态隔离**：
+     - `HermesGatewayClient.listProfiles` 调用 `profiles.list` RPC；
+     - `ChatViewModel.switchProfile` 升级 `modelFetchGeneration` 与 `sessionAttachGeneration` 异步代次；
+     - 切换 Profile 立即清空旧会话 runtimeSessionId、历史消息流与模型目录，彻底阻断跨 Profile / 跨会话旧网络响应污染。
+  5. **测试与编译全线通过**：
      - DevEco `assembleHap`（entry 与 entry@ohosTest）双 HAP 编译成功 (退出码 0)；
-     - Node 回归测试 `protocol-suite.js` 扩展至 34 项全部通过 (退出码 0)；
-     - 官方模拟器（`127.0.0.1:5555`）执行定向 `testCronManagementUserFlow` 通过 (1/1, 退出码 0)；
-     - 官方模拟器执行 `run-e2e-with-network-test.js` 全量 5 项测试全部通过 (Tests run: 5, Failure: 0, Error: 0, Pass: 5, 退出码 0，6 阶段有效产物完整捕获)。
-- 更新时间：2026-10-21 08:22
+     - Node 回归测试 `protocol-suite.js` 扩展至 35 项全部通过 (退出码 0)；
+     - 官方模拟器（`127.0.0.1:5555`）执行定向 `testModelAndProfileUserFlow` 通过 (1/1, 退出码 0)；
+     - 官方模拟器执行 `run-e2e-with-network-test.js` 全量 6 项官方测试全部通过 (Tests run: 6, Failure: 0, Error: 0, Pass: 6, Ignore: 0, 退出码 0，6 阶段有效产物完整捕获)。
+- 更新时间：2026-10-21 08:43
 - 当前分支：`harmonyos/native-port`
 - 实施者：AntiGravity
-- 监督审查参考：`RESUME_RUN20.md`, `REVIEW_CRON19.md`, `REVIEW_SHARE_TEST19.md`
+- 监督审查参考：`RESUME_RUN21.md`, `REVIEW_MODELS_NEXT.md`, `REMAINING_SCOPE_QUEUE.md`
 
 ## 监督意见落实与本次核心重构详单
 
